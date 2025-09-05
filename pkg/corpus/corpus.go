@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"sync"
+	"time"
 
 	"github.com/google/syzkaller/pkg/cover"
 	"github.com/google/syzkaller/pkg/hash"
@@ -94,13 +95,14 @@ type ItemUpdate struct {
 // too hard to synchonize accesses to them across the whole project.
 // When Corpus updates one of its items, it saves a copy of it.
 type Item struct {
-	Sig     string
-	Call    int
-	Prog    *prog.Prog
-	HasAny  bool // whether the prog contains squashed arguments
-	Signal  signal.Signal
-	Cover   []uint64
-	Updates []ItemUpdate
+	Sig       string
+	Call      int
+	Prog      *prog.Prog
+	HasAny    bool // whether the prog contains squashed arguments
+	Signal    signal.Signal
+	Timestamp time.Time
+	Cover     []uint64
+	Updates   []ItemUpdate
 
 	areas map[*focusAreaState]struct{}
 }
@@ -144,14 +146,15 @@ func (corpus *Corpus) Save(inp NewInput) {
 		newCover.Merge(old.Cover)
 		newCover.Merge(inp.Cover)
 		newItem := &Item{
-			Sig:     sig,
-			Prog:    old.Prog,
-			Call:    old.Call,
-			HasAny:  old.HasAny,
-			Signal:  newSignal,
-			Cover:   newCover.Serialize(),
-			Updates: append([]ItemUpdate{}, old.Updates...),
-			areas:   maps.Clone(old.areas),
+			Sig:       sig,
+			Prog:      old.Prog,
+			Call:      old.Call,
+			HasAny:    old.HasAny,
+			Signal:    newSignal,
+			Timestamp: old.Timestamp,
+			Cover:     newCover.Serialize(),
+			Updates:   append([]ItemUpdate{}, old.Updates...),
+			areas:     maps.Clone(old.areas),
 		}
 		const maxUpdates = 32
 		if len(newItem.Updates) < maxUpdates {
@@ -161,13 +164,14 @@ func (corpus *Corpus) Save(inp NewInput) {
 		corpus.applyFocusAreas(newItem, inp.Cover)
 	} else {
 		item := &Item{
-			Sig:     sig,
-			Call:    inp.Call,
-			Prog:    inp.Prog,
-			HasAny:  inp.Prog.ContainsAny(),
-			Signal:  inp.Signal,
-			Cover:   inp.Cover,
-			Updates: []ItemUpdate{update},
+			Sig:       sig,
+			Call:      inp.Call,
+			Prog:      inp.Prog,
+			HasAny:    inp.Prog.ContainsAny(),
+			Signal:    inp.Signal,
+			Timestamp: time.Now(),
+			Cover:     inp.Cover,
+			Updates:   []ItemUpdate{update},
 		}
 		corpus.progsMap[sig] = item
 		corpus.applyFocusAreas(item, inp.Cover)
