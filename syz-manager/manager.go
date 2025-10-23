@@ -1176,9 +1176,6 @@ func (mgr *Manager) MachineChecked(features flatrpc.Feature,
 			NoMutateCalls:  mgr.cfg.NoMutateCalls,
 			FetchRawCover:  mgr.cfg.RawCover,
 			Logf: func(level int, msg string, args ...interface{}) {
-				if level != 0 {
-					return
-				}
 				log.Logf(level, msg, args...)
 			},
 			NewInputFilter: func(call string) bool {
