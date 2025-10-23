@@ -421,9 +421,10 @@ func (serv *HTTPServer) httpCorpus(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		data.Inputs = append(data.Inputs, UIInput{
-			Sig:   inp.Sig,
-			Short: inp.Prog.String(),
-			Cover: len(inp.Cover),
+			Sig:       inp.Sig,
+			Short:     inp.Prog.String(),
+			Cover:     len(inp.Cover),
+			Timestamp: inp.Timestamp.Format("2006/01/02 15:04:05 "),
 		})
 	}
 	sort.Slice(data.Inputs, func(i, j int) bool {
@@ -733,6 +734,9 @@ func (serv *HTTPServer) httpInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Write([]byte("Timestamp: "))
+	w.Write([]byte(inp.Timestamp.Format("2006/01/02 15:04:05 ")))
+	w.Write([]byte("------------------------"))
 	w.Write(inp.Prog.Serialize())
 }
 
@@ -1088,9 +1092,10 @@ type UICorpusPage struct {
 }
 
 type UIInput struct {
-	Sig   string
-	Short string
-	Cover int
+	Sig       string
+	Short     string
+	Cover     int
+	Timestamp string
 }
 
 type UIPageHeader struct {
