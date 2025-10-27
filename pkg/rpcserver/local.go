@@ -121,6 +121,10 @@ func (ctx *local) CoverageFilter(modules []*vminfo.KernelModule) ([]uint64, erro
 	return ctx.cfg.CoverFilter, nil
 }
 
+func (ctx *local) DebugFilter(modules []*vminfo.KernelModule) ([]uint64, error) {
+	return []uint64{}, nil
+}
+
 func (ctx *local) Serve(context context.Context) error {
 	return ctx.serv.Serve(context)
 }
