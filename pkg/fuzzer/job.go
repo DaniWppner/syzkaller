@@ -71,6 +71,19 @@ func mutateProgRequest(fuzzer *Fuzzer, rnd *rand.Rand) *queue.Request {
 	}
 }
 
+func filteredCoverage(slice []uint64, set map[uint64]struct{}) []uint64 {
+	res := make([]uint64, 0, len(slice))
+	if len(slice) == 0 || len(set) == 0 {
+		return res
+	}
+	for _, v := range slice {
+		if _, ok := set[v]; ok {
+			res = append(res, v)
+		}
+	}
+	return res
+}
+
 // triageJob are programs for which we noticed potential new coverage during
 // first execution. But we are not sure yet if the coverage is real or not.
 // During triage we understand if these programs in fact give new coverage,
@@ -174,6 +187,11 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 		}
 	}
 	callName := p.CallName(call)
+
+	if len(filteredCoverage(info.rawCover, job.fuzzer.Config.DebugFilters)) > 0 {
+		job.fuzzer.Logf(3, "handle call %v in triage with flagged coverage", callName)
+	}
+
 	if !job.fuzzer.Config.NewInputFilter(callName) {
 		return
 	}
@@ -265,6 +283,9 @@ func (job *triageJob) deflake(exec func(*queue.Request, ProgFlags) *queue.Result
 			}
 			if len(info.rawCover) == 0 && job.fuzzer.Config.FetchRawCover {
 				info.rawCover = res.Cover
+			}
+			if len(filteredCoverage(res.Cover, job.fuzzer.Config.DebugFilters)) > 0 {
+				job.info.Logf("call #%d during deflake has flagged coverage", call)
 			}
 			// Since the signal is frequently flaky, we may get some new new max signal.
 			// Merge it into the new signal we are chasing.

@@ -1185,6 +1185,7 @@ func (mgr *Manager) MachineChecked(features flatrpc.Feature,
 				return !mgr.saturatedCalls[call]
 			},
 			ModeKFuzzTest: mgr.cfg.Experimental.EnableKFuzzTest,
+			DebugFilters:  mgr.debugFilters,
 		}, rnd, mgr.target)
 		fuzzerObj.AddCandidates(candidates)
 		mgr.fuzzer.Store(fuzzerObj)
