@@ -84,6 +84,22 @@ func filteredCoverage(slice []uint64, set map[uint64]struct{}) []uint64 {
 	return res
 }
 
+func rawPreview(slice []uint64) string {
+	if len(slice) > 0 {
+		var sb strings.Builder
+		sb.WriteString(" (")
+		for i, x := range slice {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			fmt.Fprintf(&sb, "0x%x", x)
+		}
+		sb.WriteByte(')')
+		return sb.String()
+	}
+	return ""
+}
+
 // triageJob are programs for which we noticed potential new coverage during
 // first execution. But we are not sure yet if the coverage is real or not.
 // During triage we understand if these programs in fact give new coverage,
@@ -156,6 +172,12 @@ func (job *triageJob) run(fuzzer *Fuzzer) {
 	for call, info := range job.calls {
 		job.info.Logf("call #%d [%s]: |new signal|=%d%s",
 			call, job.p.CallName(call), info.newSignal.Len(), signalPreview(info.newSignal))
+
+		filteredRawSignal := filteredCoverage(info.newSignal.ToRaw(), job.fuzzer.Config.DebugFilters)
+		if len(filteredRawSignal) > 0 {
+			job.info.Logf("call #%d [%s]: |new filtered signal|=%d%s",
+				call, job.p.CallName(call), len(filteredRawSignal), rawPreview(filteredRawSignal))
+		}
 	}
 
 	// Compute input coverage and non-flaky signal for minimization.
@@ -188,8 +210,9 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 	}
 	callName := p.CallName(call)
 
-	if len(filteredCoverage(info.rawCover, job.fuzzer.Config.DebugFilters)) > 0 {
-		job.info.Logf("handle call #%d [%s] with flagged coverage", call, callName)
+	filteredRaw := filteredCoverage(info.cover.Serialize(), job.fuzzer.Config.DebugFilters)
+	if len(filteredRaw) > 0 {
+		job.info.Logf("handle call #%d [%s] with flagged coverage: %s", call, callName, rawPreview(filteredRaw))
 	}
 
 	if !job.fuzzer.Config.NewInputFilter(callName) {
@@ -290,7 +313,7 @@ func (job *triageJob) deflake(exec func(*queue.Request, ProgFlags) *queue.Result
 				info.rawCover = res.Cover
 			}
 			if len(filteredCoverage(res.Cover, job.fuzzer.Config.DebugFilters)) > 0 {
-				job.info.Logf("call #%d [%s] triggered flagged coverage before deflake", call, job.p.CallName(call))
+				job.info.Logf("call #%d [%s] triggered flagged coverage during deflake", call, job.p.CallName(call))
 			}
 			// Since the signal is frequently flaky, we may get some new new max signal.
 			// Merge it into the new signal we are chasing.
@@ -322,6 +345,14 @@ func (job *triageJob) deflake(exec func(*queue.Request, ProgFlags) *queue.Result
 		job.info.Logf("call #%d [%s]: |stable signal|=%d, |new stable signal|=%d%s",
 			call, job.p.CallName(call), info.stableSignal.Len(), info.newStableSignal.Len(),
 			signalPreview(info.newStableSignal))
+
+		newStableFilteredSignal := filteredCoverage(info.newStableSignal.ToRaw(), job.fuzzer.Config.DebugFilters)
+		stableFilteredSignal := filteredCoverage(info.stableSignal.ToRaw(), job.fuzzer.Config.DebugFilters)
+
+		if len(stableFilteredSignal) > 0 {
+			job.info.Logf("call #%d [%s]: |stable filtered signal|=%d, |new stable filtered signal|=%d%s",
+				call, job.p.CallName(call), len(stableFilteredSignal), len(newStableFilteredSignal), rawPreview(newStableFilteredSignal))
+		}
 	}
 	return false
 }
