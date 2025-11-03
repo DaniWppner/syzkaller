@@ -237,7 +237,7 @@ func (fuzzer *Fuzzer) triageProgCall(p *prog.Prog, info *flatrpc.CallInfo, call 
 	if !fuzzer.Config.NewInputFilter(p.CallName(call)) {
 		return
 	}
-	fuzzer.Logf(2, "found new signal in call %d in %s", call, p)
+	fuzzer.Logf(2, "found new signal in call #%d [%s] in %s", call, p.CallName(call), p)
 	if *triage == nil {
 		*triage = make(map[int]*triageCall)
 	}

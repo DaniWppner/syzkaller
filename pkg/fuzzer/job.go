@@ -189,7 +189,7 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 	callName := p.CallName(call)
 
 	if len(filteredCoverage(info.rawCover, job.fuzzer.Config.DebugFilters)) > 0 {
-		job.info.Logf("handle call %v in triage with flagged coverage", callName)
+		job.info.Logf("handle call #%d [%s] with flagged coverage", call, callName)
 	}
 
 	if !job.fuzzer.Config.NewInputFilter(callName) {
@@ -230,7 +230,7 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 			})
 		}
 	}
-	job.info.Logf("added new input for %v to the corpus: %s", callName, p)
+	job.info.Logf("added new input for #%d [%s] to the corpus with program: %s", call, callName, p)
 	input := corpus.NewInput{
 		Prog:     p,
 		Call:     call,
@@ -290,7 +290,7 @@ func (job *triageJob) deflake(exec func(*queue.Request, ProgFlags) *queue.Result
 				info.rawCover = res.Cover
 			}
 			if len(filteredCoverage(res.Cover, job.fuzzer.Config.DebugFilters)) > 0 {
-				job.info.Logf("call #%d during deflake has flagged coverage", call)
+				job.info.Logf("call #%d [%s] triggered flagged coverage before deflake", call, job.p.CallName(call))
 			}
 			// Since the signal is frequently flaky, we may get some new new max signal.
 			// Merge it into the new signal we are chasing.
@@ -367,7 +367,7 @@ func (job *triageJob) stopDeflake(run, needRuns int, noNewSignal bool) bool {
 }
 
 func (job *triageJob) minimize(call int, info *triageCall) (*prog.Prog, int) {
-	job.info.Logf("[call #%d] minimize started", call)
+	job.info.Logf("call #%d [%s]: minimize started", call, job.p.CallName(call))
 	minimizeAttempts := 3
 	if job.fuzzer.Config.Snapshot {
 		minimizeAttempts = 2
@@ -404,12 +404,12 @@ func (job *triageJob) minimize(call int, info *triageCall) (*prog.Prog, int) {
 				mergedSignal.Merge(thisSignal)
 			}
 			if info.newStableSignal.Intersection(mergedSignal).Len() == info.newStableSignal.Len() {
-				job.info.Logf("[call #%d] minimization step success (|calls| = %d)",
-					call, len(p1.Calls))
+				job.info.Logf("call #%d [%s] minimization step success (|calls| = %d)",
+					call, job.p.CallName(call), len(p1.Calls))
 				return true
 			}
 		}
-		job.info.Logf("[call #%d] minimization step failure", call)
+		job.info.Logf("call #%d [%s] minimization step failure", call, job.p.CallName(call))
 		return false
 	})
 	if stop {
@@ -529,8 +529,8 @@ type faultInjectionJob struct {
 
 func (job *faultInjectionJob) run(fuzzer *Fuzzer) {
 	for nth := 1; nth <= 100; nth++ {
-		job.info.Logf("injecting fault into call %v, step %v",
-			job.call, nth)
+		job.info.Logf("injecting fault into call #%d [%s], step %v",
+			job.call, job.p.CallName(job.call), nth)
 		newProg := job.p.Clone()
 		newProg.Calls[job.call].Props.FailNth = nth
 		result := fuzzer.execute(job.exec, &queue.Request{
