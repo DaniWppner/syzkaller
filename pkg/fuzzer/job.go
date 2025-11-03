@@ -222,6 +222,11 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 				exec: job.fuzzer.smashQueue,
 				p:    p.Clone(),
 				call: call,
+				info: &JobInfo{
+					Name:  p.String(),
+					Type:  "fault-injection",
+					Calls: []string{p.CallName(call)},
+				},
 			})
 		}
 	}
@@ -519,11 +524,12 @@ type faultInjectionJob struct {
 	exec queue.Executor
 	p    *prog.Prog
 	call int
+	info *JobInfo
 }
 
 func (job *faultInjectionJob) run(fuzzer *Fuzzer) {
 	for nth := 1; nth <= 100; nth++ {
-		fuzzer.Logf(2, "injecting fault into call %v, step %v",
+		job.info.Logf("injecting fault into call %v, step %v",
 			job.call, nth)
 		newProg := job.p.Clone()
 		newProg.Calls[job.call].Props.FailNth = nth
@@ -540,6 +546,10 @@ func (job *faultInjectionJob) run(fuzzer *Fuzzer) {
 			break
 		}
 	}
+}
+
+func (job *faultInjectionJob) getInfo() *JobInfo {
+	return job.info
 }
 
 type hintsJob struct {
