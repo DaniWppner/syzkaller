@@ -189,7 +189,7 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 	callName := p.CallName(call)
 
 	if len(filteredCoverage(info.rawCover, job.fuzzer.Config.DebugFilters)) > 0 {
-		job.fuzzer.Logf(3, "handle call %v in triage with flagged coverage", callName)
+		job.info.Logf("handle call %v in triage with flagged coverage", callName)
 	}
 
 	if !job.fuzzer.Config.NewInputFilter(callName) {
@@ -225,7 +225,7 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 			})
 		}
 	}
-	job.fuzzer.Logf(2, "added new input for %v to the corpus: %s", callName, p)
+	job.info.Logf("added new input for %v to the corpus: %s", callName, p)
 	input := corpus.NewInput{
 		Prog:     p,
 		Call:     call,
@@ -466,7 +466,7 @@ type smashJob struct {
 }
 
 func (job *smashJob) run(fuzzer *Fuzzer) {
-	fuzzer.Logf(2, "smashing the program %s:", job.p)
+	job.info.Logf("smashing the program %s:", job.p)
 	job.info.Logf("\n%s", job.p.Serialize())
 
 	const iters = 25
@@ -608,13 +608,13 @@ type syncBuffer struct {
 	buf bytes.Buffer
 }
 
-func (sb *syncBuffer) Logf(logFmt string, args ...any) {
-	sb.mu.Lock()
-	defer sb.mu.Unlock()
+func (ji *JobInfo) Logf(logFmt string, args ...any) {
+	ji.mu.Lock()
+	defer ji.mu.Unlock()
 
-	fmt.Fprintf(&sb.buf, "%s: ", time.Now().Format(time.DateTime))
-	fmt.Fprintf(&sb.buf, logFmt, args...)
-	sb.buf.WriteByte('\n')
+	fmt.Fprintf(&ji.buf, "%s [%s-%s]: ", time.Now().Format(time.DateTime), ji.Type, ji.ID())
+	fmt.Fprintf(&ji.buf, logFmt, args...)
+	ji.buf.WriteByte('\n')
 }
 
 func (sb *syncBuffer) Bytes() []byte {
