@@ -150,6 +150,12 @@ func PrepareDebugFilters(source *ReportGeneratorWrapper, cfg *mgrconfig.Config, 
 			ret[next] = struct{}{}
 		}
 	}
+	keys := make([]uint64, 0, len(ret))
+	for k := range ret {
+		keys = append(keys, k)
+	}
+	log.Logf(3, "debug coverage filter PCs: %#x", keys)
+
 	return ret, nil
 }
 
