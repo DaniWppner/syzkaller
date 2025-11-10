@@ -29,10 +29,11 @@ type jobIntrospector interface {
 }
 
 type JobInfo struct {
-	Name  string
-	Calls []string
-	Type  string
-	Execs atomic.Int32
+	Name   string
+	Calls  []string
+	Type   string
+	Execs  atomic.Int32
+	ProgId string
 
 	syncBuffer
 }
@@ -223,9 +224,10 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 			exec: job.fuzzer.smashQueue,
 			p:    p.Clone(),
 			info: &JobInfo{
-				Name:  p.String(),
-				Type:  "smash",
-				Calls: []string{p.CallName(call)},
+				Name:   p.String(),
+				Type:   "smash",
+				Calls:  []string{p.CallName(call)},
+				ProgId: job.info.ProgId,
 			},
 		})
 		if job.fuzzer.Config.Comparisons && call >= 0 {
@@ -234,9 +236,10 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 				p:    p.Clone(),
 				call: call,
 				info: &JobInfo{
-					Name:  p.String(),
-					Type:  "hints",
-					Calls: []string{p.CallName(call)},
+					Name:   p.String(),
+					Type:   "hints",
+					Calls:  []string{p.CallName(call)},
+					ProgId: job.info.ProgId,
 				},
 			})
 		}
@@ -246,14 +249,15 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 				p:    p.Clone(),
 				call: call,
 				info: &JobInfo{
-					Name:  p.String(),
-					Type:  "fault-injection",
-					Calls: []string{p.CallName(call)},
+					Name:   p.String(),
+					Type:   "fault-injection",
+					Calls:  []string{p.CallName(call)},
+					ProgId: job.info.ProgId,
 				},
 			})
 		}
 	}
-	job.info.Logf("added new input for #%d [%s] to the corpus with program: %s", call, callName, p)
+	job.info.Logf("added new input for #%d [%s] to the corpus with program:\n%s", call, callName, p.Serialize())
 	input := corpus.NewInput{
 		Prog:     p,
 		Call:     call,
@@ -653,7 +657,7 @@ func (ji *JobInfo) Logf(logFmt string, args ...any) {
 	ji.mu.Lock()
 	defer ji.mu.Unlock()
 
-	fmt.Fprintf(&ji.buf, "%s [%s-%s]: ", time.Now().Format(time.DateTime), ji.Type, ji.ID())
+	fmt.Fprintf(&ji.buf, "%s [%s-%s] [prog-%s]: ", time.Now().Format(time.DateTime), ji.Type, ji.ID(), ji.ProgId)
 	fmt.Fprintf(&ji.buf, logFmt, args...)
 	ji.buf.WriteByte('\n')
 }

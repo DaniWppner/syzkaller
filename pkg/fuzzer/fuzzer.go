@@ -167,8 +167,9 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 				queue:    queue.Append(),
 				calls:    triage,
 				info: &JobInfo{
-					Name: req.Prog.String(),
-					Type: "triage",
+					Name:   req.Prog.String(),
+					Type:   "triage",
+					ProgId: fmt.Sprintf("%p", req.Prog),
 				},
 			}
 			for id := range triage {
