@@ -238,7 +238,7 @@ func (fuzzer *Fuzzer) triageProgCall(p *prog.Prog, info *flatrpc.CallInfo, call 
 	if !fuzzer.Config.NewInputFilter(p.CallName(call)) {
 		return
 	}
-	fuzzer.Logf(2, "found new signal in call #%d [%s] in %s", call, p.CallName(call), p)
+	fuzzer.Logf(3, "found new signal in call #%d [%s] in %s", call, p.CallName(call), p)
 	if *triage == nil {
 		*triage = make(map[int]*triageCall)
 	}
@@ -331,7 +331,7 @@ func (fuzzer *Fuzzer) startJob(stat *stat.Val, newJob job) {
 
 		if job_obj, ok := newJob.(jobIntrospector); ok {
 			job_logbytes := job_obj.getInfo().Bytes()
-			fuzzer.Logf(3, string(job_logbytes))
+			fuzzer.Logf(5, string(job_logbytes))
 		}
 	}()
 }
