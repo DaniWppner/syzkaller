@@ -5,13 +5,13 @@ go 1.24.4
 require (
 	cloud.google.com/go v0.123.0
 	cloud.google.com/go/batch v1.13.0
-	cloud.google.com/go/bigquery v1.71.0
+	cloud.google.com/go/bigquery v1.72.0
 	cloud.google.com/go/compute/metadata v0.9.0
-	cloud.google.com/go/logging v1.13.0
+	cloud.google.com/go/logging v1.13.1
 	cloud.google.com/go/profiler v0.4.3
-	cloud.google.com/go/secretmanager v1.15.1
+	cloud.google.com/go/secretmanager v1.16.0
 	cloud.google.com/go/spanner v1.82.0
-	cloud.google.com/go/storage v1.57.0
+	cloud.google.com/go/storage v1.57.1
 	github.com/VividCortex/gohistogram v1.0.0
 	github.com/argoproj/argo-workflows/v3 v3.7.3
 	github.com/golang-migrate/migrate/v4 v4.19.0
