@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/google/syzkaller/pkg/ifuzz"
+	"github.com/google/syzkaller/pkg/log"
 )
 
 const (
@@ -593,6 +594,32 @@ func (r *randGen) nOutOf(n, outOf int) bool {
 	return v < n
 }
 
+func (r *randGen) override_choice(biasCall int, meta *Syscall) *Syscall {
+	OPENAT_DM_IOCTL := r.target.SyscallMap["openat$auto__ctl_fops_dm_ioctl"]
+	IOCTL_DM_IOCTL := r.target.SyscallMap["ioctl$auto__ctl_fops_dm_ioctl"]
+	if biasCall == OPENAT_DM_IOCTL.ID {
+		overrideSyscall := IOCTL_DM_IOCTL
+		biasSyscall := OPENAT_DM_IOCTL
+		log.Logf(3, `[generateCall] Overriding syscall chosen.
+Bias:
+	ID:%d
+	Name:%s
+Chosen:
+	ID:%d
+	Name:%s
+Override with:
+	ID:%d
+	Name:%s
+`,
+			biasSyscall.ID, biasSyscall.Name,
+			meta.ID, meta.Name,
+			overrideSyscall.ID, overrideSyscall.Name)
+		return overrideSyscall
+	} else {
+		return meta
+	}
+}
+
 func (r *randGen) generateCall(s *state, p *Prog, insertionPoint int) []*Call {
 	biasCall := -1
 	if insertionPoint > 0 {
@@ -605,6 +632,7 @@ func (r *randGen) generateCall(s *state, p *Prog, insertionPoint int) []*Call {
 	}
 	idx := s.ct.choose(r.Rand, biasCall)
 	meta := r.target.Syscalls[idx]
+	meta = r.override_choice(biasCall, meta)
 	return r.generateParticularCall(s, meta)
 }
 

@@ -9,6 +9,8 @@ import (
 	"math/rand"
 	"slices"
 	"sort"
+
+	"github.com/google/syzkaller/pkg/log"
 )
 
 // Calulation of call-to-call priorities.
@@ -264,6 +266,16 @@ type ChoiceTable struct {
 	target *Target
 	runs   [][]int32
 	calls  []*Syscall
+}
+
+func (target *Target) dumpSyscalls() {
+	// Call this function once from anywhere to get the information of the syscall table
+	// in order to hard code some IDs of a given syscall.
+	log.Log(3, "-----------------Syscall table information:------------")
+	for p, v := range target.Syscalls {
+		log.Logf(3, "ID: %d, Name: %s, Index: %d", v.ID, v.Name, p)
+	}
+	log.Log(3, "-----------------Syscall table information end------------")
 }
 
 func (target *Target) BuildChoiceTable(corpus []*Prog, enabled map[*Syscall]bool) *ChoiceTable {
