@@ -85,22 +85,6 @@ func filteredCoverage(slice []uint64, set map[uint64]struct{}) []uint64 {
 	return res
 }
 
-func rawPreview(slice []uint64) string {
-	if len(slice) > 0 {
-		var sb strings.Builder
-		sb.WriteString(" (")
-		for i, x := range slice {
-			if i > 0 {
-				sb.WriteString(", ")
-			}
-			fmt.Fprintf(&sb, "0x%x", x)
-		}
-		sb.WriteByte(')')
-		return sb.String()
-	}
-	return ""
-}
-
 // triageJob are programs for which we noticed potential new coverage during
 // first execution. But we are not sure yet if the coverage is real or not.
 // During triage we understand if these programs in fact give new coverage,
@@ -177,7 +161,7 @@ func (job *triageJob) run(fuzzer *Fuzzer) {
 		filteredRawSignal := filteredCoverage(info.newSignal.ToRaw(), job.fuzzer.Config.DebugFilters)
 		if len(filteredRawSignal) > 0 {
 			job.info.Logf("call #%d [%s]: |new filtered signal|=%d%s",
-				call, job.p.CallName(call), len(filteredRawSignal), rawPreview(filteredRawSignal))
+				call, job.p.CallName(call), len(filteredRawSignal), signal.RawPreview(filteredRawSignal))
 		}
 	}
 
@@ -213,7 +197,7 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 
 	filteredRaw := filteredCoverage(info.cover.Serialize(), job.fuzzer.Config.DebugFilters)
 	if len(filteredRaw) > 0 {
-		job.info.Logf("handle call #%d [%s] with flagged coverage: %s", call, callName, rawPreview(filteredRaw))
+		job.info.Logf("handle call #%d [%s] with flagged coverage: %s", call, callName, signal.RawPreview(filteredRaw))
 	}
 
 	if !job.fuzzer.Config.NewInputFilter(callName) {
@@ -355,7 +339,7 @@ func (job *triageJob) deflake(exec func(*queue.Request, ProgFlags) *queue.Result
 
 		if len(stableFilteredSignal) > 0 {
 			job.info.Logf("call #%d [%s]: |stable filtered signal|=%d, |new stable filtered signal|=%d%s",
-				call, job.p.CallName(call), len(stableFilteredSignal), len(newStableFilteredSignal), rawPreview(newStableFilteredSignal))
+				call, job.p.CallName(call), len(stableFilteredSignal), len(newStableFilteredSignal), signal.RawPreview(newStableFilteredSignal))
 		}
 	}
 	return false
