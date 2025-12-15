@@ -595,11 +595,10 @@ func (r *randGen) nOutOf(n, outOf int) bool {
 }
 
 func (r *randGen) override_choice(biasCall int, meta *Syscall) *Syscall {
-	OPENAT_DM_IOCTL := r.target.SyscallMap["openat$auto__ctl_fops_dm_ioctl"]
-	IOCTL_DM_IOCTL := r.target.SyscallMap["ioctl$auto__ctl_fops_dm_ioctl"]
-	if biasCall == OPENAT_DM_IOCTL.ID {
-		overrideSyscall := IOCTL_DM_IOCTL
-		biasSyscall := OPENAT_DM_IOCTL
+	overrideSyscallIdx, ok := r.target.ChoiceOverrides[biasCall]
+	if ok {
+		biasSyscall := r.target.Syscalls[biasCall]
+		overrideSyscall := r.target.Syscalls[overrideSyscallIdx]
 		log.Logf(3, `[generateCall] Overriding syscall chosen.
 Bias:
 	ID:%d

@@ -261,8 +261,17 @@ type Experimental struct {
 	// For example, whenever a TriageJob handles coverage that covers an area matching the filter, output additional information regarding that triage.
 	DebugFilters []CovFilterCfg `json:"debug_filters,omitempty"`
 
+	// OverrideChoices configures overriding of the syscall choice mechanism during test generation.
+	// When the Choice Table would be used for the parent syscall, it chooses the child syscall instead.
+	OverrideChoices []ChoiceOverride `json:"override_choices,omitempty"`
+
 	// Enable dynamic discovery and fuzzing of KFuzzTest targets.
 	EnableKFuzzTest bool `json:"enable_kfuzztest"`
+}
+
+type ChoiceOverride struct {
+	Parent string `json:"parent"`
+	Child  string `json:"child"`
 }
 
 type FocusArea struct {

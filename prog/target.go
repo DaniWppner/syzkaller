@@ -81,6 +81,10 @@ type Target struct {
 	// The default ChoiceTable is used only by tests and utilities, so we initialize it lazily.
 	defaultOnce        sync.Once
 	defaultChoiceTable *ChoiceTable
+
+	// Map that allows to override the choiceTable during test generation for debugging purposes.
+	// This is filled in by manager Config.
+	ChoiceOverrides map[int]int
 }
 
 const maxSpecialPointers = 16

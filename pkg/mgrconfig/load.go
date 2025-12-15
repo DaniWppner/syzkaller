@@ -207,6 +207,10 @@ func Complete(cfg *Config) error {
 	if err := cfg.completeFocusAreas(); err != nil {
 		return err
 	}
+	if err := cfg.setChoiceOverrides(); err != nil {
+		return err
+	}
+
 	cfg.initTimeouts()
 	cfg.VMLess = cfg.Type == "none"
 
@@ -398,6 +402,42 @@ func (cfg *Config) completeFocusAreas() error {
 			},
 		}
 		cfg.CovFilter = CovFilterCfg{}
+	}
+	return nil
+}
+
+func (cfg *Config) setChoiceOverrides() error {
+	for _, overrideChoice := range cfg.Experimental.OverrideChoices {
+		var childSyscalls []int
+		var parentSyscalls []int
+
+		nChild := 0
+		nParent := 0
+		for _, call := range cfg.Target.Syscalls {
+			if MatchSyscall(call.Name, overrideChoice.Child) {
+				childSyscalls = append(childSyscalls, call.ID)
+				nChild++
+			}
+			if MatchSyscall(call.Name, overrideChoice.Parent) {
+				parentSyscalls = append(parentSyscalls, call.ID)
+				nParent++
+			}
+		}
+		if nChild == 0 {
+			return fmt.Errorf("unknown child syscall in choice override: %v", overrideChoice.Child)
+		}
+		if nChild > 1 {
+			return fmt.Errorf("more than one syscalls match child in choice override: %v", overrideChoice.Child)
+		}
+		if nParent == 0 {
+			return fmt.Errorf("unknown parent syscall in choice override: %v", overrideChoice.Parent)
+		}
+		if nParent > 1 {
+			return fmt.Errorf("more than one syscalls match parent in choice override: %v", overrideChoice.Parent)
+		}
+
+		// We assume by this point only both syscall slices have only one element
+		cfg.Target.ChoiceOverrides[parentSyscalls[0]] = childSyscalls[0]
 	}
 	return nil
 }
