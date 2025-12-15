@@ -152,8 +152,10 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 	if req.ExecOpts.ExecFlags&flatrpc.ExecFlagCollectSignal > 0 && res.Info != nil && !dontTriage {
 		for call, info := range res.Info.Calls {
 			fuzzer.triageProgCall(req.Prog, info, call, &triage)
+			fuzzer.debugResultInfo(flags, req, info, call)
 		}
 		fuzzer.triageProgCall(req.Prog, res.Info.Extra, -1, &triage)
+		fuzzer.debugResultInfo(flags, req, res.Info.Extra, -1)
 
 		if len(triage) != 0 {
 			queue, stat := fuzzer.triageQueue, fuzzer.statJobsTriage
@@ -206,6 +208,14 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 		fuzzer.statCandidates.Add(-1)
 	}
 	return true
+}
+
+func (fuzzer *Fuzzer) debugResultInfo(flags ProgFlags, req *queue.Request, info *flatrpc.CallInfoRawT, call int) {
+
+	if flags&ProgFromCorpus != 0 {
+		fuzzer.Logf(4, "seed prog-%p processed call #%d [%s].\n\tProg:\n%s\n\tSignal:(%d)%s",
+			req.Prog, call, req.Prog.CallName(call), req.Prog.Serialize(), len(info.Signal), signal.RawPreview(info.Signal))
+	}
 }
 
 type Config struct {
