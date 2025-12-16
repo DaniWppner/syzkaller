@@ -1,0 +1,28 @@
+resource fd_ctl_fops_dm_ioctl[fd]
+openat$ctl_fops_dm_ioctl(fd const[AT_FDCWD], file ptr[in, string["/dev/mapper/control"]], flags flags[open_flags], mode const[0]) fd_ctl_fops_dm_ioctl
+
+#/* Top level cmds */
+ioctl$DM_VERSION_CMD(fd fd_ctl_fops_dm_ioctl, cmd const[DM_VERSION_CMD], arg ptr[in, array[int8]])
+ioctl$DM_REMOVE_ALL_CMD(fd fd_ctl_fops_dm_ioctl, cmd const[DM_REMOVE_ALL_CMD], arg ptr[in, array[int8]])
+ioctl$DM_LIST_DEVICES_CMD(fd fd_ctl_fops_dm_ioctl, cmd const[DM_LIST_DEVICES_CMD], arg ptr[in, array[int8]])
+
+#/* device level cmds */
+ioctl$DM_DEV_CREATE_CMD(fd fd_ctl_fops_dm_ioctl, cmd const[DM_DEV_CREATE_CMD], arg ptr[in, array[int8]])
+ioctl$DM_DEV_REMOVE_CMD(fd fd_ctl_fops_dm_ioctl, cmd const[DM_DEV_REMOVE_CMD], arg ptr[in, array[int8]])
+ioctl$DM_DEV_RENAME_CMD(fd fd_ctl_fops_dm_ioctl, cmd const[DM_DEV_RENAME_CMD], arg ptr[in, array[int8]])
+ioctl$DM_DEV_SUSPEND_CMD(fd fd_ctl_fops_dm_ioctl, cmd const[DM_DEV_SUSPEND_CMD], arg ptr[in, array[int8]])
+ioctl$DM_DEV_STATUS_CMD(fd fd_ctl_fops_dm_ioctl, cmd const[DM_DEV_STATUS_CMD], arg ptr[in, array[int8]])
+
+#/* Table level cmds */
+ioctl$DM_DEV_WAIT_CMD(fd fd_ctl_fops_dm_ioctl, cmd const[DM_DEV_WAIT_CMD], arg ptr[in, array[int8]])
+ioctl$DM_TABLE_LOAD_CMD(fd fd_ctl_fops_dm_ioctl, cmd const[DM_TABLE_LOAD_CMD], arg ptr[in, array[int8]])
+ioctl$DM_TABLE_CLEAR_CMD(fd fd_ctl_fops_dm_ioctl, cmd const[DM_TABLE_CLEAR_CMD], arg ptr[in, array[int8]])
+ioctl$DM_TABLE_DEPS_CMD(fd fd_ctl_fops_dm_ioctl, cmd const[DM_TABLE_DEPS_CMD], arg ptr[in, array[int8]])
+ioctl$DM_TABLE_STATUS_CMD(fd fd_ctl_fops_dm_ioctl, cmd const[DM_TABLE_STATUS_CMD], arg ptr[in, array[int8]])
+
+#/* Added later */
+ioctl$DM_LIST_VERSIONS_CMD(fd fd_ctl_fops_dm_ioctl, cmd const[DM_LIST_VERSIONS_CMD], arg ptr[in, array[int8]])
+ioctl$DM_TARGET_MSG_CMD(fd fd_ctl_fops_dm_ioctl, cmd const[DM_TARGET_MSG_CMD], arg ptr[in, array[int8]])
+ioctl$DM_DEV_SET_GEOMETRY_CMD(fd fd_ctl_fops_dm_ioctl, cmd const[DM_DEV_SET_GEOMETRY_CMD], arg ptr[in, array[int8]])
+ioctl$DM_DEV_ARM_POLL(fd fd_ctl_fops_dm_ioctl, cmd const[DM_DEV_ARM_POLL], arg ptr[in, array[int8]])
+ioctl$DM_GET_TARGET_VERSION(fd fd_ctl_fops_dm_ioctl, cmd const[DM_GET_TARGET_VERSION], arg ptr[in, array[int8]])
