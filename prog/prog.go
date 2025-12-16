@@ -14,6 +14,9 @@ type Prog struct {
 	Calls    []*Call
 	Comments []string
 
+	// Taints can be added during generation or mutation to track flow between progs
+	Taints []int
+
 	// Was deserialized using Unsafe mode, so can do unsafe things.
 	isUnsafe bool
 }

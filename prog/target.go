@@ -85,6 +85,11 @@ type Target struct {
 	// Map that allows to override the choiceTable during test generation for debugging purposes.
 	// This is filled in by manager Config.
 	ChoiceOverrides map[int]int
+
+	// Set of syscalls that should taint a Prog when included.
+	// This is filled in by manager Config.
+	TaintSyscalls map[int]bool
+	taintId       int
 }
 
 const maxSpecialPointers = 16
@@ -559,4 +564,21 @@ func (t *Target) KFuzzTestRunID() (int, error) {
 		kFuzzTestIDCache.err = fmt.Errorf("could not find ID for syz_kfuzztest_run - does it exist?")
 	})
 	return kFuzzTestIDCache.id, kFuzzTestIDCache.err
+}
+
+func (t *Target) TaintProg(p *Prog) int {
+	taintId := t.taintId
+	t.taintId++
+	p.Taints = append(p.Taints, taintId)
+	return taintId
+}
+
+func (t *Target) CallsThatTaint(calls []*Call) []*Call {
+	var res []*Call
+	for _, c := range calls {
+		if t.TaintSyscalls[c.Meta.ID] {
+			res = append(res, c)
+		}
+	}
+	return res
 }

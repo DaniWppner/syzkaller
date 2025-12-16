@@ -11,6 +11,7 @@ import (
 	"sort"
 
 	"github.com/google/syzkaller/pkg/image"
+	"github.com/google/syzkaller/pkg/log"
 )
 
 // Maximum length of generated binary blobs inserted into the program.
@@ -200,6 +201,14 @@ func (ctx *mutator) insertCall() bool {
 	p.insertBefore(c, calls)
 	for len(p.Calls) > ctx.ncalls {
 		p.RemoveCall(idx)
+	}
+	if taintCalls := r.target.CallsThatTaint(calls); taintCalls != nil {
+		taintId := r.target.TaintProg(p)
+		taintSyscalls := make([]string, 0, len(taintCalls))
+		for _, tc := range taintCalls {
+			taintSyscalls = append(taintSyscalls, tc.Meta.Name)
+		}
+		log.Logf(4, "[mutator.insertCall] tainted prog-%p with #%d due to inserted calls: %v", p, taintId, taintSyscalls)
 	}
 	return true
 }
