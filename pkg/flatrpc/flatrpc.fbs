@@ -229,6 +229,14 @@ table CallInfoRaw {
 	cover			:[uint64];
 	// Comparison operands.
 	comps			:[ComparisonRaw];
+	// Store Instructions where the stored value is a function pointer.
+	funcStores		:[StoreFunPointerRaw]:
+}
+
+struct StoreFunPointerRaw {
+	pc			:uint64;
+	storeAddr	:uint64;
+	storeValue  :uint64;
 }
 
 struct ComparisonRaw {
