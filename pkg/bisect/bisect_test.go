@@ -6,6 +6,7 @@ package bisect
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"testing"
 
@@ -54,7 +55,8 @@ func (env *testEnv) BuildKernel(buildCfg *instance.BuildKernelConfig) (string, b
 	return "", details, nil
 }
 
-func (env *testEnv) Test(numVMs int, reproSyz, reproOpts, reproC []byte) ([]instance.EnvTestResult, error) {
+func (env *testEnv) Test(numVMs int, reproSyz, reproOpts, reproC []byte, collectCoverage bool) (
+	[]instance.EnvTestResult, error) {
 	commit := env.headCommit()
 	if commit >= env.test.brokenStart && commit <= env.test.brokenEnd ||
 		env.config == "baseline-skip" {
@@ -1064,7 +1066,7 @@ func TestPickReleaseTags(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			ret := pickReleaseTags(append([]string{}, test.tags...))
+			ret := pickReleaseTags(slices.Clone(test.tags))
 			assert.Equal(t, test.ret, ret)
 		})
 	}

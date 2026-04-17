@@ -85,7 +85,7 @@ var linuxSyscallChecks = map[string]func(*checkContext, *prog.Syscall) string{
 	"syz_kvm_add_vcpu":              linuxSyzKvmSupported,
 	"syz_kvm_assert_syzos_uexit":    linuxSyzKvmSupported,
 	"syz_kvm_assert_syzos_kvm_exit": linuxSyzKvmSupported,
-	"syz_kvm_assert_reg":            linuxSyzSupportedOnArm64,
+	"syz_kvm_assert_reg":            linuxSyzKvmSupported,
 	"syz_emit_vhci":                 linuxVhciInjectionSupported,
 	"syz_init_net_socket":           linuxSyzInitNetSocketSupported,
 	"syz_genetlink_get_family_id":   linuxSyzGenetlinkGetFamilyIDSupported,
@@ -94,6 +94,7 @@ var linuxSyscallChecks = map[string]func(*checkContext, *prog.Syscall) string{
 	"syz_io_uring_setup":            alwaysSupported,
 	"syz_io_uring_submit":           alwaysSupported,
 	"syz_io_uring_complete":         alwaysSupported,
+	"syz_io_uring_modify_offsets":   alwaysSupported,
 	"syz_memcpy_off":                alwaysSupported,
 	"syz_btf_id_by_name":            linuxBtfVmlinuxSupported,
 	"syz_fuse_handle_req":           alwaysSupported,
@@ -188,8 +189,15 @@ func linuxSyzKvmSupported(ctx *checkContext, call *prog.Syscall) string {
 			return ""
 		}
 	case "syz_kvm_setup_cpu$arm64", "syz_kvm_setup_syzos_vm$arm64", "syz_kvm_add_vcpu$arm64",
-		"syz_kvm_assert_syzos_uexit$arm64", "syz_kvm_assert_syzos_kvm_exit$arm64":
+		"syz_kvm_assert_syzos_uexit$arm64", "syz_kvm_assert_syzos_kvm_exit$arm64",
+		"syz_kvm_assert_reg%arm64":
 		if ctx.target.Arch == targets.ARM64 {
+			return ""
+		}
+	case "syz_kvm_setup_cpu$riscv64", "syz_kvm_assert_reg$riscv64", "syz_kvm_setup_syzos_vm$riscv64",
+		"syz_kvm_add_vcpu$riscv64", "syz_kvm_assert_syzos_kvm_exit$riscv64",
+		"syz_kvm_assert_syzos_uexit$riscv64":
+		if ctx.target.Arch == targets.RiscV64 {
 			return ""
 		}
 	case "syz_kvm_setup_cpu$ppc64":

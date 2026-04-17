@@ -103,7 +103,11 @@ func generateInput(target *prog.Target, rs rand.Source, sizeSig int) NewInput {
 }
 
 func generateRangedInput(target *prog.Target, rs rand.Source, sigFrom, sigTo int) NewInput {
-	p := target.Generate(rs, 5, target.DefaultChoiceTable())
+	enabled := map[*prog.Syscall]bool{
+		target.SyscallMap["test$manual"]: true,
+	}
+	ct := target.BuildChoiceTable(nil, enabled)
+	p := target.Generate(rs, 5, ct)
 	var raw []uint64
 	for i := sigFrom; i <= sigTo; i++ {
 		raw = append(raw, uint64(i))

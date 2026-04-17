@@ -130,6 +130,7 @@ func (p *Pool[T]) runInstance(ctx context.Context, inst *poolInstance[T]) {
 		p.reportBootError(ctx, err)
 		return
 	}
+	log.Logf(2, "pool: instance %d created", inst.idx)
 	defer obj.Close()
 
 	p.BootTime.Save(time.Since(start))
@@ -158,6 +159,7 @@ func (p *Pool[T]) runInstance(ctx context.Context, inst *poolInstance[T]) {
 func (p *Pool[T]) reportBootError(ctx context.Context, err error) {
 	select {
 	case p.BootErrors <- err:
+		log.Logf(0, "boot error: %s", err)
 		return
 	default:
 		// Print some log message to make it visible.
@@ -340,6 +342,7 @@ func (pi *poolInstance[T]) free(job Runner[T]) {
 	}
 }
 
+//nolint:syz-linter
 func mergeContextCancel(main, monitor context.Context) (context.Context, func()) {
 	withCancel, cancel := context.WithCancel(main)
 	go func() {

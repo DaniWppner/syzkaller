@@ -7,6 +7,7 @@ meta arches["386", "amd64"]
 
 include <linux/kvm.h>
 include <linux/kvm_host.h>
+include <asm/kvm.h>
 include <asm/mce.h>
 
 # kvm_syz_vm is a VM handler used by syzos-related pseudo-syscalls. It is actually an opaque pointer under the hood.
@@ -23,7 +24,7 @@ syz_kvm_setup_syzos_vm$x86(fd fd_kvmvm, usermem vma[1024]) kvm_syz_vm$x86
 syz_kvm_add_vcpu$x86(vm kvm_syz_vm$x86, text ptr[in, kvm_text$x86]) fd_kvmcpu (no_squash)
 
 # Test assertions, will not be used by the fuzzer.
-syz_kvm_assert_syzos_uexit$x86(run kvm_run_ptr, exitcode intptr) (no_generate)
+syz_kvm_assert_syzos_uexit$x86(cpufd fd_kvmcpu, run kvm_run_ptr, exitcode intptr) (no_generate)
 syz_kvm_assert_syzos_kvm_exit$x86(run kvm_run_ptr, exitcode intptr) (no_generate)
 
 # Pseudo call that setups VCPU into a reasonable interesting state for execution.
@@ -101,22 +102,105 @@ syzos_api_nested_load_code {
 	insns	text[x86_64]
 } [packed]
 
+syzos_api_nested_load_syzos {
+	vm_id		syzos_api_vm_id
+	unused_pages	int64
+# Can't limit the array size, because it leads to a recursive definition that cannot be compiled.
+	program		array[syzos_api_call$x86]
+} [packed]
+
+# VMCS Component Encoding is a 32-bit value, but only bits 0:15 are used.
+# Certain bit combinations are invalid, because the number encodes additional
+# parameters like access type and width.
+# Constants as per Intel SDM vol. 3C, Appendix B.
+vmcs_field_encoding [
+	control16	int64[0x0:0x4, 2]
+	guest16		int64[0x800:0x812, 2]
+	host16		int64[0xc00:0xc0c, 2]
+	control64	int64[0x2000:0x2033]
+	ro64		int64[0x2400:0x2401]
+	guest64		int64[0x2800:0x2813]
+	host64		int64[0x2c00:0x2c05]
+	control32	int64[0x4000:0x4022, 2]
+	ro32		int64[0x4400:0x440e, 2]
+	guest32		int64[0x4800:0x482e, 2]
+	host32		int64[0x4c00:0x4c00]
+	control_nat	int64[0x6000:0x600e, 2]
+	ro_nat		int64[0x6400:0x640a, 2]
+	guest_nat	int64[0x6800:0x6826, 2]
+	host_nat	int64[0x6c00:0x6c16, 2]
+]
+
+syzos_api_nested_intel_vmwrite_mask {
+	vm_id		syzos_api_vm_id
+	field		vmcs_field_encoding
+	set_mask	int64
+	unset_mask	int64
+	flip_mask	int64
+}
+
+# See AMD Secure Virtual Machine Architecture Reference Manual,
+# Appendix C: Layout of VMCB.
+vmcb_offset [
+	control_area	int64[0x0:0xc0]
+	save_area	int64[0x400:0x698]
+]
+
+syzos_api_nested_amd_vmcb_write_mask {
+	vm_id		syzos_api_vm_id
+	offset		vmcb_offset
+	set_mask	int64
+	unset_mask	int64
+	flip_mask	int64
+}
+
+syzos_api_nested_amd_invlpga {
+	addr	flags[kvm_guest_addrs, int64]
+	asid	int64[0:65535]
+}
+
+syzos_api_nested_amd_inject_event {
+	vm_id		syzos_api_vm_id
+	vector		int64[0:255]
+	type		int64[0:7]
+	error_code	int64
+	flags		int64[0:3]
+}
+
+syzos_api_nested_amd_set_intercept {
+	vm_id		syzos_api_vm_id
+	offset		int64
+	bit_mask	int64
+	action		int64[0:1]
+}
+
 # IDs here must match those in executor/common_kvm_amd64_syzos.h.
 syzos_api_call$x86 [
-	uexit			syzos_api$x86[0, intptr]
-	code			syzos_api$x86[10, syzos_api_code$x86]
-	cpuid			syzos_api$x86[100, syzos_api_cpuid]
-	wrmsr			syzos_api$x86[101, syzos_api_wrmsr]
-	rdmsr			syzos_api$x86[102, syzos_api_rdmsr]
-	wr_crn			syzos_api$x86[103, syzos_api_wr_crn]
-	wr_drn			syzos_api$x86[104, syzos_api_wr_drn]
-	in_dx			syzos_api$x86[105, syzos_api_in_dx]
-	out_dx			syzos_api$x86[106, syzos_api_out_dx]
-	set_irq_handler		syzos_api$x86[200, syzos_api_set_irq_handler]
-	enable_nested		syzos_api$x86[300, const[0, intptr]]
-	nested_create_vm	syzos_api$x86[301, syzos_api_vm_id]
-	nested_load_code	syzos_api$x86[302, syzos_api_nested_load_code]
-	nested_vmlaunch		syzos_api$x86[303, syzos_api_vm_id]
+	uexit				syzos_api$x86[0, intptr]
+	code				syzos_api$x86[10, syzos_api_code$x86]
+	cpuid				syzos_api$x86[100, syzos_api_cpuid]
+	wrmsr				syzos_api$x86[101, syzos_api_wrmsr]
+	rdmsr				syzos_api$x86[102, syzos_api_rdmsr]
+	wr_crn				syzos_api$x86[103, syzos_api_wr_crn]
+	wr_drn				syzos_api$x86[104, syzos_api_wr_drn]
+	in_dx				syzos_api$x86[105, syzos_api_in_dx]
+	out_dx				syzos_api$x86[106, syzos_api_out_dx]
+	set_irq_handler			syzos_api$x86[200, syzos_api_set_irq_handler]
+	enable_nested			syzos_api$x86[300, const[0, intptr]]
+	nested_create_vm		syzos_api$x86[301, syzos_api_vm_id]
+	nested_load_code		syzos_api$x86[302, syzos_api_nested_load_code]
+	nested_vmlaunch			syzos_api$x86[303, syzos_api_vm_id]
+	nested_vmresume			syzos_api$x86[304, syzos_api_vm_id]
+	nested_load_syzos		syzos_api$x86[310, syzos_api_nested_load_syzos]
+	nested_intel_vmwrite_mask	syzos_api$x86[340, syzos_api_nested_intel_vmwrite_mask]
+	nested_amd_vmcb_write_mask	syzos_api$x86[380, syzos_api_nested_amd_vmcb_write_mask]
+	nested_amd_invlpga		syzos_api$x86[381, syzos_api_nested_amd_invlpga]
+	nested_amd_stgi			syzos_api$x86[382, void]
+	nested_amd_clgi			syzos_api$x86[383, void]
+	nested_amd_inject_event		syzos_api$x86[384, syzos_api_nested_amd_inject_event]
+	nested_amd_set_intercept	syzos_api$x86[385, syzos_api_nested_amd_set_intercept]
+	nested_amd_vmload		syzos_api$x86[386, syzos_api_vm_id]
+	nested_amd_vmsave		syzos_api$x86[387, syzos_api_vm_id]
 ] [varlen]
 
 kvm_text_x86 [
@@ -264,6 +348,25 @@ ioctl$KVM_SEV_SNP_LAUNCH_START(fd fd_kvmvm, cmd const[KVM_MEMORY_ENCRYPT_OP], ar
 ioctl$KVM_SEV_SNP_LAUNCH_UPDATE(fd fd_kvmvm, cmd const[KVM_MEMORY_ENCRYPT_OP], arg ptr[inout, kvm_memory_encrypt_op[KVM_SEV_SNP_LAUNCH_UPDATE, ptr[in, kvm_sev_snp_launch_update]]])
 ioctl$KVM_SEV_SNP_LAUNCH_FINISH(fd fd_kvmvm, cmd const[KVM_MEMORY_ENCRYPT_OP], arg ptr[inout, kvm_memory_encrypt_op[KVM_SEV_SNP_LAUNCH_FINISH, ptr[in, kvm_sev_snp_launch_finish]]])
 
+# TDX-related (based on Documentation/virt/kvm/x86/intel-tdx.rst).
+kvm_tdx_init_mem_region_flags = KVM_TDX_MEASURE_MEMORY_REGION
+
+kvm_tdx_empty_flags = 0
+
+type kvm_tdx_cmd[ID, FLAGS, DATA] {
+	id		const[ID, int32]
+	flags		flags[FLAGS, int32]
+	data		DATA
+	hw_error	int64	(out)
+}
+
+ioctl$KVM_TDX_CAPABILITIES(fd fd_kvmvm, cmd const[KVM_MEMORY_ENCRYPT_OP], arg ptr[inout, kvm_tdx_cmd[KVM_TDX_CAPABILITIES, kvm_tdx_empty_flags, ptr[out, kvm_tdx_capabilities]]])
+ioctl$KVM_TDX_INIT_VM(fd fd_kvmvm, cmd const[KVM_MEMORY_ENCRYPT_OP], arg ptr[inout, kvm_tdx_cmd[KVM_TDX_INIT_VM, kvm_tdx_empty_flags, ptr[in, kvm_tdx_init_vm]]])
+ioctl$KVM_TDX_INIT_VCPU(fd fd_kvmcpu, cmd const[KVM_MEMORY_ENCRYPT_OP], arg ptr[inout, kvm_tdx_cmd[KVM_TDX_INIT_VCPU, kvm_tdx_empty_flags, int64]])
+ioctl$KVM_TDX_INIT_MEM_REGION(fd fd_kvmvm, cmd const[KVM_MEMORY_ENCRYPT_OP], arg ptr[inout, kvm_tdx_cmd[KVM_TDX_INIT_MEM_REGION, kvm_tdx_init_mem_region_flags, ptr[in, kvm_tdx_init_mem_region]]])
+ioctl$KVM_TDX_FINALIZE_VM(fd fd_kvmvm, cmd const[KVM_MEMORY_ENCRYPT_OP], arg ptr[inout, kvm_tdx_cmd[KVM_TDX_FINALIZE_VM, kvm_tdx_empty_flags, const[0, intptr]]])
+ioctl$KVM_TDX_GET_CPUID(fd fd_kvmcpu, cmd const[KVM_MEMORY_ENCRYPT_OP], arg ptr[inout, kvm_tdx_cmd[KVM_TDX_GET_CPUID, kvm_tdx_empty_flags, ptr[inout, kvm_cpuid2]]])
+
 # Apparently KVM_MEMORY_ENCRYPT_REG_REGION and KVM_MEMORY_ENCRYPT_UNREG_REGION are VM ioctls, despite
 # https://docs.kernel.org/virt/kvm/api.html#kvm-memory-encrypt-reg-region says they are system.
 ioctl$KVM_MEMORY_ENCRYPT_REG_REGION(fd fd_kvmvm, cmd const[KVM_MEMORY_ENCRYPT_REG_REGION], arg ptr[in, kvm_enc_region])
@@ -322,7 +425,7 @@ kvm_sev_launch_measure {
 kvm_sev_guest_status {
 	handle	sev_handle
 	policy	int32
-	state	int8
+	state	int32
 }
 
 kvm_sev_dbg {
@@ -423,6 +526,56 @@ kvm_sev_snp_launch_finish {
 	pad1		array[const[0, int64], 4]
 }
 
+kvm_tdx_capabilities {
+	supported_attrs			int64
+	supported_xfam			int64
+	kernel_tdvmcallinfo_1_r11	int64
+	user_tdvmcallinfo_1_r11		int64
+	kernel_tdvmcallinfo_1_r12	int64
+	user_tdvmcallinfo_1_r12		int64
+	reserved			array[const[0, int64], 250]
+	cpuid				kvm_cpuid2
+}
+
+# From arch/x86/include/asm/shared/tdx.h.
+tdx_attrs = 0, TDX_TD_ATTR_DEBUG, TDX_TD_ATTR_HGS_PLUS_PROF, TDX_TD_ATTR_PERF_PROF, TDX_TD_ATTR_PMT_PROF, TDX_TD_ATTR_ICSSD, TDX_TD_ATTR_LASS, TDX_TD_ATTR_SEPT_VE_DISABLE, TDX_TD_ATTR_MIGRATABLE, TDX_TD_ATTR_PKS, TDX_TD_ATTR_KL, TDX_TD_ATTR_TPA, TDX_TD_ATTR_PERFMON
+
+# From Intel Trust Domain Extensions Module Base Architecture Specification,
+# Table 11.9: Extended Features Enumeration and Execution Control.
+# These loosely resemble the XFEATURE_MASK_* flags in the kernel.
+define XFAM_FP	(1 << 0)
+define XFAM_SSE	(1 << 1)
+define XFAM_AVX	(1 << 2)
+# MPX is XFAM[4:3] and must be 0.
+define XFAM_AVX512	(7 << 5)
+define XFAM_PT	(1 << 8)
+define XFAM_PK	(1 << 9)
+define XFAM_ENQCMD	(1 << 10)
+define XFAM_CET	(3 << 11)
+define XFAM_HDC	(1 << 13)
+define XFAM_ULI	(1 << 14)
+define XFAM_LBR	(1 << 15)
+define XFAM_HWP	(1 << 16)
+define XFAM_AMX	(3 << 17)
+define XFAM_APX	(1 << 19)
+tdx_xfam = 0, XFAM_FP, XFAM_SSE, XFAM_AVX, XFAM_AVX512, XFAM_PT, XFAM_PK, XFAM_ENQCMD, XFAM_CET, XFAM_HDC, XFAM_ULI, XFAM_LBR, XFAM_HWP, XFAM_AMX, XFAM_APX
+
+kvm_tdx_init_vm {
+	attributes	flags[tdx_attrs, int64]
+	xfam		flags[tdx_xfam, int64]
+	mrconfigid	array[int64, 6]
+	mrowner		array[int64, 6]
+	mrownerconfig	array[int64, 6]
+	reserved	array[const[0, int64], 12]
+	cpuid		kvm_cpuid2
+}
+
+kvm_tdx_init_mem_region {
+	source_addr	vma64
+	gpa		flags[kvm_guest_addrs, int64]
+	nr_pages	int64
+}
+
 kvm_enc_region {
 	addr	flags[kvm_guest_addrs, int64]
 	size	flags[kvm_guest_addr_size, int64]
@@ -486,11 +639,11 @@ ioctl$KVM_TRANSLATE(fd fd_kvmcpu, cmd const[KVM_TRANSLATE], arg ptr[inout, kvm_t
 # KVM_GET_MSRS can be both a system and a vcpu ioctl: https://docs.kernel.org/virt/kvm/api.html#kvm-get-msrs
 ioctl$KVM_GET_MSRS_sys(fd fd_kvm, cmd const[KVM_GET_MSRS], arg ptr[inout, kvm_msrs])
 ioctl$KVM_GET_MSRS_cpu(fd fd_kvmcpu, cmd const[KVM_GET_MSRS], arg ptr[inout, kvm_msrs])
-ioctl$KVM_SET_MSRS(fd fd_kvmcpu, cmd const[KVM_SET_MSRS], arg ptr[in, kvm_msrs])
-ioctl$KVM_SET_CPUID(fd fd_kvmcpu, cmd const[KVM_SET_CPUID], arg ptr[in, kvm_cpuid])
+ioctl$KVM_SET_MSRS(fd fd_kvmcpu, cmd const[KVM_SET_MSRS], arg ptr[in, kvm_msrs]) (no_squash)
+ioctl$KVM_SET_CPUID(fd fd_kvmcpu, cmd const[KVM_SET_CPUID], arg ptr[in, kvm_cpuid]) (no_squash)
 # NEED: we should be able to read kvm_cpuid2 with KVM_GET_CPUID2, alter few bits and then call KVM_SET_CPUID2 with that object.
 ioctl$KVM_GET_CPUID2(fd fd_kvmcpu, cmd const[KVM_GET_CPUID2], arg ptr[out, kvm_cpuid2])
-ioctl$KVM_SET_CPUID2(fd fd_kvmcpu, cmd const[KVM_SET_CPUID2], arg ptr[in, kvm_cpuid2])
+ioctl$KVM_SET_CPUID2(fd fd_kvmcpu, cmd const[KVM_SET_CPUID2], arg ptr[in, kvm_cpuid2]) (no_squash)
 ioctl$KVM_GET_SUPPORTED_CPUID(fd fd_kvm, cmd const[KVM_GET_SUPPORTED_CPUID], arg ptr[inout, kvm_cpuid2])
 # KVM_GET_SUPPORTED_HV_CPUID is both a system and a vcpu ioctl: https://docs.kernel.org/virt/kvm/api.html#kvm-get-supported-hv-cpuid
 ioctl$KVM_GET_SUPPORTED_HV_CPUID_sys(fd fd_kvm, cmd const[KVM_GET_SUPPORTED_HV_CPUID], arg ptr[inout, kvm_cpuid2])
@@ -542,28 +695,61 @@ kvm_guest_debug_arch_x86 {
 	reg	array[int64, 8]
 }
 
-kvm_nested_state {
+kvm_vmx_smm {
+	flags	flags[kvm_nested_smm_flags, int16]
+}
+
+# Size must be 120 bytes to start data at 128 bytes.
+kvm_vmx_nested_state_hdr {
+	vmxon_pa			flags[kvm_guest_addrs, int64]
+	vmcs12_pa			flags[kvm_guest_addrs, int64]
+	smm				kvm_vmx_smm
+	flags				flags[kvm_vmx_nested_state_hdr_flags, int32]
+	preemption_timer_deadline	int64
+} [size[120]]
+
+kvm_vmx_nested_state_data {
+	vmcs12		array[int8, KVM_STATE_NESTED_VMX_VMCS_SIZE]
+	shadow_vmcs12	array[int8, KVM_STATE_NESTED_VMX_VMCS_SIZE]
+}
+
+# format = KVM_STATE_NESTED_FORMAT_VMX
+kvm_nested_state_vmx {
 	flags	flags[kvm_nested_state_flags, int16]
 	format	const[0, int16]
 	size	bytesize[parent, int32]
-	hdr	kvm_vmx_nested_state
-	data	void
+	hdr	kvm_vmx_nested_state_hdr
+	data	kvm_vmx_nested_state_data
 }
 
-kvm_nested_state_arg {
-	state		kvm_nested_state
-	current_vmcs	array[int8, VMCS12_SIZE]
-	shadow_vmcs	array[int8, VMCS12_SIZE]
-}
-
-kvm_vmx_nested_state {
-	vmxon_pa	flags[kvm_guest_addrs, int64]
-	vmcs_pa		flags[kvm_guest_addrs, int64]
-	smm_flags	flags[kvm_nested_smm_flags, int16]
+# SVM descriptions taken from https://elixir.bootlin.com/linux/latest/source/arch/x86/include/uapi/asm/kvm.h
+# Size must be 120 bytes to start data at 128 bytes.
+kvm_svm_nested_state_hdr {
+	vmcb_pa	flags[kvm_guest_addrs, int64]
 } [size[120]]
 
-kvm_nested_state_flags = KVM_STATE_NESTED_GUEST_MODE, KVM_STATE_NESTED_RUN_PENDING
+kvm_svm_nested_state_data {
+	vmcb12	array[int8, KVM_STATE_NESTED_SVM_VMCB_SIZE]
+}
+
+# format = KVM_STATE_NESTED_FORMAT_SVM
+kvm_nested_state_svm {
+	flags	flags[kvm_nested_state_flags, int16]
+	format	const[1, int16]
+	size	bytesize[parent, int32]
+	hdr	kvm_svm_nested_state_hdr
+	data	kvm_svm_nested_state_data
+}
+
+# See https://docs.kernel.org/virt/kvm/api.html#kvm-get-nested-state.
+kvm_nested_state_arg [
+	vmx	kvm_nested_state_vmx
+	svm	kvm_nested_state_svm
+] [varlen]
+
+kvm_nested_state_flags = KVM_STATE_NESTED_GUEST_MODE, KVM_STATE_NESTED_RUN_PENDING, KVM_STATE_NESTED_EVMCS, KVM_STATE_NESTED_MTF_PENDING, KVM_STATE_NESTED_GIF_SET
 kvm_nested_smm_flags = KVM_STATE_NESTED_SMM_GUEST_MODE, KVM_STATE_NESTED_SMM_VMXON
+kvm_vmx_nested_state_hdr_flags = KVM_STATE_VMX_PREEMPTION_TIMER_DEADLINE
 
 kvm_cpuid_entry {
 	func	flags[kvm_cpu_function, int32]

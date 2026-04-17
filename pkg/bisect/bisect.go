@@ -36,8 +36,8 @@ type Config struct {
 	Syzkaller       SyzkallerConfig
 	Repro           ReproConfig
 	Manager         *mgrconfig.Config
-	BuildSemaphore  *instance.Semaphore
-	TestSemaphore   *instance.Semaphore
+	BuildSemaphore  *osutil.Semaphore
+	TestSemaphore   *osutil.Semaphore
 	BuildCPUs       int
 	// CrossTree specifies whether a cross tree bisection is to take place, i.e.
 	// Kernel.Commit is not reachable from Kernel.Branch.
@@ -683,7 +683,7 @@ func (env *env) test() (*testResult, error) {
 
 	testStart := time.Now()
 
-	results, err := env.inst.Test(numTests, cfg.Repro.Syz, cfg.Repro.Opts, cfg.Repro.C)
+	results, err := env.inst.Test(numTests, cfg.Repro.Syz, cfg.Repro.Opts, cfg.Repro.C, false)
 	env.testTime += time.Since(testStart)
 	if err != nil {
 		problem := fmt.Sprintf("repro testing failure: %v", err)
@@ -1057,11 +1057,11 @@ func (env *env) log(msg string) {
 	env.logf("%v", msg)
 }
 
-func (env *env) logf(msg string, args ...interface{}) {
+func (env *env) logf(msg string, args ...any) {
 	if false {
 		_ = fmt.Sprintf(msg, args...) // enable printf checker
 	}
-	env.cfg.Trace.Log(msg, args...)
+	env.cfg.Trace.Logf(msg, args...)
 }
 
 // pickReleaseTags() picks a subset of revisions to test.

@@ -11,9 +11,11 @@ import (
 	"github.com/google/syzkaller/syz-cluster/pkg/api"
 	"github.com/google/syzkaller/syz-cluster/pkg/app"
 	"github.com/google/syzkaller/syz-cluster/pkg/controller"
+	"github.com/google/syzkaller/syz-cluster/pkg/db"
 	"github.com/google/syzkaller/syz-cluster/pkg/emailclient"
 	"github.com/google/syzkaller/syz-cluster/pkg/reporter"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var testEmailConfig = emailclient.TestEmailConfig()
@@ -21,7 +23,7 @@ var testEmailConfig = emailclient.TestEmailConfig()
 func TestModerationReportFlow(t *testing.T) {
 	env, ctx := app.TestEnvironment(t)
 	testSeries := controller.DummySeries()
-	handler, _, emailServer := setupHandlerTest(t, env, ctx, testSeries)
+	handler, _, emailServer, _ := setupHandlerTest(t, ctx, env, testSeries)
 
 	report, err := handler.PollAndReport(ctx)
 	assert.NoError(t, err)
@@ -64,10 +66,42 @@ func TestModerationReportFlow(t *testing.T) {
 	}, receivedEmail)
 }
 
+func TestReportInvalidationFlow(t *testing.T) {
+	env, ctx := app.TestEnvironment(t)
+	testSeries := controller.DummySeries()
+	handler, _, emailServer, _ := setupHandlerTest(t, ctx, env, testSeries)
+
+	report, err := handler.PollAndReport(ctx)
+	require.NoError(t, err)
+
+	receivedEmail := emailServer.email()
+	require.NotNil(t, receivedEmail, "a moderation email must be sent")
+	receivedEmail.Body = nil // for now don't validate the body
+
+	// Emulate an "upstream" command.
+	err = handler.IncomingEmail(ctx, &email.Email{
+		BugIDs: []string{report.ID},
+		Commands: []*email.SingleCommand{
+			{
+				Command: email.CmdInvalid,
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	// The report must be not sent upstream.
+	report, err = handler.PollAndReport(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, report)
+
+	receivedEmail = emailServer.email()
+	assert.Nil(t, receivedEmail, "an email must not be sent upstream")
+}
+
 func TestInvalidReply(t *testing.T) {
 	env, ctx := app.TestEnvironment(t)
 	testSeries := controller.DummySeries()
-	handler, _, emailServer := setupHandlerTest(t, env, ctx, testSeries)
+	handler, _, emailServer, _ := setupHandlerTest(t, ctx, env, testSeries)
 
 	report, err := handler.PollAndReport(ctx)
 	assert.NoError(t, err)
@@ -101,6 +135,7 @@ func TestInvalidReply(t *testing.T) {
 			Commands: []*email.SingleCommand{
 				{
 					Command: email.CmdFix,
+					Str:     "fix:",
 				},
 			},
 			Body: `#syz fix: abcd`,
@@ -115,7 +150,7 @@ func TestInvalidReply(t *testing.T) {
 			InReplyTo: "user-reply-msg-id",
 			Body: []byte(`> #syz fix: abcd
 
-Unknown command
+syzbot-ci does not support` + " `fix:` " + `command
 
 `),
 		}, reply)
@@ -156,10 +191,105 @@ Unknown command
 	})
 }
 
-func setupHandlerTest(t *testing.T, env *app.AppEnvironment, ctx context.Context,
-	series *api.Series) (*Handler, *api.ReporterClient, *fakeSender) {
+func TestSyzTestFlow(t *testing.T) {
+	env, ctx := app.TestEnvironment(t)
+	testSeries := controller.DummySeries()
+	handler, _, emailServer, _ := setupHandlerTest(t, ctx, env, testSeries)
+
+	report, err := handler.PollAndReport(ctx)
+	require.NoError(t, err)
+	receivedEmail := emailServer.email()
+	require.NotNil(t, receivedEmail, "a moderation email must be sent")
+
+	err = handler.IncomingEmail(ctx, &email.Email{
+		Author:    "user@email.com",
+		BugIDs:    []string{report.ID},
+		MessageID: "user-reply-msg-id",
+		Cc:        []string{"test-cc@email.com", "other@email.com"},
+		Patch:     "--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-a\n+b\n",
+		Commands: []*email.SingleCommand{
+			{
+				Command: email.CmdTest,
+				Str:     "test",
+			},
+		},
+	})
+	require.NoError(t, err)
+	reply := emailServer.email()
+	assert.Nil(t, reply, "syz test should be silent on success")
+
+	repo := db.NewSessionRepository(env.Spanner)
+	list, _, err := repo.ListWaiting(context.Background(), nil, 2)
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	controller.FakeJobSession(t, env, handler.apiClient, list[0].ID)
+
+	generator := reporter.NewGenerator(env)
+	err = generator.Process(ctx, 1)
+	require.NoError(t, err)
+
+	_, err = handler.PollAndReport(ctx)
+	require.NoError(t, err)
+
+	reportReply := emailServer.email()
+	require.NotNil(t, reportReply, "an email must be sent with the test results")
+	assert.Equal(t, "user-reply-msg-id", reportReply.InReplyTo)
+	assert.Equal(t, []string{"user@email.com", "test-cc@email.com", "other@email.com"}, reportReply.To)
+	assert.Equal(t, append([]string{testEmailConfig.ArchiveList}, testEmailConfig.ReportCC...), reportReply.Cc)
+	assert.Contains(t, string(reportReply.Body), "passed")
+	assert.Contains(t, string(reportReply.Body), "/session/"+list[0].ID)
+
+	// Some error cases.
+	t.Run("missing patch", func(t *testing.T) {
+		err = handler.IncomingEmail(ctx, &email.Email{
+			Author:    "user@email.com",
+			Subject:   "Command",
+			BugIDs:    []string{report.ID},
+			MessageID: "user-reply-msg-id-2",
+			Cc:        []string{"error-cc1@email.com"},
+			Commands: []*email.SingleCommand{
+				{
+					Command: email.CmdTest,
+					Str:     "test",
+				},
+			},
+		})
+		require.NoError(t, err)
+		reply = emailServer.email()
+		require.NotNil(t, reply)
+		assert.Contains(t, string(reply.Body), "Please attach the patch to act upon")
+		assert.Equal(t, []string{"user@email.com"}, reply.To)
+		assert.Equal(t, []string{"error-cc1@email.com"}, reply.Cc)
+	})
+
+	t.Run("with args", func(t *testing.T) {
+		err = handler.IncomingEmail(ctx, &email.Email{
+			Author:    "user@email.com",
+			Subject:   "Command",
+			BugIDs:    []string{report.ID},
+			MessageID: "user-reply-msg-id-3",
+			Cc:        []string{"error-cc2@email.com"},
+			Commands: []*email.SingleCommand{
+				{
+					Command: email.CmdTest,
+					Args:    "git://repo.git branch",
+					Str:     "test:",
+				},
+			},
+		})
+		require.NoError(t, err)
+		reply = emailServer.email()
+		require.NotNil(t, reply)
+		assert.Contains(t, string(reply.Body), "does not support `#syz test` with arguments.")
+		assert.Equal(t, []string{"user@email.com"}, reply.To)
+		assert.Equal(t, []string{"error-cc2@email.com"}, reply.Cc)
+	})
+}
+
+func setupHandlerTest(t *testing.T, ctx context.Context, env *app.AppEnvironment,
+	series *api.Series) (*Handler, *api.ReporterClient, *fakeSender, controller.EntityIDs) {
 	client := controller.TestServer(t, env)
-	controller.FakeSeriesWithFindings(t, ctx, env, client, series)
+	ids := controller.FakeSeriesWithFindings(t, ctx, env, client, series)
 
 	generator := reporter.NewGenerator(env)
 	err := generator.Process(ctx, 1)
@@ -168,12 +298,14 @@ func setupHandlerTest(t *testing.T, env *app.AppEnvironment, ctx context.Context
 	emailServer := makeFakeSender()
 	reporterClient := reporter.TestServer(t, env)
 	handler := &Handler{
-		reporter:    api.LKMLReporter,
-		apiClient:   reporterClient,
-		emailConfig: testEmailConfig,
-		sender:      emailServer.send,
+		reporter:       api.LKMLReporter,
+		reporterClient: reporterClient,
+		apiClient:      client,
+		emailConfig:    testEmailConfig,
+		sender:         emailServer.send,
 	}
-	return handler, reporterClient, emailServer
+
+	return handler, reporterClient, emailServer, ids.EntityIDs
 }
 
 type fakeSender struct {

@@ -41,6 +41,7 @@ type ParseTest struct {
 	EndLine    string
 	Corrupted  bool
 	Suppressed bool
+	Panicked   bool
 	HasReport  bool
 	Report     []byte
 	Executor   string
@@ -52,6 +53,7 @@ func (test *ParseTest) Equal(other *ParseTest) bool {
 	if test.Title != other.Title ||
 		test.Corrupted != other.Corrupted ||
 		test.Suppressed != other.Suppressed ||
+		test.Panicked != other.Panicked ||
 		test.Type != other.Type {
 		return false
 	}
@@ -69,7 +71,9 @@ func (test *ParseTest) Equal(other *ParseTest) bool {
 
 func (test *ParseTest) Headers() []byte {
 	buf := new(bytes.Buffer)
-	fmt.Fprintf(buf, "TITLE: %v\n", test.Title)
+	if test.Title != "" {
+		fmt.Fprintf(buf, "TITLE: %v\n", test.Title)
+	}
 	for _, t := range test.AltTitles {
 		fmt.Fprintf(buf, "ALT: %v\n", t)
 	}
@@ -84,6 +88,9 @@ func (test *ParseTest) Headers() []byte {
 	}
 	if test.Suppressed {
 		fmt.Fprintf(buf, "SUPPRESSED: Y\n")
+	}
+	if test.Panicked {
+		fmt.Fprintf(buf, "PANICKED: Y\n")
 	}
 	if test.Executor != "" {
 		fmt.Fprintf(buf, "EXECUTOR: %s\n", test.Executor)
@@ -157,6 +164,7 @@ func parseHeaderLine(t *testing.T, test *ParseTest, ln string) {
 		endPrefix        = "END: "
 		corruptedPrefix  = "CORRUPTED: "
 		suppressedPrefix = "SUPPRESSED: "
+		panickedPrefix   = "PANICKED: "
 		executorPrefix   = "EXECUTOR: "
 	)
 	switch {
@@ -191,6 +199,15 @@ func parseHeaderLine(t *testing.T, test *ParseTest, ln string) {
 		default:
 			t.Fatalf("unknown SUPPRESSED value %q", v)
 		}
+	case strings.HasPrefix(ln, panickedPrefix):
+		switch v := ln[len(panickedPrefix):]; v {
+		case "Y":
+			test.Panicked = true
+		case "N":
+			test.Panicked = false
+		default:
+			t.Fatalf("unknown PANICKED value %q", v)
+		}
 	case strings.HasPrefix(ln, executorPrefix):
 		test.Executor = ln[len(executorPrefix):]
 	default:
@@ -208,7 +225,8 @@ func testFromReport(rep *Report) *ParseTest {
 		Corrupted:       rep.Corrupted,
 		corruptedReason: rep.CorruptedReason,
 		Suppressed:      rep.Suppressed,
-		Type:            TitleToCrashType(rep.Title),
+		Panicked:        rep.Panicked,
+		Type:            crash.TitleToType(rep.Title),
 		Frame:           rep.Frame,
 		Report:          rep.Report,
 	}
@@ -293,6 +311,10 @@ func checkReport(t *testing.T, reporter *Reporter, rep *Report, test *ParseTest)
 
 func updateReportTest(t *testing.T, test, parsed *ParseTest) {
 	buf := new(bytes.Buffer)
+	if test.Frame == "" {
+		// Don't create "FRAME:" record, only update existing.
+		parsed.Frame = ""
+	}
 	buf.Write(parsed.Headers())
 	fmt.Fprintf(buf, "\n%s", test.Log)
 	if test.HasReport {

@@ -243,6 +243,9 @@ func TestMutateRandom(t *testing.T) {
 	next:
 		for i := 0; i < iters; i++ {
 			p := target.Generate(rs, 10, ct)
+			if p.countArgs() > maxArgCutoff {
+				continue
+			}
 			data0 := p.Serialize()
 			p1 := p.Clone()
 			// There is a chance that mutation will produce the same program.
@@ -502,4 +505,4 @@ func BenchmarkStoreLoadInt(b *testing.B) {
 	}
 }
 
-var sink interface{}
+var sink any

@@ -32,13 +32,7 @@ $(warning $(RED)run command via tools/syz-env for best compatibility, see:$(RESE
 $(warning $(RED)https://github.com/google/syzkaller/blob/master/docs/contributing.md#using-syz-env$(RESET))
 endif
 
-GITREV=$(shell git rev-parse HEAD)
-ifeq ("$(shell git diff --shortstat)", "")
-	REV=$(GITREV)
-else
-	REV=$(GITREV)+
-endif
-GITREVDATE=$(shell git log -n 1 --format="%cd" --date=format:%Y%m%d-%H%M%S)
+include tools/version.mk
 
 # Don't generate symbol table and DWARF debug info.
 # Reduces build time and binary sizes considerably.
@@ -55,6 +49,7 @@ GOFLAGS := -ldflags="$(GLFLAGS) -X github.com/google/syzkaller/prog.GitRevision=
 ifneq ("$(GOTAGS)", "")
 	GOFLAGS += " -tags=$(GOTAGS)"
 endif
+
 
 GOHOSTFLAGS ?= $(GOFLAGS)
 GOTARGETFLAGS ?= $(GOFLAGS)
@@ -104,7 +99,7 @@ ifeq ("$(TARGETOS)", "trusty")
 endif
 
 .PHONY: all clean host target \
-	manager executor kfuzztest ci hub \
+	manager executor kfuzztest ci hub agent \
 	execprog mutate prog2c trace2syz repro upgrade db \
 	usbgen symbolize cover kconf syz-build crush \
 	bin/syz-extract bin/syz-fmt \
@@ -172,6 +167,10 @@ ci: descriptions
 hub: descriptions
 	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-hub github.com/google/syzkaller/syz-hub
 
+agent: descriptions
+	# syz-agent uses codesearch clang tool which requires cgo.
+	CGO_ENABLED=1 GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-agent github.com/google/syzkaller/syz-agent
+
 repro: descriptions
 	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-repro github.com/google/syzkaller/tools/syz-repro
 
@@ -226,8 +225,7 @@ kfuzztest:
 endif
 
 verifier: descriptions
-	# TODO: switch syz-verifier to use syz-executor.
-	# GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-verifier github.com/google/syzkaller/syz-verifier
+	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-verifier github.com/google/syzkaller/syz-verifier
 
 # `extract` extracts const files from various kernel sources, and may only
 # re-generate parts of files.
@@ -269,11 +267,13 @@ format_keep_sorted:
 	find . -name "*.yml" -exec bin/keep-sorted {} \;
 
 format_cpp:
-	clang-format --style=file -i executor/*.cc executor/*.h \
-		executor/android/android_seccomp.h \
-		tools/kcovtrace/*.c tools/kcovfuzzer/*.c tools/fops_probe/*.cc \
-		tools/clang/*.h \
-		tools/clang/declextract/*.h tools/clang/declextract/*.cpp
+	# Exclude auto-generated and canned files.
+	git ls-files '*.h' '*.c' '*.cc' '*.cpp' | grep -Ev \
+"executor/_include/flatbuffers/\
+|pkg/flatrpc/flatrpc.h\
+|pkg/covermerger/testdata/integration/\
+|executor/android/.*_policy.h" \
+	| xargs -I {} -P 0 clang-format --style=file -i {}
 
 format_sys: bin/syz-fmt
 	bin/syz-fmt all
@@ -392,7 +392,8 @@ presubmit_gvisor: host target
 	./tools/gvisor-smoke-test.sh
 
 test: descriptions
-	$(GO) test -short -coverprofile=.coverage.txt ./...
+	# Clang tools require cgo.
+	CGO_ENABLED=1 $(GO) test -short -coverprofile=.coverage.txt ./...
 
 clean:
 	rm -rf ./bin .descriptions executor/defs.h executor/syscalls.h sys/gen sys/register.go

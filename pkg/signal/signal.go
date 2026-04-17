@@ -122,10 +122,10 @@ func (s Signal) ToRaw() []uint64 {
 
 type Context struct {
 	Signal  Signal
-	Context interface{}
+	Context any
 }
 
-func Minimize(corpus []Context) []interface{} {
+func Minimize(corpus []Context) []any {
 	type ContextPrio struct {
 		prio prioType
 		idx  int
@@ -145,7 +145,7 @@ func Minimize(corpus []Context) []interface{} {
 	for _, cp := range covered {
 		indices[cp.idx] = struct{}{}
 	}
-	result := make([]interface{}, 0, len(indices))
+	result := make([]any, 0, len(indices))
 	for idx := range indices {
 		result = append(result, corpus[idx].Context)
 	}

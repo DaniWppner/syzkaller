@@ -9,10 +9,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"cloud.google.com/go/spanner"
+	"github.com/google/syzkaller/syz-cluster/pkg/api"
 	"github.com/google/uuid"
 	"google.golang.org/api/iterator"
 )
@@ -34,19 +36,17 @@ func NewSeriesRepository(client *spanner.Client) *SeriesRepository {
 }
 
 // TODO: move to SeriesPatchesRepository?
-// nolint:dupl
 func (repo *SeriesRepository) PatchByID(ctx context.Context, id string) (*Patch, error) {
 	return readEntity[Patch](ctx, repo.client.Single(), spanner.Statement{
 		SQL:    "SELECT * FROM Patches WHERE ID=@id",
-		Params: map[string]interface{}{"id": id},
+		Params: map[string]any{"id": id},
 	})
 }
 
-// nolint:dupl
 func (repo *SeriesRepository) GetByExtID(ctx context.Context, extID string) (*Series, error) {
 	return readEntity[Series](ctx, repo.client.Single(), spanner.Statement{
 		SQL:    "SELECT * FROM Series WHERE ExtID=@extID",
-		Params: map[string]interface{}{"extID": extID},
+		Params: map[string]any{"extID": extID},
 	})
 }
 
@@ -74,7 +74,7 @@ func (repo *SeriesRepository) Insert(ctx context.Context, series *Series,
 			// Check if the series already exists.
 			stmt := spanner.Statement{
 				SQL:    "SELECT 1 from `Series` WHERE `ExtID`=@extID",
-				Params: map[string]interface{}{"ExtID": series.ExtID},
+				Params: map[string]any{"ExtID": series.ExtID},
 			}
 			iter := txn.Query(ctx, stmt)
 			defer iter.Stop()
@@ -127,11 +127,13 @@ type SeriesWithSession struct {
 }
 
 type SeriesFilter struct {
-	Cc           string
-	Status       SessionStatus
-	WithFindings bool
-	Limit        int
-	Offset       int
+	Cc            string
+	Status        SessionStatus
+	WithFindings  bool
+	PreventedBugs bool
+	Limit         int
+	Offset        int
+	Name          string
 }
 
 // ListLatest() returns the list of series ordered by the decreasing PublishedAt value.
@@ -141,40 +143,72 @@ func (repo *SeriesRepository) ListLatest(ctx context.Context, filter SeriesFilte
 	defer ro.Close()
 
 	stmt := spanner.Statement{
-		SQL:    "SELECT Series.* FROM Series WHERE 1=1",
-		Params: map[string]interface{}{},
+		SQL:    "SELECT Series.* FROM Series",
+		Params: map[string]any{},
 	}
+	var conds []string
+
 	if !maxPublishedAt.IsZero() {
-		stmt.SQL += " AND PublishedAt < @toTime"
+		conds = append(conds, "PublishedAt < @toTime")
 		stmt.Params["toTime"] = maxPublishedAt
 	}
 	if filter.Cc != "" {
-		stmt.SQL += " AND @cc IN UNNEST(Cc)"
+		conds = append(conds, "@cc IN UNNEST(Cc)")
 		stmt.Params["cc"] = filter.Cc
+	}
+	if filter.Name != "" {
+		conds = append(conds, `ID IN(
+SELECT ID FROM SERIES 
+WHERE SEARCH(Series.TitleTokens, @name)
+UNION DISTINCT
+SELECT SeriesID FROM Patches
+WHERE SEARCH(Patches.TitleTokens, @name)
+)`)
+		stmt.Params["name"] = filter.Name
 	}
 	if filter.Status != SessionStatusAny {
 		// It could have been an INNER JOIN in the main query, but let's favor the simpler code
 		// in this function.
 		// The optimizer should transform the query to a JOIN anyway.
-		stmt.SQL += " AND EXISTS(SELECT 1 FROM Sessions WHERE"
-		switch filter.Status {
-		case SessionStatusWaiting:
-			stmt.SQL += " Sessions.SeriesID = Series.ID AND Sessions.StartedAt IS NULL"
-		case SessionStatusInProgress:
-			stmt.SQL += " Sessions.ID = Series.LatestSessionID AND Sessions.FinishedAt IS NULL"
-		case SessionStatusFinished:
-			stmt.SQL += " Sessions.ID = Series.LatestSessionID AND Sessions.FinishedAt IS NOT NULL" +
-				" AND Sessions.SkipReason IS NULL"
-		case SessionStatusSkipped:
-			stmt.SQL += " Sessions.ID = Series.LatestSessionID AND Sessions.SkipReason IS NOT NULL"
-		default:
-			return nil, fmt.Errorf("unknown status value: %q", filter.Status)
+		if filter.Status == SessionStatusStepsFailed {
+			// Ideally we should have also considered all Sessions related to each Series,
+			// but for the current use cases this extra complication is not worth it, so
+			// let's just look at the session steps of the latest session.
+			conds = append(conds, "Series.LatestSessionID IS NOT NULL")
+			conds = append(conds, "EXISTS("+
+				"SELECT 1 FROM SessionTests WHERE "+
+				"SessionTests.SessionID = Series.LatestSessionID AND SessionTests.Result = @testResult)")
+			stmt.Params["testResult"] = api.TestFailed
+		} else {
+			var statusCond = "EXISTS(SELECT 1 FROM Sessions WHERE"
+			switch filter.Status {
+			case SessionStatusWaiting:
+				statusCond += " Sessions.SeriesID = Series.ID AND Sessions.StartedAt IS NULL"
+			case SessionStatusInProgress:
+				statusCond += " Sessions.ID = Series.LatestSessionID AND Sessions.FinishedAt IS NULL"
+			case SessionStatusFinished:
+				statusCond += " Sessions.ID = Series.LatestSessionID AND Sessions.FinishedAt IS NOT NULL" +
+					" AND Sessions.SkipReason IS NULL"
+			case SessionStatusSkipped:
+				statusCond += " Sessions.ID = Series.LatestSessionID AND Sessions.SkipReason IS NOT NULL"
+			default:
+				return nil, fmt.Errorf("unknown status value: %q", filter.Status)
+			}
+			statusCond += ")"
+			conds = append(conds, statusCond)
 		}
-		stmt.SQL += ")"
 	}
 	if filter.WithFindings {
-		stmt.SQL += " AND Series.LatestSessionID IS NOT NULL " +
-			"AND EXISTS(SELECT 1 FROM Findings WHERE Findings.SessionID = Series.LatestSessionID)"
+		conds = append(conds, "Series.LatestSessionID IS NOT NULL AND EXISTS("+
+			"SELECT 1 FROM Findings WHERE "+
+			"Findings.SessionID = Series.LatestSessionID AND Findings.InvalidatedAt IS NULL)")
+	}
+	if filter.PreventedBugs {
+		conds = append(conds, "EXISTS("+
+			"SELECT 1 FROM SeriesStats WHERE SeriesStats.ID = Series.ID AND SeriesStats.PreventedBugs > 0)")
+	}
+	if len(conds) != 0 {
+		stmt.SQL += " WHERE " + strings.Join(conds, " AND ")
 	}
 	stmt.SQL += " ORDER BY PublishedAt DESC, ID"
 	if filter.Limit > 0 {
@@ -209,6 +243,31 @@ func (repo *SeriesRepository) ListLatest(ctx context.Context, filter SeriesFilte
 	return ret, nil
 }
 
+func (repo *SeriesRepository) ListAllVersions(ctx context.Context, title string) ([]*Series, error) {
+	ro := repo.client.ReadOnlyTransaction()
+	defer ro.Close()
+	return readEntities[Series](ctx, ro, spanner.Statement{
+		SQL: "SELECT ID, Version FROM SERIES where Title = @title ORDER BY Version",
+		Params: map[string]any{
+			"title": title,
+		},
+	})
+}
+
+func (repo *SeriesRepository) ListPreviousVersions(ctx context.Context, series *Series) ([]*Series, error) {
+	ro := repo.client.ReadOnlyTransaction()
+	defer ro.Close()
+	return readEntities[Series](ctx, ro, spanner.Statement{
+		SQL: "SELECT * FROM Series WHERE Title = @title " +
+			"AND PublishedAt <= @publishedAt AND Version < @version ORDER BY Version",
+		Params: map[string]any{
+			"title":       series.Title,
+			"publishedAt": series.PublishedAt,
+			"version":     series.Version,
+		},
+	})
+}
+
 func (repo *SeriesRepository) querySessions(ctx context.Context, ro *spanner.ReadOnlyTransaction,
 	seriesList []*SeriesWithSession) error {
 	idToSeries := map[string]*SeriesWithSession{}
@@ -225,7 +284,7 @@ func (repo *SeriesRepository) querySessions(ctx context.Context, ro *spanner.Rea
 	}
 	sessions, err := readEntities[Session](ctx, ro, spanner.Statement{
 		SQL: "SELECT * FROM Sessions WHERE ID IN UNNEST(@ids)",
-		Params: map[string]interface{}{
+		Params: map[string]any{
 			"ids": keys,
 		},
 	})
@@ -262,8 +321,9 @@ func (repo *SeriesRepository) queryFindingCounts(ctx context.Context, ro *spanne
 	}
 	list, err := readEntities[findingCount](ctx, repo.client.Single(), spanner.Statement{
 		SQL: "SELECT `SessionID`, COUNT(`ID`) as `Count` FROM `Findings` " +
-			"WHERE `SessionID` IN UNNEST(@ids) GROUP BY `SessionID`",
-		Params: map[string]interface{}{
+			"WHERE `SessionID` IN UNNEST(@ids) AND `Findings`.`InvalidatedAt` IS NULL " +
+			"GROUP BY `SessionID`",
+		Params: map[string]any{
 			"ids": keys,
 		},
 	})
@@ -277,11 +337,10 @@ func (repo *SeriesRepository) queryFindingCounts(ctx context.Context, ro *spanne
 }
 
 // golint sees too much similarity with SessionRepository's ListForSeries, but in reality there's not.
-// nolint:dupl
 func (repo *SeriesRepository) ListPatches(ctx context.Context, series *Series) ([]*Patch, error) {
 	return readEntities[Patch](ctx, repo.client.Single(), spanner.Statement{
 		SQL: "SELECT * FROM `Patches` WHERE `SeriesID` = @seriesID ORDER BY `Seq`",
-		Params: map[string]interface{}{
+		Params: map[string]any{
 			"seriesID": series.ID,
 		},
 	})

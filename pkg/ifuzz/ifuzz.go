@@ -5,10 +5,12 @@ package ifuzz
 
 import (
 	"math/rand"
+	"slices"
 
 	_ "github.com/google/syzkaller/pkg/ifuzz/arm64/generated" // pull in generated instruction descriptions
 	"github.com/google/syzkaller/pkg/ifuzz/iset"
 	_ "github.com/google/syzkaller/pkg/ifuzz/powerpc/generated" // pull in generated instruction descriptions
+	_ "github.com/google/syzkaller/pkg/ifuzz/riscv64/generated" // pull in generated instruction descriptions
 	_ "github.com/google/syzkaller/pkg/ifuzz/x86/generated"     // pull in generated instruction descriptions
 )
 
@@ -22,6 +24,7 @@ const (
 	ArchX86     = iset.ArchX86
 	ArchPowerPC = iset.ArchPowerPC
 	ArchArm64   = iset.ArchArm64
+	ArchRiscv64 = iset.ArchRiscv64
 	ModeLong64  = iset.ModeLong64
 	ModeProt32  = iset.ModeProt32
 	ModeProt16  = iset.ModeProt16
@@ -116,7 +119,7 @@ func randInsn(cfg *Config, r *rand.Rand) iset.Insn {
 
 func split(cfg *Config, text []byte) [][]byte {
 	insnset := iset.Arches[cfg.Arch]
-	text = append([]byte{}, text...)
+	text = slices.Clone(text)
 	var insns [][]byte
 	var bad []byte
 	for len(text) != 0 {

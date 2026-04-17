@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -63,8 +64,9 @@ func ctorLinux(cfg *config) (reporterImpl, []string, error) {
 		vmlinux: vmlinux,
 		symbols: symbols,
 	}
-	// nolint: lll
-	ctx.consoleOutputRe = regexp.MustCompile(`^(?:\*\* [0-9]+ printk messages dropped \*\* )?(?:.* login: )?(?:\<[0-9]+\>)?\[ *[0-9]+\.[0-9]+\](\[ *(?:C|T)[0-9]+\])? `)
+	ctx.consoleOutputRe = regexp.MustCompile(
+		`^(?:\*\* [0-9]+ printk messages dropped \*\* )?` +
+			`(?:.* login: )?(?:\<[0-9]+\>)?\[ *[0-9]+\.[0-9]+\](\[ *(?:C|T)[0-9]+\])? `)
 	ctx.taskContext = regexp.MustCompile(`\[ *T[0-9]+\]`)
 	ctx.cpuContext = regexp.MustCompile(`\[ *C[0-9]+\]`)
 	ctx.questionableFrame = regexp.MustCompile(`(\[\<[0-9a-f]+\>\])? \? `)
@@ -154,6 +156,8 @@ func ctorLinux(cfg *config) (reporterImpl, []string, error) {
 
 const contextConsole = "console"
 
+var linuxPanickedRe = regexp.MustCompile(`Kernel panic - not syncing`)
+
 func (ctx *linux) ContainsCrash(output []byte) bool {
 	return containsCrash(output, linuxOopses, ctx.ignores)
 }
@@ -190,11 +194,12 @@ func (ctx *linux) Parse(output []byte) *Report {
 		}
 		rep.reportPrefixLen = len(rep.Report)
 		rep.Report = append(rep.Report, report...)
-		rep.Type = TitleToCrashType(rep.Title)
+		rep.Type = crash.TitleToType(rep.Title)
 		setExecutorInfo(rep)
 		if !rep.Corrupted {
 			rep.Corrupted, rep.CorruptedReason = isCorrupted(title, report, format)
 		}
+		rep.Panicked = linuxPanickedRe.Match(output)
 		if rep.CorruptedReason == corruptedNoFrames && context != contextConsole && !questionable {
 			// We used to look at questionable frame with the following incentive:
 			// """
@@ -251,7 +256,7 @@ func (ctx *linux) reportMinLines(oopsLine []byte) int {
 }
 
 // Yes, it is complex, but all state and logic are tightly coupled. It's unclear how to simplify it.
-// nolint: gocyclo, gocognit
+// nolint: gocyclo
 func (ctx *linux) findReport(output []byte, oops *oops, startPos int, context string, useQuestionable bool) (
 	endPos, reportEnd int, report []byte, prefix [][]byte) {
 	// Prepend 5 lines preceding start of the report,
@@ -277,7 +282,7 @@ func (ctx *linux) findReport(output []byte, oops *oops, startPos int, context st
 		stripped, questionable := ctx.stripLinePrefix(line, context1, useQuestionable)
 		if pos < startPos {
 			if context1 == context && len(stripped) != 0 && !questionable {
-				prefix = append(prefix, append([]byte{}, stripped...))
+				prefix = append(prefix, slices.Clone(stripped))
 				if len(prefix) > maxPrefix {
 					prefix = prefix[1:]
 				}
@@ -501,7 +506,7 @@ func parseLinuxBacktraceLine(line []byte) (info linuxBacktraceLine, ok bool) {
 // Note that Assemble() ignores changes to Offset and Size (no reason as these are not updated anywhere).
 func (line linuxBacktraceLine) Assemble() []byte {
 	match := line.indices
-	modified := append([]byte{}, line.raw...)
+	modified := slices.Clone(line.raw)
 	if line.BuildID != "" {
 		modified = replace(modified, match[8], match[9], []byte(" ["+line.ModName+"]"))
 	}
@@ -944,7 +949,7 @@ func isCorrupted(title string, report []byte, format oopsFormat) (bool, string) 
 				break
 			}
 		}
-		if corrupted {
+		if key != riscvSpecialStackStart && corrupted {
 			return true, "no frames in a stack trace"
 		}
 	}
@@ -1140,6 +1145,10 @@ var linuxCorruptedTitles = []*regexp.Regexp{
 	regexp.MustCompile(`\[ *[0-9]+\.[0-9]+\]`),
 }
 
+// In riscv, if show_regs() is called from kernel space, the stack is dumped without a proper indicator. However a
+// missing stack trace does not necessarily mean the log is corrupted. Match the last line printed by show_regs(),
+// before the stack dump.
+var riscvSpecialStackStart = regexp.MustCompile(`status: [0-9a-f]{16} badaddr: [0-9a-f]{16} cause: [0-9a-f]{16}`)
 var linuxStackParams = &stackParams{
 	stackStartRes: []*regexp.Regexp{
 		regexp.MustCompile(`Call (?:T|t)race`),
@@ -1152,6 +1161,8 @@ var linuxStackParams = &stackParams{
 		regexp.MustCompile(`[^k] backtrace(?: \(crc [[:xdigit:]]*\))?:`),
 		regexp.MustCompile(`Backtrace:`),
 		regexp.MustCompile(`Uninit was stored to memory at`),
+		// A special stack trace for RISC-V is handled separately.
+		riscvSpecialStackStart,
 	},
 	frameRes: []*regexp.Regexp{
 		compile("^ *(?:{{PC}} ){0,2}{{FUNC}}"),
@@ -1398,6 +1409,9 @@ var linuxStackParams = &stackParams{
 		"__timer_delete_sync",
 		"sk_stop_timer_sync",
 		"__mod_timer",
+		"fast_dput",
+		"dput",
+		"mark_buffer_dirty",
 	},
 	corruptedLines: []*regexp.Regexp{
 		// Fault injection stacks are frequently intermixed with crash reports.
@@ -1811,7 +1825,7 @@ var linuxOopses = append([]*oops{
 		[]byte("WARNING:"),
 		[]oopsFormat{
 			{
-				title: compile("WARNING: .*lib/debugobjects\\.c.* (?:debug_print|debug_check)"),
+				title: compile("WARNING: .*lib/debugobjects\\.c.* (?:debug_print|debug_check|at)"),
 				fmt:   "WARNING: ODEBUG bug in %[1]v",
 				// Skip all users of ODEBUG as well.
 				stack: warningStackFmt("debug_", "rcu", "hrtimer_", "timer_",
@@ -1819,22 +1833,22 @@ var linuxOopses = append([]*oops{
 					"vfree", "__free_", "debug_check", "kobject_"),
 			},
 			{
-				title: compile("WARNING: .*mm/usercopy\\.c.* usercopy_warn"),
+				title: compile("WARNING: .*mm/usercopy\\.c.* (?:usercopy_warn|at)"),
 				fmt:   "WARNING: bad usercopy in %[1]v",
 				stack: warningStackFmt("usercopy", "__check"),
 			},
 			{
-				title: compile("WARNING: .*lib/kobject\\.c.* kobject_"),
+				title: compile("WARNING: .*lib/kobject\\.c.* (?:kobject_|at)"),
 				fmt:   "WARNING: kobject bug in %[1]v",
 				stack: warningStackFmt("kobject_"),
 			},
 			{
-				title: compile("WARNING: .*fs/proc/generic\\.c.* proc_register"),
+				title: compile("WARNING: .*fs/proc/generic\\.c.* (?:proc_register|at)"),
 				fmt:   "WARNING: proc registration bug in %[1]v",
 				stack: warningStackFmt("proc_"),
 			},
 			{
-				title: compile("WARNING: .*lib/refcount\\.c.* refcount_"),
+				title: compile("WARNING: .*lib/refcount\\.c.* (?:refcount_|at)"),
 				fmt:   "WARNING: refcount bug in %[1]v",
 				stack: warningStackFmt("refcount", "kobject_"),
 			},
@@ -1875,12 +1889,23 @@ var linuxOopses = append([]*oops{
 				stack: warningStackFmt("usb_submit_urb", "usb_start_wait_urb", "usb_bulk_msg", "usb_interrupt_msg", "usb_control_msg"),
 			},
 			{
+				// Format introduced in https://lore.kernel.org/all/20251110114633.202485143@infradead.org/.
+				title: compile(`WARNING: {{SRC}} at 0x\d+, CPU#\d+`),
+				fmt:   "WARNING in %[2]v",
+				stack: warningStackFmt(),
+			},
+			{
 				title: compile("WARNING: .* at {{SRC}} {{FUNC}}"),
 				fmt:   "WARNING in %[3]v",
 				stack: warningStackFmt(),
 			},
 			{
 				title: compile("WARNING: {{SRC}} at {{FUNC}}"),
+				fmt:   "WARNING in %[3]v",
+				stack: warningStackFmt(),
+			},
+			{
+				title: compile(`WARNING: \[.*\] {{SRC}} at {{FUNC}}.*`),
 				fmt:   "WARNING in %[3]v",
 				stack: warningStackFmt(),
 			},

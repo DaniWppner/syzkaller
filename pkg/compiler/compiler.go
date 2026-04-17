@@ -148,12 +148,12 @@ type warn struct {
 	msg string
 }
 
-func (comp *compiler) error(pos ast.Pos, msg string, args ...interface{}) {
+func (comp *compiler) error(pos ast.Pos, msg string, args ...any) {
 	comp.errors++
 	comp.eh(pos, fmt.Sprintf(msg, args...))
 }
 
-func (comp *compiler) warning(pos ast.Pos, msg string, args ...interface{}) {
+func (comp *compiler) warning(pos ast.Pos, msg string, args ...any) {
 	comp.warnings = append(comp.warnings, warn{pos, fmt.Sprintf(msg, args...)})
 }
 
@@ -401,15 +401,6 @@ func (comp *compiler) parseIntType(name string) (size uint64, bigEndian bool) {
 		size /= 8
 	}
 	return size, be
-}
-
-func arrayContains(a []string, v string) bool {
-	for _, s := range a {
-		if s == v {
-			return true
-		}
-	}
-	return false
 }
 
 func (comp *compiler) flattenFlags() {

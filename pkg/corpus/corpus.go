@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"slices"
 	"sync"
 	"time"
 
@@ -150,10 +151,10 @@ func (corpus *Corpus) Save(inp NewInput) {
 			Prog:      old.Prog,
 			Call:      old.Call,
 			HasAny:    old.HasAny,
-			Signal:    newSignal,
 			Timestamp: old.Timestamp,
+			Signal:    newSignal,
 			Cover:     newCover.Serialize(),
-			Updates:   append([]ItemUpdate{}, old.Updates...),
+			Updates:   slices.Clone(old.Updates),
 			areas:     maps.Clone(old.areas),
 		}
 		const maxUpdates = 32

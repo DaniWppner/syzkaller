@@ -23,7 +23,7 @@ import (
 )
 
 type Config struct {
-	ToolBin    string
+	Tool       string // one of compiled-in tool names
 	KernelSrc  string
 	KernelObj  string
 	CacheFile  string
@@ -32,9 +32,9 @@ type Config struct {
 
 type OutputDataPtr[T any] interface {
 	*T
-	Merge(*T)
+	Merge(*T, *Verifier)
 	SetSourceFile(string, func(filename string) string)
-	SortAndDedup()
+	Finalize(*Verifier)
 }
 
 // Run runs the clang tool on all files in the compilation database
@@ -73,15 +73,24 @@ func Run[Output any, OutputPtr OutputDataPtr[Output]](cfg *Config) (OutputPtr, e
 	}
 	close(files)
 
+	v := NewVerifier(cfg.KernelSrc, cfg.KernelObj)
 	out := OutputPtr(new(Output))
 	for range cmds {
 		res := <-results
 		if res.err != nil {
 			return nil, res.err
 		}
-		out.Merge(res.out)
+		out.Merge(res.out, v)
 	}
-	out.SortAndDedup()
+	// Finalize the output (sort, dedup, etc), and let the output verify
+	// that all source file names, line numbers, etc are valid/present.
+	// If there are any bogus entries, it's better to detect them early,
+	// than to crash/error much later when the info is used.
+	// Some of the source files (generated) may be in the obj dir.
+	out.Finalize(v)
+	if err := v.Error(); err != nil {
+		return nil, err
+	}
 	if cfg.CacheFile != "" {
 		osutil.MkdirAll(filepath.Dir(cfg.CacheFile))
 		data, err := json.MarshalIndent(out, "", "\t")
@@ -95,12 +104,68 @@ func Run[Output any, OutputPtr OutputDataPtr[Output]](cfg *Config) (OutputPtr, e
 	return out, nil
 }
 
+type Verifier struct {
+	srcDirs   []string
+	fileCache map[string]int // file->line count (-1 is cached for missing files)
+	err       strings.Builder
+}
+
+func NewVerifier(src ...string) *Verifier {
+	return &Verifier{
+		srcDirs:   src,
+		fileCache: make(map[string]int),
+	}
+}
+
+func (v *Verifier) Error() error {
+	if v.err.Len() == 0 {
+		return nil
+	}
+	return errors.New(v.err.String())
+}
+
+func (v *Verifier) Filename(file string) {
+	if _, ok := v.fileCache[file]; ok {
+		return
+	}
+	for _, srcDir := range v.srcDirs {
+		data, err := os.ReadFile(filepath.Join(srcDir, file))
+		if err != nil {
+			continue
+		}
+		v.fileCache[file] = len(bytes.Split(data, []byte{'\n'}))
+		return
+	}
+	v.fileCache[file] = -1
+	fmt.Fprintf(&v.err, "missing file: %v (src dirs %+v)\n", file, v.srcDirs)
+}
+
+func (v *Verifier) LineRange(file string, start, end int) {
+	v.Filename(file)
+	lines, ok := v.fileCache[file]
+	if !ok || lines < 0 {
+		return
+	}
+	// Line numbers produced by clang are 1-based.
+	if start <= 0 || end < start || end > lines {
+		fmt.Fprintf(&v.err, "bad line range [%v-%v] for file %v with %v lines\n",
+			start, end, file, lines)
+	}
+}
+
 func runTool[Output any, OutputPtr OutputDataPtr[Output]](cfg *Config, dbFile, file string) (OutputPtr, error) {
 	relFile := strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(filepath.Clean(file),
 		cfg.KernelSrc), cfg.KernelObj), "/")
 	// Suppress warning since we may build the tool on a different clang
 	// version that produces more warnings.
-	data, err := exec.Command(cfg.ToolBin, "-p", dbFile, "--extra-arg=-w", file).Output()
+	// Comments are needed for codesearch tool, but may be useful for declextract
+	// in the future if we try to parse them with LLMs.
+	cmd := exec.Command(osutil.Abs(os.Args[0]), "-p", dbFile,
+		"--extra-arg=-w", "--extra-arg=-fparse-all-comments", file)
+	cmd.Dir = cfg.KernelObj
+	// This tells the C++ clang tool to execute in a constructor.
+	cmd.Env = append([]string{fmt.Sprintf("%v=%v", runToolEnv, cfg.Tool)}, os.Environ()...)
+	data, err := cmd.Output()
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
@@ -122,6 +187,16 @@ func runTool[Output any, OutputPtr OutputDataPtr[Output]](cfg *Config, dbFile, f
 		return filename
 	})
 	return out, nil
+}
+
+const runToolEnv = "SYZ_RUN_CLANGTOOL"
+
+func init() {
+	// The C++ clang tool was supposed to intercept execution in a constructor,
+	// execute and exit. If we got here with the env var set, something is wrong.
+	if name := os.Getenv(runToolEnv); name != "" {
+		panic(fmt.Sprintf("clang tool %q is not compiled in", name))
+	}
 }
 
 type compileCommand struct {

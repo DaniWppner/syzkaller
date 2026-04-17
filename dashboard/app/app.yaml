@@ -1,7 +1,7 @@
 # Copyright 2017 syzkaller project authors. All rights reserved.
 # Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
-runtime: go124
+runtime: go126
 app_engine_apis: true
 
 # With the f2 setting, the app episodically crashes with:
@@ -25,7 +25,8 @@ handlers:
 - url: /static
   static_dir: dashboard/app/static
   secure: always
-- url: /(admin|cron/.*)
+# debug is for net/http/pprof handlers.
+- url: /(admin|debug/.*|cron/.*)
   script: auto
   login: admin
   secure: always

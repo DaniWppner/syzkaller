@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -122,6 +123,14 @@ func (err *VerboseError) Error() string {
 
 func (err *VerboseError) Unwrap() error {
 	return err.Err
+}
+
+func VerboseMessage(err error) string {
+	msg := err.Error()
+	if verr := new(VerboseError); errors.As(err, &verr) {
+		msg += "\n" + string(verr.Output)
+	}
+	return msg
 }
 
 func IsDir(name string) bool {
@@ -307,7 +316,13 @@ func WriteExecFile(filename string, data []byte) error {
 // TempFile creates a unique temp filename.
 // Note: the file already exists when the function returns.
 func TempFile(prefix string) (string, error) {
-	f, err := os.CreateTemp("", prefix)
+	return TempFileIn("", prefix)
+}
+
+// An extended version of TempFileIn that allows to configure
+// the folder in which the file will be created.
+func TempFileIn(dir, prefix string) (string, error) {
+	f, err := os.CreateTemp(dir, prefix)
 	if err != nil {
 		return "", fmt.Errorf("failed to create temp file: %w", err)
 	}
@@ -350,10 +365,9 @@ func Abs(path string) string {
 	return filepath.Clean(path)
 }
 
-// CreationTime returns file creation time.
-// May return zero time, if not known.
-func CreationTime(fi os.FileInfo) time.Time {
-	return creationTime(fi)
+// FileTimes returns file creation and modification times.
+func FileTimes(file string) (time.Time, time.Time, error) {
+	return fileTimes(file)
 }
 
 // MonotonicNano returns monotonic time in nanoseconds from some unspecified point in time.
@@ -366,3 +380,20 @@ func CreationTime(fi os.FileInfo) time.Time {
 //
 //go:linkname MonotonicNano runtime.nanotime
 func MonotonicNano() time.Duration
+
+// DiskUsage returns total recursive disk usage of the dir (similar to du -s).
+func DiskUsage(dir string) (uint64, error) {
+	var total uint64
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		total += sysDiskUsage(info)
+		return nil
+	})
+	return total, err
+}

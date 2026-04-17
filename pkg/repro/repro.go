@@ -51,7 +51,7 @@ type Stats struct {
 type reproContext struct {
 	ctx            context.Context
 	exec           execInterface
-	logf           func(string, ...interface{})
+	logf           func(string, ...any)
 	target         *targets.Target
 	crashTitle     string
 	crashType      crash.Type
@@ -63,14 +63,16 @@ type reproContext struct {
 	stats          *Stats
 	report         *report.Report
 	timeouts       targets.Timeouts
-	observedTitles map[string]bool
+	observedTitles map[string]crash.Type
 	fast           bool
 }
 
 // execInterface describes the interfaces needed by pkg/repro.
 type execInterface interface {
-	// Run() will either run a C repro or a syz repro depending on params.
-	Run(ctx context.Context, params instance.ExecParams, logf instance.ExecutorLogger) (*instance.RunResult, error)
+	RunC(ctx context.Context, p *prog.Prog, opts instance.RunOptions,
+		logf instance.ExecutorLogger) (*instance.RunResult, error)
+	RunSyz(ctx context.Context, syzProg []byte, opts instance.RunOptions,
+		logf instance.ExecutorLogger) (*instance.RunResult, error)
 }
 
 type Environment struct {
@@ -82,7 +84,7 @@ type Environment struct {
 	// it skips multiple simpifications and C repro generation.
 	Fast bool
 
-	logf func(string, ...interface{})
+	logf func(string, ...any)
 }
 
 func Run(ctx context.Context, log []byte, env Environment) (*Result, *Stats, error) {
@@ -146,10 +148,11 @@ func runInner(ctx context.Context, crashLog []byte, env Environment, exec execIn
 		startOpts:      createStartOptions(cfg, env.Features, crashType),
 		stats:          new(Stats),
 		timeouts:       cfg.Timeouts,
-		observedTitles: map[string]bool{},
+		observedTitles: map[string]crash.Type{},
 		fast:           env.Fast,
 		logf:           env.logf,
 	}
+
 	return reproCtx.run()
 }
 
@@ -598,6 +601,10 @@ func (ctx *reproContext) simplifyProg(res *Result) (*Result, error) {
 
 // Try triggering crash with a C reproducer.
 func (ctx *reproContext) extractC(res *Result) (*Result, error) {
+	if ctx.target.BrokenCompiler != "" {
+		ctx.reproLogf(2, "skipping C reproducer extraction due to broken compiler: %v", ctx.target.BrokenCompiler)
+		return res, nil
+	}
 	ctx.reproLogf(2, "extracting C reproducer")
 	start := time.Now()
 	defer func() {
@@ -702,16 +709,40 @@ func (ctx *reproContext) getVerdict(callback func() (rep *instance.RunResult, er
 		ctx.reproLogf(2, "not a leak crash: %v", rep.Title)
 		return verdict{false, result.Duration}, nil
 	}
-	if strict && len(ctx.observedTitles) > 0 {
-		if !ctx.observedTitles[rep.Title] {
-			ctx.reproLogf(2, "a never seen crash title: %v, ignore", rep.Title)
-			return verdict{false, result.Duration}, nil
-		}
+	if _, ok := ctx.observedTitles[rep.Title]; ok {
+		// Already established title, always permit.
+	} else if !isHighPrioReport(rep.Type) && ctx.observedHighPrioCrash() {
+		ctx.reproLogf(2, "ignore low priority crash: %v", rep.Title)
+		return verdict{false, result.Duration}, nil
+	} else if strict && len(ctx.observedTitles) > 0 {
+		ctx.reproLogf(2, "a never seen crash title: %v, ignore", rep.Title)
+		return verdict{false, result.Duration}, nil
 	} else {
-		ctx.observedTitles[rep.Title] = true
+		ctx.observedTitles[rep.Title] = rep.Type
 	}
 	ctx.report = rep
 	return verdict{true, result.Duration}, nil
+}
+
+func (ctx *reproContext) observedHighPrioCrash() bool {
+	if isHighPrioReport(ctx.crashType) {
+		return true
+	}
+	for _, typ := range ctx.observedTitles {
+		if isHighPrioReport(typ) {
+			return true
+		}
+	}
+	return false
+}
+
+func isHighPrioReport(typ crash.Type) bool {
+	switch typ {
+	case crash.LostConnection, crash.NoOutput, crash.SyzFailure, crash.UnexpectedReboot:
+		return false
+	default:
+		return true
+	}
 }
 
 var ErrNoVMs = errors.New("all VMs failed to boot")
@@ -747,8 +778,7 @@ func (ctx *reproContext) testProgs(entries []*prog.LogEntry, duration time.Durat
 	ctx.reproLogf(2, "testing program (duration=%v, %+v): %s", duration, opts, program)
 	ctx.reproLogf(3, "detailed listing:\n%s", pstr)
 	return ctx.getVerdict(func() (*instance.RunResult, error) {
-		return ctx.exec.Run(ctx.ctx, instance.ExecParams{
-			SyzProg:  pstr,
+		return ctx.exec.RunSyz(ctx.ctx, pstr, instance.RunOptions{
 			Opts:     opts,
 			Duration: duration,
 		}, ctx.reproLogf)
@@ -758,15 +788,14 @@ func (ctx *reproContext) testProgs(entries []*prog.LogEntry, duration time.Durat
 func (ctx *reproContext) testCProg(p *prog.Prog, duration time.Duration, opts csource.Options,
 	strict bool) (ret verdict, err error) {
 	return ctx.getVerdict(func() (*instance.RunResult, error) {
-		return ctx.exec.Run(ctx.ctx, instance.ExecParams{
-			CProg:    p,
+		return ctx.exec.RunC(ctx.ctx, p, instance.RunOptions{
 			Opts:     opts,
 			Duration: duration,
 		}, ctx.reproLogf)
 	}, strict)
 }
 
-func (ctx *reproContext) reproLogf(level int, format string, args ...interface{}) {
+func (ctx *reproContext) reproLogf(level int, format string, args ...any) {
 	if ctx.logf != nil {
 		ctx.logf(format, args...)
 	}
@@ -795,7 +824,7 @@ func (ctx *reproContext) bisectProgs(progs []*prog.LogEntry, pred func([]*prog.L
 	ret, err := minimize.SliceWithFixed(minimize.Config[*prog.LogEntry]{
 		Pred:      minimizePred,
 		MaxChunks: chunks,
-		Logf: func(msg string, args ...interface{}) {
+		Logf: func(msg string, args ...any) {
 			ctx.reproLogf(3, "bisect: "+msg, args...)
 		},
 	}, progs, func(elem *prog.LogEntry) bool {
@@ -818,40 +847,51 @@ type poolWrapper struct {
 	pool     *vm.Dispatcher
 }
 
-func (pw *poolWrapper) Run(ctx context.Context, params instance.ExecParams,
+func (pw *poolWrapper) RunC(ctx context.Context, p *prog.Prog, opts instance.RunOptions,
 	logf instance.ExecutorLogger) (*instance.RunResult, error) {
+	var result *instance.RunResult
+	err := pw.run(ctx, opts.Duration, logf, "C", func(ret *instance.ExecProgInstance) error {
+		var err error
+		result, err = ret.RunCProg(p, opts)
+		return err
+	})
+	return result, err
+}
+
+func (pw *poolWrapper) RunSyz(ctx context.Context, syzProg []byte, opts instance.RunOptions,
+	logf instance.ExecutorLogger) (*instance.RunResult, error) {
+	var result *instance.RunResult
+	err := pw.run(ctx, opts.Duration, logf, "syz", func(ret *instance.ExecProgInstance) error {
+		var err error
+		result, err = ret.RunSyzProg(syzProg, opts)
+		return err
+	})
+	return result, err
+}
+
+func (pw *poolWrapper) run(ctx context.Context, duration time.Duration, logf instance.ExecutorLogger, typ string,
+	fn func(*instance.ExecProgInstance) error) error {
 	if err := ctx.Err(); err != nil {
 		// Note that we could also propagate ctx down to SetupExecProg() and RunCProg() operations,
 		// but so far it does not seem to be worth the effort.
-		return nil, err
+		return err
 	}
-
-	var result *instance.RunResult
-	var err error
-	runErr := pw.pool.Run(ctx, func(ctx context.Context, inst *vm.Instance, updInfo dispatcher.UpdateInfo) {
+	var runErr error
+	err := pw.pool.Run(ctx, func(ctx context.Context, inst *vm.Instance, updInfo dispatcher.UpdateInfo) {
 		updInfo(func(info *dispatcher.Info) {
-			typ := "syz"
-			if params.CProg != nil {
-				typ = "C"
-			}
-			info.Status = fmt.Sprintf("reproducing (%s, %.1f min)", typ, params.Duration.Minutes())
+			info.Status = fmt.Sprintf("reproducing (%s, %.1f min)", typ, duration.Minutes())
 		})
-		var ret *instance.ExecProgInstance
-		ret, err = instance.SetupExecProg(inst, pw.cfg, pw.reporter,
-			&instance.OptionalConfig{Logf: logf})
+		ret, err := instance.SetupExecProg(inst, pw.cfg, pw.reporter, &instance.OptionalConfig{Logf: logf})
 		if err != nil {
+			runErr = err
 			return
 		}
-		if params.CProg != nil {
-			result, err = ret.RunCProg(params)
-		} else {
-			result, err = ret.RunSyzProg(params)
-		}
+		runErr = fn(ret)
 	})
-	if runErr != nil {
-		return nil, runErr
+	if err != nil {
+		return err
 	}
-	return result, err
+	return runErr
 }
 
 type Simplify func(opts *csource.Options) bool

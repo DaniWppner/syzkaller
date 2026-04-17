@@ -18,6 +18,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -33,6 +34,7 @@ import (
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/report"
+	"github.com/google/syzkaller/pkg/updater"
 	"github.com/google/syzkaller/pkg/vcs"
 	"github.com/google/syzkaller/prog"
 	_ "github.com/google/syzkaller/sys"
@@ -41,11 +43,11 @@ import (
 )
 
 // This is especially slightly longer than syzkaller rebuild period.
-// If we set kernelRebuildPeriod = syzkallerRebuildPeriod and both are changed
+// If we set kernelRebuildPeriod = updater.RebuildPeriod and both are changed
 // during that period (or around that period), we can rebuild kernel, restart
 // manager and then instantly shutdown everything for syzkaller update.
 // Instead we rebuild syzkaller, restart and then rebuild kernel.
-const kernelRebuildPeriod = syzkallerRebuildPeriod + time.Hour
+const kernelRebuildPeriod = updater.RebuildPeriod + time.Hour
 
 // List of required files in kernel build (contents of latest/current dirs).
 var imageFiles = map[string]bool{
@@ -99,7 +101,7 @@ type ManagerDashapi interface {
 	ReportBuildError(req *dashapi.BuildErrorReq) error
 	UploadBuild(build *dashapi.Build) error
 	BuilderPoll(manager string) (*dashapi.BuilderPollResp, error)
-	LogError(name, msg string, args ...interface{})
+	LogError(name, msg string, args ...any)
 	CommitPoll() (*dashapi.CommitPollResp, error)
 	UploadCommits(commits []dashapi.Commit) error
 }
@@ -169,12 +171,12 @@ func createManager(cfg *Config, mgrcfg *ManagerConfig, debug bool) (*Manager, er
 // Gates kernel builds, syzkaller builds and coverage report generation.
 // Kernel builds take whole machine, so we don't run more than one at a time.
 // Also current image build script uses some global resources (/dev/nbd0) and can't run in parallel.
-var buildSem = instance.NewSemaphore(1)
+var buildSem = osutil.NewSemaphore(1)
 
 // Gates tests that require extra VMs.
 // Currently we overcommit instances in such cases, so we'd like to minimize the number of
 // simultaneous env.Test calls.
-var testSem = instance.NewSemaphore(1)
+var testSem = osutil.NewSemaphore(1)
 
 const fuzzingMinutesBeforeCover = 360
 const benchUploadPeriod = 30 * time.Minute
@@ -200,7 +202,7 @@ func (mgr *Manager) loop(ctx context.Context) {
 
 	benchUploadTime = time.Now().Add(benchUploadPeriod)
 
-	ticker := time.NewTicker(buildRetryPeriod)
+	ticker := time.NewTicker(updater.BuildRetryPeriod)
 	defer ticker.Stop()
 
 loop:
@@ -274,7 +276,7 @@ func (mgr *Manager) archiveCommit(commit string) {
 
 func (mgr *Manager) pollAndBuild(ctx context.Context, lastCommit string, latestInfo *BuildInfo) (
 	string, *BuildInfo, time.Duration) {
-	rebuildAfter := buildRetryPeriod
+	rebuildAfter := updater.BuildRetryPeriod
 	commit, err := mgr.repo.Poll(mgr.mgrcfg.Repo, mgr.mgrcfg.Branch)
 	if err != nil {
 		mgr.buildFailed = true
@@ -747,7 +749,7 @@ func (mgr *Manager) pollCommits(buildCommit string) ([]string, []dashapi.Commit,
 
 func (mgr *Manager) backportCommits() []vcs.BackportCommit {
 	return append(
-		append([]vcs.BackportCommit{}, mgr.cfg.BisectBackports...),
+		slices.Clone(mgr.cfg.BisectBackports),
 		mgr.mgrcfg.BisectBackports...,
 	)
 }
@@ -1081,7 +1083,7 @@ func uploadFileHTTPPut(ctx context.Context, URL string, file io.Reader) error {
 }
 
 // Errorf logs non-fatal error and sends it to dashboard.
-func (mgr *Manager) Errorf(msg string, args ...interface{}) {
+func (mgr *Manager) Errorf(msg string, args ...any) {
 	for _, arg := range args {
 		err, _ := arg.(error)
 		if err == nil {

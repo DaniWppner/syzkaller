@@ -5,10 +5,7 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
 
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"google.golang.org/appengine/v2/log"
@@ -18,51 +15,39 @@ import (
 // The external system is meant to poll for new bugs with apiReportingPoll,
 // and report back bug status updates with apiReportingUpdate.
 
-func apiReportingPollBugs(c context.Context, payload io.Reader) (interface{}, error) {
-	if stop, err := emergentlyStopped(c); err != nil || stop {
+func apiReportingPollBugs(ctx context.Context, req *dashapi.PollBugsRequest) (any, error) {
+	if stop, err := emergentlyStopped(ctx); err != nil || stop {
 		return &dashapi.PollBugsResponse{}, err
 	}
-	req := new(dashapi.PollBugsRequest)
-	if err := json.NewDecoder(payload).Decode(req); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal request: %w", err)
-	}
-	reports := reportingPollBugs(c, req.Type)
+	reports := reportingPollBugs(ctx, req.Type)
 	resp := &dashapi.PollBugsResponse{
 		Reports: reports,
 	}
-	jobs, err := pollCompletedJobs(c, req.Type)
+	jobs, err := pollCompletedJobs(ctx, req.Type)
 	if err != nil {
-		log.Errorf(c, "failed to poll jobs(bugs): %v", err)
+		log.Errorf(ctx, "failed to poll jobs(bugs): %v", err)
 	}
 	resp.Reports = append(resp.Reports, jobs...)
 	return resp, nil
 }
 
-func apiReportingPollNotifications(c context.Context, payload io.Reader,
-) (interface{}, error) {
-	if stop, err := emergentlyStopped(c); err != nil || stop {
+func apiReportingPollNotifications(ctx context.Context, req *dashapi.PollNotificationsRequest) (
+	any, error) {
+	if stop, err := emergentlyStopped(ctx); err != nil || stop {
 		return &dashapi.PollNotificationsResponse{}, err
 	}
-	req := new(dashapi.PollNotificationsRequest)
-	if err := json.NewDecoder(payload).Decode(req); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal request: %w", err)
-	}
-	notifs := reportingPollNotifications(c, req.Type)
+	notifs := reportingPollNotifications(ctx, req.Type)
 	resp := &dashapi.PollNotificationsResponse{
 		Notifications: notifs,
 	}
 	return resp, nil
 }
 
-func apiReportingPollClosed(c context.Context, payload io.Reader) (interface{}, error) {
-	if stop, err := emergentlyStopped(c); err != nil || stop {
+func apiReportingPollClosed(ctx context.Context, req *dashapi.PollClosedRequest) (any, error) {
+	if stop, err := emergentlyStopped(ctx); err != nil || stop {
 		return &dashapi.PollClosedResponse{}, err
 	}
-	req := new(dashapi.PollClosedRequest)
-	if err := json.NewDecoder(payload).Decode(req); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal request: %w", err)
-	}
-	ids, err := reportingPollClosed(c, req.IDs)
+	ids, err := reportingPollClosed(ctx, req.IDs)
 	if err != nil {
 		return nil, err
 	}
@@ -72,24 +57,20 @@ func apiReportingPollClosed(c context.Context, payload io.Reader) (interface{}, 
 	return resp, nil
 }
 
-func apiReportingUpdate(c context.Context, payload io.Reader) (interface{}, error) {
-	req := new(dashapi.BugUpdate)
-	if err := json.NewDecoder(payload).Decode(req); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal request: %w", err)
-	}
+func apiReportingUpdate(ctx context.Context, req *dashapi.BugUpdate) (any, error) {
 	if req.JobID != "" {
 		resp := &dashapi.BugUpdateReply{
 			OK:    true,
 			Error: false,
 		}
-		if err := jobReported(c, req.JobID); err != nil {
-			log.Errorf(c, "failed to mark job reported: %v", err)
+		if err := jobReported(ctx, req.JobID); err != nil {
+			log.Errorf(ctx, "failed to mark job reported: %v", err)
 			resp.Text = err.Error()
 			resp.Error = true
 		}
 		return resp, nil
 	}
-	ok, reason, err := incomingCommand(c, req)
+	ok, reason, err := incomingCommand(ctx, req)
 	return &dashapi.BugUpdateReply{
 		OK:    ok,
 		Error: err != nil,
@@ -97,19 +78,15 @@ func apiReportingUpdate(c context.Context, payload io.Reader) (interface{}, erro
 	}, nil
 }
 
-func apiNewTestJob(c context.Context, payload io.Reader) (interface{}, error) {
-	req := new(dashapi.TestPatchRequest)
-	if err := json.NewDecoder(payload).Decode(req); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal request: %w", err)
-	}
+func apiNewTestJob(ctx context.Context, req *dashapi.TestPatchRequest) (any, error) {
 	resp := &dashapi.TestPatchReply{}
-	err := handleExternalTestRequest(c, req)
+	err := handleExternalTestRequest(ctx, req)
 	if err != nil {
 		resp.ErrorText = err.Error()
 		var badTest *BadTestRequestError
 		if !errors.As(err, &badTest) {
 			// Log errors that are not related to the invalid input.
-			log.Errorf(c, "external patch posting error: %v", err)
+			log.Errorf(ctx, "external patch posting error: %v", err)
 		}
 	}
 	return resp, nil

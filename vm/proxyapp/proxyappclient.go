@@ -300,7 +300,7 @@ func (proxy *ProxyApp) signalLostConnection() {
 	}
 }
 
-func (proxy *ProxyApp) Call(serviceMethod string, args, reply interface{}) error {
+func (proxy *ProxyApp) Call(serviceMethod string, args, reply any) error {
 	err := proxy.Client.Call(serviceMethod, args, reply)
 	if err == rpc.ErrShutdown {
 		proxy.signalLostConnection()
@@ -423,7 +423,6 @@ type instance struct {
 }
 
 // Copy copies a hostSrc file into VM and returns file name in VM.
-// nolint: dupl
 func (inst *instance) Copy(hostSrc string) (string, error) {
 	var reply proxyrpc.CopyResult
 	params := proxyrpc.CopyParams{
@@ -450,7 +449,6 @@ func (inst *instance) Copy(hostSrc string) (string, error) {
 
 // Forward sets up forwarding from within VM to the given tcp
 // port on the host and returns the address to use in VM.
-// nolint: dupl
 func (inst *instance) Forward(port int) (string, error) {
 	var reply proxyrpc.ForwardResult
 	err := inst.ProxyApp.Call(
@@ -466,19 +464,29 @@ func (inst *instance) Forward(port int) (string, error) {
 	return reply.ManagerAddress, nil
 }
 
-func buildMerger(names ...string) (*vmimpl.OutputMerger, []io.Writer) {
+func buildMerger(streams []struct {
+	name string
+	typ  vmimpl.OutputType
+}) (*vmimpl.OutputMerger, []io.Writer) {
 	var wPipes []io.Writer
 	merger := vmimpl.NewOutputMerger(nil)
-	for _, name := range names {
+	for _, stream := range streams {
 		rpipe, wpipe := io.Pipe()
 		wPipes = append(wPipes, wpipe)
-		merger.Add(name, rpipe)
+		merger.Add(stream.name, stream.typ, rpipe)
 	}
 	return merger, wPipes
 }
 
-func (inst *instance) Run(ctx context.Context, command string) (<-chan []byte, <-chan error, error) {
-	merger, wPipes := buildMerger("stdout", "stderr", "console")
+func (inst *instance) Run(ctx context.Context, command string) (<-chan vmimpl.Chunk, <-chan error, error) {
+	merger, wPipes := buildMerger([]struct {
+		name string
+		typ  vmimpl.OutputType
+	}{
+		{"stdout", vmimpl.OutputStdout},
+		{"stderr", vmimpl.OutputStderr},
+		{"console", vmimpl.OutputConsole},
+	})
 	receivedStdoutChunks := wPipes[0]
 	receivedStderrChunks := wPipes[1]
 	receivedConsoleChunks := wPipes[2]
@@ -589,8 +597,8 @@ type stdInOutCloser struct {
 	io.Writer
 }
 
-func clientErrorf(writer io.Writer) func(fmt string, s ...interface{}) {
-	return func(f string, s ...interface{}) {
+func clientErrorf(writer io.Writer) func(fmt string, s ...any) {
+	return func(f string, s ...any) {
 		fmt.Fprintf(writer, f, s...)
 		writer.Write([]byte("\nSYZFAIL: proxy app plugin error\n"))
 	}

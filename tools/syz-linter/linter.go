@@ -54,7 +54,7 @@ var SyzAnalyzer = &analysis.Analyzer{
 	Run:  run,
 }
 
-func run(p *analysis.Pass) (interface{}, error) {
+func run(p *analysis.Pass) (any, error) {
 	pass := (*Pass)(p)
 	for _, file := range pass.Files {
 		stmts := make(map[int]bool)
@@ -68,15 +68,19 @@ func run(p *analysis.Pass) (interface{}, error) {
 				pass.checkStringLenCompare(n)
 			case *ast.FuncDecl:
 				pass.checkFuncArgs(n)
+				pass.checkContextArgs(n)
 			case *ast.CallExpr:
 				pass.checkFlagDefinition(n)
 				pass.checkLogErrorFormat(n)
+				pass.checkSliceClone(n)
 			case *ast.GenDecl:
 				pass.checkVarDecl(n)
 			case *ast.IfStmt:
 				pass.checkIfStmt(n)
 			case *ast.AssignStmt:
 				pass.checkAssignStmt(n)
+			case *ast.InterfaceType:
+				pass.checkInterfaceType(n)
 			}
 			return true
 		})
@@ -91,7 +95,7 @@ func run(p *analysis.Pass) (interface{}, error) {
 
 type Pass analysis.Pass
 
-func (pass *Pass) report(pos ast.Node, msg string, args ...interface{}) {
+func (pass *Pass) report(pos ast.Node, msg string, args ...any) {
 	pass.Report(analysis.Diagnostic{
 		Pos:     pos.Pos(),
 		Message: fmt.Sprintf(msg, args...),
@@ -227,6 +231,43 @@ func (pass *Pass) reportFuncArgs(fields []*ast.Field, first, last int) {
 	pass.report(fields[first], "Use '%v %v'", names[2:], pass.typ(fields[first].Type))
 }
 
+func (pass *Pass) checkContextArgs(n *ast.FuncDecl) {
+	if n.Type.Params == nil {
+		return
+	}
+	expectedCtxPos := 0
+	if len(n.Type.Params.List) > 0 {
+		firstField := n.Type.Params.List[0]
+		if strings.HasSuffix(pass.typ(firstField.Type), "*testing.T") {
+			expectedCtxPos = 1
+		}
+	}
+	for fieldPos, field := range n.Type.Params.List {
+		isContext := pass.typ(field.Type) == "context.Context"
+		if isContext {
+			if fieldPos != expectedCtxPos {
+				if expectedCtxPos == 0 {
+					pass.report(field, "Context must be the first argument")
+				} else {
+					pass.report(field, "Context must be the second argument")
+				}
+			}
+			// Every type group may have a few variables.
+			if len(field.Names) > 1 {
+				// A few contexts are passed to the function
+				// It is very rare. Let's use nolint:syz-linter to opt-out.
+				pass.report(field, "multiple Contexts are passed, use nolint:syz-linter")
+			}
+			if len(field.Names) == 1 {
+				name := field.Names[0]
+				if name.Name != "ctx" && name.Name != "_" {
+					pass.report(name, "Context variable must be named 'ctx' or '_'")
+				}
+			}
+		}
+	}
+}
+
 func (pass *Pass) checkFlagDefinition(n *ast.CallExpr) {
 	fun, ok := n.Fun.(*ast.SelectorExpr)
 	if !ok {
@@ -253,6 +294,20 @@ func (pass *Pass) checkFlagDefinition(n *ast.CallExpr) {
 			pass.report(n, "Don't start flag description with a Capital letter")
 		}
 	}
+}
+
+// checkSliceClone warns about manual slice cloning using append([]T{}, slice...)
+// and suggests using slices.Clone instead.
+func (pass *Pass) checkSliceClone(n *ast.CallExpr) {
+	fn, ok := n.Fun.(*ast.Ident)
+	if !ok || fn.Name != "append" || len(n.Args) != 2 || n.Ellipsis == token.NoPos {
+		return
+	}
+	arg0, ok := n.Args[0].(*ast.CompositeLit)
+	if !ok || len(arg0.Elts) != 0 {
+		return
+	}
+	pass.report(n, "Use slices.Clone instead of append")
 }
 
 // checkLogErrorFormat warns about log/error messages starting with capital letter or ending with a period.
@@ -405,4 +460,10 @@ func (pass *Pass) checkAssignStmt(n *ast.AssignStmt) {
 		}
 	}
 	pass.report(n, "Don't duplicate loop variables. They are per-iter (not per-loop) since go122.")
+}
+
+func (pass *Pass) checkInterfaceType(n *ast.InterfaceType) {
+	if len(n.Methods.List) == 0 {
+		pass.report(n, "Use any instead of interface{}")
+	}
 }

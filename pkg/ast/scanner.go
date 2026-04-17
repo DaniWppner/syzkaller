@@ -82,7 +82,7 @@ func init() {
 		if tok == tokIllegal {
 			continue
 		}
-		tok2str[tok] = fmt.Sprintf("%q", ch)
+		tok2str[tok] = fmt.Sprintf("%q", rune(ch))
 	}
 }
 
@@ -289,7 +289,7 @@ func (s *scanner) scanIdent(pos Pos) (tok token, lit string) {
 	return
 }
 
-func (s *scanner) Errorf(pos Pos, msg string, args ...interface{}) {
+func (s *scanner) Errorf(pos Pos, msg string, args ...any) {
 	s.errors++
 	s.errorHandler(pos, fmt.Sprintf(msg, args...))
 }

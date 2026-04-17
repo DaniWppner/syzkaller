@@ -17,7 +17,6 @@ import (
 	"github.com/google/syzkaller/pkg/signal"
 	"github.com/google/syzkaller/pkg/vminfo"
 	"github.com/google/syzkaller/prog"
-	"golang.org/x/sync/errgroup"
 )
 
 type LocalConfig struct {
@@ -43,15 +42,27 @@ func RunLocal(ctx context.Context, cfg *LocalConfig) error {
 		return err
 	}
 	defer localCtx.serv.Close()
-	// groupCtx will be cancelled once any goroutine returns an error.
-	eg, groupCtx := errgroup.WithContext(ctx)
-	eg.Go(func() error {
-		return localCtx.RunInstance(groupCtx, 0)
-	})
-	eg.Go(func() error {
-		return localCtx.serv.Serve(groupCtx)
-	})
-	return eg.Wait()
+
+	// Note: we must not stop the RPC server before we finish RunInstance.
+	// Otherwise, RPC server will close the connection, and executor may SYZFAIL
+	// on the closed network connection.
+	// We first need to wait for the executor binary to finish, and only then stop the RPC server.
+	// However, we want to stop both if the other one errors out.
+	instCtx, instCancel := context.WithCancel(ctx)
+	defer instCancel()
+	servCtx, servCancel := context.WithCancel(context.Background())
+	defer servCancel()
+	servErr := make(chan error, 1)
+	go func() {
+		servErr <- localCtx.serv.Serve(servCtx)
+		instCancel()
+	}()
+	instErr := localCtx.RunInstance(instCtx, 0)
+	servCancel()
+	if err := <-servErr; err != nil {
+		return err
+	}
+	return instErr
 }
 
 func setupLocal(ctx context.Context, cfg *LocalConfig) (*local, context.Context, error) {
@@ -103,39 +114,39 @@ type local struct {
 	setupDone chan bool
 }
 
-func (ctx *local) MachineChecked(features flatrpc.Feature, syscalls map[*prog.Syscall]bool) (queue.Source, error) {
-	<-ctx.setupDone
-	ctx.serv.TriagedCorpus()
-	return ctx.cfg.MachineChecked(features, syscalls), nil
+func (l *local) MachineChecked(features flatrpc.Feature, syscalls map[*prog.Syscall]bool) (queue.Source, error) {
+	<-l.setupDone
+	l.serv.TriagedCorpus()
+	return l.cfg.MachineChecked(features, syscalls), nil
 }
 
-func (ctx *local) BugFrames() ([]string, []string) {
+func (l *local) BugFrames() ([]string, []string) {
 	return nil, nil
 }
 
-func (ctx *local) MaxSignal() signal.Signal {
-	return signal.FromRaw(ctx.cfg.MaxSignal, 0)
+func (l *local) MaxSignal() signal.Signal {
+	return signal.FromRaw(l.cfg.MaxSignal, 0)
 }
 
-func (ctx *local) CoverageFilter(modules []*vminfo.KernelModule) ([]uint64, error) {
-	return ctx.cfg.CoverFilter, nil
+func (l *local) CoverageFilter(modules []*vminfo.KernelModule) ([]uint64, error) {
+	return l.cfg.CoverFilter, nil
 }
 
-func (ctx *local) DebugFilter(modules []*vminfo.KernelModule) ([]uint64, error) {
+func (l *local) DebugFilter(modules []*vminfo.KernelModule) ([]uint64, error) {
 	return []uint64{}, nil
 }
 
-func (ctx *local) Serve(context context.Context) error {
-	return ctx.serv.Serve(context)
+func (l *local) Serve(ctx context.Context) error {
+	return l.serv.Serve(ctx)
 }
 
-func (ctx *local) RunInstance(baseCtx context.Context, id int) error {
-	connErr := ctx.serv.CreateInstance(id, nil, nil)
-	defer ctx.serv.ShutdownInstance(id, true)
+func (l *local) RunInstance(ctx context.Context, id int) error {
+	connErr := l.serv.CreateInstance(id, nil, nil)
+	defer l.serv.ShutdownInstance(id, true)
 
-	cfg := ctx.cfg
+	cfg := l.cfg
 	bin := cfg.Executor
-	args := []string{"runner", fmt.Sprint(id), "localhost", fmt.Sprint(ctx.serv.Port())}
+	args := []string{"runner", fmt.Sprint(id), "localhost", fmt.Sprint(l.serv.Port())}
 	if cfg.GDB {
 		bin = "gdb"
 		args = append([]string{
@@ -145,7 +156,7 @@ func (ctx *local) RunInstance(baseCtx context.Context, id int) error {
 			cfg.Executor,
 		}, args...)
 	}
-	cmd := exec.CommandContext(baseCtx, bin, args...)
+	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = cfg.Dir
 	if cfg.OutputWriter != nil {
 		cmd.Stdout = cfg.OutputWriter
@@ -162,7 +173,7 @@ func (ctx *local) RunInstance(baseCtx context.Context, id int) error {
 	}
 	var retErr error
 	select {
-	case <-baseCtx.Done():
+	case <-ctx.Done():
 	case err := <-connErr:
 		if err != nil {
 			retErr = fmt.Errorf("connection error: %w", err)
@@ -174,7 +185,7 @@ func (ctx *local) RunInstance(baseCtx context.Context, id int) error {
 		retErr = fmt.Errorf("executor process exited: %w", err)
 	}
 	// Note that we ignore the error if we killed the process because of the context.
-	if baseCtx.Err() == nil {
+	if ctx.Err() == nil {
 		return retErr
 	}
 	return nil

@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"math/bits"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -50,6 +51,17 @@ func Write(p *prog.Prog, opts Options) ([]byte, error) {
 		calls:     make(map[string]uint64),
 	}
 	return ctx.generateSource()
+}
+
+// WriteLLM generates a minimal, single-threaded C reproducer for LLMs.
+func WriteLLM(p *prog.Prog) ([]byte, error) {
+	opts := Options{
+		Sandbox:      "",
+		CallComments: true,
+		Procs:        1,
+		Slowdown:     1,
+	}
+	return Write(p, opts)
 }
 
 type context struct {
@@ -721,7 +733,7 @@ func (ctx *context) hoistIncludes(result []byte) []byte {
 	sort.Strings(sortedTop)
 	sort.Strings(sorted)
 	sort.Strings(sortedBottom)
-	newResult := append([]byte{}, result[:includesStart]...)
+	newResult := slices.Clone(result[:includesStart])
 	newResult = append(newResult, strings.Join(sortedTop, "")...)
 	newResult = append(newResult, '\n')
 	newResult = append(newResult, strings.Join(sorted, "")...)

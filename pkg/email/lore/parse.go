@@ -25,12 +25,13 @@ type Thread struct {
 
 // Series represents a single patch series sent over email.
 type Series struct {
-	Subject   string
-	MessageID string
-	Version   int
-	Corrupted string // If non-empty, contains a reason why the series better be ignored.
-	Tags      []string
-	Patches   []Patch
+	Subject        string
+	MessageID      string
+	Version        int
+	Corrupted      string // If non-empty, contains a reason why the series better be ignored.
+	Tags           []string
+	Patches        []Patch
+	BaseCommitHint string
 }
 
 type Patch struct {
@@ -87,6 +88,9 @@ func PatchSeries(emails []*Email) []*Series {
 			patch, ok := parsePatchSubject(email.Subject)
 			if !ok {
 				continue
+			}
+			if series.BaseCommitHint == "" { // Usually base-commit is in patch 0 or 1. Check them all to be safe.
+				series.BaseCommitHint = email.BaseCommitHint
 			}
 			seq := patch.Seq.ValueOr(1)
 			if seq == 0 {
@@ -281,4 +285,14 @@ func (o Optional[T]) ValueOr(def T) T {
 func (o *Optional[T]) Set(val T) {
 	o.val = val
 	o.set = true
+}
+
+// LinkToMessage returns a lore.kernel.org link for the given message ID.
+func LinkToMessage(msgID string) string {
+	return fmt.Sprintf("https://lore.kernel.org/all/%s", strings.Trim(msgID, "<>"))
+}
+
+// LinkToThread returns a lore.kernel.org link for the given message ID thread.
+func LinkToThread(msgID string) string {
+	return fmt.Sprintf("https://lore.kernel.org/all/%s/T/", strings.Trim(msgID, "<>"))
 }

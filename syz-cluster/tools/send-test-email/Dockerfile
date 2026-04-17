@@ -1,27 +1,14 @@
-FROM golang:1.24-alpine AS builder
-
-WORKDIR /build
-
-# Prepare the dependencies.
-COPY go.mod ./
-COPY go.sum ./
-RUN go mod download
-COPY dashboard/dashapi/ dashboard/dashapi/
-COPY pkg/gcs/ pkg/gcs/
-COPY pkg/email/ pkg/email/
-COPY pkg/auth/ pkg/auth/
-COPY pkg/gcpsecret/ pkg/gcpsecret/
-
-# Build the tool.
-COPY syz-cluster/tools/send-test-email/*.go syz-cluster/tools/send-test-email/
-COPY dashboard/dashapi/ dashboard/dashapi/
-COPY syz-cluster/pkg/ syz-cluster/pkg/
-RUN go build -o /bin/send-email /build/syz-cluster/tools/send-test-email
+# syntax=docker.io/docker/dockerfile:1.7-labs
+# Copyright 2025 syzkaller project authors. All rights reserved.
+# Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+ARG IMAGE_PREFIX=local/
+ARG IMAGE_TAG=latest
+FROM ${IMAGE_PREFIX}syz-cluster-build:${IMAGE_TAG} AS builder
 
 # Create the actual container.
 FROM alpine:latest
 WORKDIR /app
 
-COPY --from=builder /bin/send-email /bin/send-email
+COPY --from=builder /build/syz-cluster/bin/send-test-email /bin/send-email
 
 ENTRYPOINT ["/bin/send-email"]

@@ -4,12 +4,18 @@
 package manager
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
+	"github.com/google/syzkaller/pkg/mgrconfig"
+	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/report"
 	"github.com/google/syzkaller/pkg/repro"
+	"github.com/google/syzkaller/pkg/subsystem"
 	"github.com/google/syzkaller/prog"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestCrashList(t *testing.T) {
@@ -112,4 +118,105 @@ func TestCrashRepro(t *testing.T) {
 	assert.Equal(t, []byte("prog text"), report.Prog)
 	assert.Equal(t, []byte("c prog text"), report.CProg)
 	assert.Equal(t, []byte("Some report"), report.Report)
+}
+
+func TestCrashMemoryDump(t *testing.T) {
+	crashStore := &CrashStore{
+		BaseDir:      t.TempDir(),
+		MaxCrashLogs: 5,
+	}
+
+	tmpDir := t.TempDir()
+	sourceDump := filepath.Join(tmpDir, "vmcore_source")
+	osutil.WriteFile(sourceDump, []byte("VMCORE"))
+
+	_, err := crashStore.SaveCrash(&Crash{
+		Report: &report.Report{
+			Title:  "Title With Dump",
+			Output: []byte("Output"),
+		},
+		MemoryDump: sourceDump,
+	})
+	assert.NoError(t, err)
+
+	info, err := crashStore.BugInfo(crashHash("Title With Dump"), false)
+	assert.NoError(t, err)
+
+	assert.NotEmpty(t, info.MemoryDumpFile)
+	assert.Contains(t, info.MemoryDumpFile, "vmcore")
+	assert.FileExists(t, filepath.Join(crashStore.BaseDir, info.MemoryDumpFile))
+}
+
+func TestGetSubsystems(t *testing.T) {
+	tests := []struct {
+		testFile string
+		want     []string
+	}{
+		{testFile: "0", want: []string{"block"}},
+		{testFile: "1", want: nil},
+		{testFile: "2", want: []string{"input", "usb"}},
+		{testFile: "3", want: []string{"mm"}},
+	}
+
+	reproter, err := report.NewReporter(&mgrconfig.Config{
+		Derived: mgrconfig.Derived{TargetOS: "linux", TargetArch: "amd64"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	subsystems := []*subsystem.Subsystem{
+		{
+			Name:      "block",
+			PathRules: []subsystem.PathRule{{IncludeRegexp: "^block/"}},
+		},
+		{
+			Name:      "mm",
+			PathRules: []subsystem.PathRule{{IncludeRegexp: "^mm/"}},
+		},
+		{
+			Name:      "input",
+			PathRules: []subsystem.PathRule{{IncludeRegexp: "^drivers/hid/"}},
+		},
+		{
+			Name:      "usb",
+			PathRules: []subsystem.PathRule{{IncludeRegexp: "^drivers/usb/"}, {IncludeRegexp: "^drivers/hid/usbhid/"}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.testFile, func(t *testing.T) {
+			reportBytes, err := os.ReadFile(filepath.Join("testdata", tt.testFile))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			crashStore := &CrashStore{
+				BaseDir:      t.TempDir(),
+				MaxCrashLogs: 10,
+				subsystems:   make(map[string][]string),
+				Extractor:    subsystem.MakeExtractor(subsystems),
+				Reporter:     reproter,
+			}
+
+			title := "Some Title"
+			_, err = crashStore.SaveCrash(&Crash{
+				Report: &report.Report{
+					Title:  title,
+					Report: reportBytes,
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			id := crashHash(title)
+			dir := crashStore.path(title)
+			got, err := crashStore.getSubsystems(id, dir, title)
+			if err != nil {
+				t.Fatal(err)
+			}
+			require.Equal(t, tt.want, got)
+		})
+	}
 }

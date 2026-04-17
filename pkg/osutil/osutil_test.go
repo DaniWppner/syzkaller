@@ -4,14 +4,18 @@
 package osutil
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestIsExist(t *testing.T) {
@@ -146,7 +150,61 @@ func TestReadWriteJSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if diff := cmp.Diff(test, test2); diff != "" {
-		t.Fatal(diff)
+	require.Equal(t, test, test2)
+}
+
+func TestDiskUsage(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		// The test uses some hardcoded numbers for disk usage,
+		// it's hard to get it working on all possible OSes.
+		t.Skip("skipping on non-linux")
 	}
+	dir := t.TempDir()
+	var currentUsage uint64
+	expectUsage := func(minIncrease, maxIncrease uint64) {
+		usage, err := DiskUsage(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectMin := currentUsage + minIncrease
+		expectMax := currentUsage + maxIncrease
+		t.Logf("got usage %v when expected (%v, %v)", usage, expectMin, expectMax)
+		if usage <= expectMin || usage >= expectMax {
+			t.Fatalf("bad usage %v, expect (%v, %v)", usage, expectMin, expectMax)
+		}
+		currentUsage = usage
+	}
+	expectUsage(1, 5<<10)
+	if err := MkdirAll(filepath.Join(dir, "nested")); err != nil {
+		t.Fatal(err)
+	}
+	expectUsage(1, 5<<10)
+	if err := WriteFile(filepath.Join(dir, "nested", "foo"), bytes.Repeat([]byte{'a'}, 1<<10)); err != nil {
+		t.Fatal(err)
+	}
+	expectUsage(1<<10, 5<<10)
+	if err := WriteFile(filepath.Join(dir, "nested", "bar"), bytes.Repeat([]byte{'a'}, 10<<10)); err != nil {
+		t.Fatal(err)
+	}
+	expectUsage(10<<10, 14<<10)
+	// Symlinks must not be counted twice.
+	if err := os.Symlink(filepath.Join(dir, "nested"), filepath.Join(dir, "dirlink")); err != nil {
+		t.Fatal(err)
+	}
+	expectUsage(1, 1<<10)
+
+	if err := os.Symlink(filepath.Join(dir, "nested", "bar"), filepath.Join(dir, "filelink")); err != nil {
+		t.Fatal(err)
+	}
+	expectUsage(1, 1<<10)
+}
+
+func TestVerboseMessage(t *testing.T) {
+	assert.Equal(t, "error message", VerboseMessage(errors.New("error message")))
+	verr := &VerboseError{
+		Err:    errors.New("verbose error"),
+		Output: []byte("verbose text"),
+	}
+	assert.Equal(t, "verbose error\nverbose text", VerboseMessage(verr))
+	assert.Equal(t, "wrapped: verbose error\nverbose text", VerboseMessage(fmt.Errorf("wrapped: %w", verr)))
 }

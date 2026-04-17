@@ -3,7 +3,10 @@
 
 package crash
 
-import "slices"
+import (
+	"slices"
+	"strings"
+)
 
 type Type string
 
@@ -46,9 +49,21 @@ const (
 	Warning                 = Type("WARNING")
 	// keep-sorted end
 	LostConnection   = Type("LOST_CONNECTION")
+	NoOutput         = Type("NO_OUTPUT")
 	SyzFailure       = Type("SYZ_FAILURE")
 	UnexpectedReboot = Type("REBOOT")
 )
+
+func TitleToType(title string) Type {
+	for _, t := range titleToType {
+		for _, prefix := range t.includePrefixes {
+			if strings.HasPrefix(title, prefix) {
+				return t.crashType
+			}
+		}
+	}
+	return UnknownType
+}
 
 func (t Type) String() string {
 	if t == UnknownType {
@@ -63,6 +78,10 @@ func (t Type) IsKASAN() bool {
 	return slices.Contains([]Type{
 		KASANNullPtrDerefRead, KASANNullPtrDerefWrite, KASANRead, KASANWrite,
 		KASANUseAfterFreeRead, KASANUseAfterFreeWrite, KASANInvalidFree, KASANUnknown}, t)
+}
+
+func (t Type) IsUAF() bool {
+	return slices.Contains([]Type{KASANUseAfterFreeRead, KASANUseAfterFreeWrite}, t)
 }
 
 func (t Type) IsKMSAN() bool {

@@ -12,7 +12,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/google/go-cmp/cmp"
 	"github.com/google/syzkaller/pkg/image"
 	"github.com/stretchr/testify/assert"
 )
@@ -405,14 +404,10 @@ func TestHintsCompressedImage(t *testing.T) {
 			}
 			sort.Strings(res)
 			sort.Strings(test.output)
-			if diff := cmp.Diff(test.output, res); diff != "" {
-				t.Fatalf("got wrong mutants: %v", diff)
-			}
+			assert.Equal(t, test.output, res, "got wrong mutants")
 			data, dtor := image.MustDecompress(arg.Data())
 			defer dtor()
-			if diff := cmp.Diff(test.input, string(data)); diff != "" {
-				t.Fatalf("argument got changed afterwards: %v", diff)
-			}
+			assert.Equal(t, test.input, string(data), "argument got changed afterwards")
 		})
 	}
 }
@@ -655,14 +650,19 @@ func TestHintsRandom(t *testing.T) {
 	r := newRand(target, rs)
 	for i := 0; i < iters; i++ {
 		p := target.Generate(rs, 5, ct)
+		// In the test mode, MutateWithHints is essentially quadratic over the number of arguments
+		// since we run full prog validation on each run.
+		// To avoid consuming too much time, let's just skip programs that are too big.
+		if p.countArgs() > maxArgCutoff {
+			t.Logf("iter %d: skipping program - too big", i)
+			continue
+		}
 		for j, c := range p.Calls {
 			vals := extractValues(c)
 			for k := 0; k < 5; k++ {
 				vals[r.randInt64()] = true
 			}
-			// In the test mode, MutateWithHints is essentially quadratic over the number of values
-			// since we run full prog validation on each run.
-			// To avoid consuming too much time, let's just skip all calls that are too big.
+			// MutateWithHints is also quadratic over the number of values. Skip large calls.
 			const valsCutOff = 10000
 			if len(vals) > valsCutOff {
 				t.Logf("iter %d: skipping call %d - too big", i, j)

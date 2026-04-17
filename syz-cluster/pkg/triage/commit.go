@@ -12,8 +12,7 @@ import (
 )
 
 // TODO: Some further improvements:
-//   1. Consider the blob hashes incorporated into the git diff. These may restrict the set of base commits.
-//   2. Add support for experimental sessions: these may be way behind the current HEAD.
+//   1. Add support for experimental sessions: these may be way behind the current HEAD.
 
 type TreeOps interface {
 	HeadCommit(tree *api.Tree) (*vcs.Commit, error)
@@ -45,12 +44,12 @@ func (cs *CommitSelector) Select(series *api.Series, tree *api.Tree, lastBuild *
 	if err != nil || head == nil {
 		return SelectResult{}, err
 	}
-	cs.tracer.Log("current HEAD: %q (%v)", head.Hash, head.Date)
+	cs.tracer.Logf("current HEAD: %q (commit date: %v)", head.Hash, head.CommitDate)
 	// If the series is already too old, it may be incompatible even if it applies cleanly.
 	const seriesLagsBehind = time.Hour * 24 * 7
 	if diff := head.CommitDate.Sub(series.PublishedAt); series.PublishedAt.Before(head.CommitDate) &&
 		diff > seriesLagsBehind {
-		cs.tracer.Log("the series is too old: %v before the HEAD", diff)
+		cs.tracer.Logf("the series is too old: %v before the HEAD", diff)
 		return SelectResult{Reason: reasonSeriesTooOld}, nil
 	}
 
@@ -64,20 +63,57 @@ func (cs *CommitSelector) Select(series *api.Series, tree *api.Tree, lastBuild *
 	if lastBuild != nil {
 		// Check if the commit is still good enough.
 		if diff := head.CommitDate.Sub(lastBuild.CommitDate); diff > seriesLagsBehind {
-			cs.tracer.Log("the last successful build is already too old: %v, skipping", diff)
+			cs.tracer.Logf("the last successful build is already too old: %v, skipping", diff)
 		} else {
 			hashes = append(hashes, lastBuild.CommitHash)
 		}
 	}
 	for _, hash := range append(hashes, head.Hash) {
-		cs.tracer.Log("considering %q", hash)
+		cs.tracer.Logf("considering %q", hash)
 		err := cs.ops.ApplySeries(hash, series.PatchBodies())
 		if err == nil {
-			cs.tracer.Log("series can be applied to %q", hash)
+			cs.tracer.Logf("series can be applied to %q", hash)
 			return SelectResult{Commit: hash}, nil
 		} else {
-			cs.tracer.Log("failed to apply to %q: %v", hash, err)
+			cs.tracer.Logf("failed to apply to %q: %v", hash, err)
 		}
 	}
 	return SelectResult{Reason: reasonNotApplies}, nil
+}
+
+func FromBaseCommits(series *api.Series, baseCommits []*vcs.BaseCommit, trees []*api.Tree) (*api.Tree, string) {
+	// Technically, any one of baseCommits could be a good match.
+	// However, the developers have their own expectations regarding
+	// what tree and what branch are actually preferred there.
+	// So, among baseCommits, we still give preference to those that
+	// align with the mailing lists Cc'd by the patch series.
+	tree, commit := bestCommit(baseCommits, SelectTrees(series, trees))
+	if tree != nil {
+		return tree, commit
+	}
+	return bestCommit(baseCommits, trees)
+}
+
+func bestCommit(baseCommits []*vcs.BaseCommit, trees []*api.Tree) (*api.Tree, string) {
+	retTreeIdx, retSameBranch, retCommit := -1, false, ""
+	for _, commit := range baseCommits {
+		for _, commitBranch := range commit.Branches {
+			treeIdx, branch := FindTree(trees, commitBranch)
+			if treeIdx < 0 {
+				continue
+			}
+			sameBranch := branch == trees[treeIdx].Branch
+			// If, for the same tree, we also have matched the branch, even better.
+			if retTreeIdx < 0 || treeIdx < retTreeIdx ||
+				treeIdx == retTreeIdx && !retSameBranch && sameBranch {
+				retTreeIdx = treeIdx
+				retSameBranch = sameBranch
+				retCommit = commit.Hash
+			}
+		}
+	}
+	if retTreeIdx < 0 {
+		return nil, ""
+	}
+	return trees[retTreeIdx], retCommit
 }

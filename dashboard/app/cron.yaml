@@ -6,6 +6,8 @@ cron:
   schedule: every 1 minutes
 - url: /cron/cache_update
   schedule: every 1 hours
+- url: /cron/dungeon_preheat
+  schedule: every 1 hours
 - url: /cron/minute_cache_update
   schedule: every 1 minutes
 - url: /cron/deprecate_assets
@@ -38,4 +40,4 @@ cron:
   schedule: 15 of month 00:00
 # Weekly update the kernel-file -> subsystems relationship
 - url: /cron/update_coverdb_subsystems
-  schedule: every monday
+  schedule: every monday 00:00

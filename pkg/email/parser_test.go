@@ -9,20 +9,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestExtractCommand(t *testing.T) {
 	for i, test := range extractCommandTests {
 		t.Run(fmt.Sprint(i), func(t *testing.T) {
 			cmd, _ := extractCommand(test.body)
-			if diff := cmp.Diff(test.cmd, cmd); diff != "" {
-				t.Fatal(diff)
-			}
+			require.Equal(t, test.cmd, cmd)
 			cmd, _ = extractCommand(strings.ReplaceAll(test.body, "\n", "\r\n"))
-			if diff := cmp.Diff(test.cmd, cmd); diff != "" {
-				t.Fatal(diff)
-			}
+			require.Equal(t, test.cmd, cmd)
 		})
 	}
 }
@@ -124,9 +121,7 @@ func TestParse(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if diff := cmp.Diff(&test.res, email); diff != "" {
-				t.Error(diff)
-			}
+			assert.Equal(t, &test.res, email)
 		}
 		t.Run(fmt.Sprint(i), func(t *testing.T) { body(t, test) })
 
@@ -1138,4 +1133,114 @@ Body
 		Body: `Body
 `,
 	}},
+	{
+		`Sender: foo@foobar.com
+Subject: [PATCH] Some patch
+To: <bar@foo.com>
+From: <foo@foobar.com>
+Message-ID: <1250334f-7220-2bff-5d87-b87573758d81@bar.com>
+Date: Sun, 7 May 2017 19:54:00 -0700
+
+base-commit-broken-tag-correct-hash: f8f97927abf7c12382dddc93a144fc9df7919b77
+`,
+		Email{
+			MessageID: "<1250334f-7220-2bff-5d87-b87573758d81@bar.com>",
+			Date:      time.Date(2017, time.May, 7, 19, 54, 0, 0, parseTestZone),
+			Subject:   "[PATCH] Some patch",
+			Author:    "foo@foobar.com",
+			Cc:        []string{"bar@foo.com", "foo@foobar.com"},
+			RawCc:     []string{"bar@foo.com", "foo@foobar.com"},
+			Body: `base-commit-broken-tag-correct-hash: f8f97927abf7c12382dddc93a144fc9df7919b77
+`,
+			BaseCommitHint: "",
+		},
+	}, {
+		`Sender: foo@foobar.com
+Subject: [PATCH] Some patch
+To: <bar@foo.com>
+From: <foo@foobar.com>
+Message-ID: <1250334f-7220-2bff-5d87-b87573758d81@bar.com>
+Date: Sun, 7 May 2017 19:54:00 -0700
+
+base-commit: f8f97927brokenhash
+`,
+		Email{
+			MessageID: "<1250334f-7220-2bff-5d87-b87573758d81@bar.com>",
+			Date:      time.Date(2017, time.May, 7, 19, 54, 0, 0, parseTestZone),
+			Subject:   "[PATCH] Some patch",
+			Author:    "foo@foobar.com",
+			Cc:        []string{"bar@foo.com", "foo@foobar.com"},
+			RawCc:     []string{"bar@foo.com", "foo@foobar.com"},
+			Body: `base-commit: f8f97927brokenhash
+`,
+			BaseCommitHint: "",
+		},
+	}, {
+		`Sender: foo@foobar.com
+Subject: [PATCH] Some patch
+To: <bar@foo.com>
+From: <foo@foobar.com>
+Message-ID: <1250334f-7220-2bff-5d87-b87573758d81@bar.com>
+Date: Sun, 7 May 2017 19:54:00 -0700
+
+base-commit: f8f97927abf7c12382dddc93a144fc9df7919b77
+`,
+		Email{
+			MessageID: "<1250334f-7220-2bff-5d87-b87573758d81@bar.com>",
+			Date:      time.Date(2017, time.May, 7, 19, 54, 0, 0, parseTestZone),
+			Subject:   "[PATCH] Some patch",
+			Author:    "foo@foobar.com",
+			Cc:        []string{"bar@foo.com", "foo@foobar.com"},
+			RawCc:     []string{"bar@foo.com", "foo@foobar.com"},
+			Body: `base-commit: f8f97927abf7c12382dddc93a144fc9df7919b77
+`,
+			BaseCommitHint: "f8f97927abf7c12382dddc93a144fc9df7919b77",
+		},
+	}, {
+		`Sender: foo@foobar.com
+Subject: [PATCH] Some patch
+To: <bar@foo.com>
+From: <foo@foobar.com>
+Message-ID: <1250334f-7220-2bff-5d87-b87573758d81@bar.com>
+Date: Sun, 7 May 2017 19:54:00 -0700
+
+base-commit: 
+
+Oops, no hash.
+`,
+		Email{
+			MessageID: "<1250334f-7220-2bff-5d87-b87573758d81@bar.com>",
+			Date:      time.Date(2017, time.May, 7, 19, 54, 0, 0, parseTestZone),
+			Subject:   "[PATCH] Some patch",
+			Author:    "foo@foobar.com",
+			Cc:        []string{"bar@foo.com", "foo@foobar.com"},
+			RawCc:     []string{"bar@foo.com", "foo@foobar.com"},
+			Body: `base-commit: 
+
+Oops, no hash.
+`,
+			BaseCommitHint: "",
+		},
+	}, {
+		`Sender: foo@foobar.com
+Subject: [PATCH] Some patch
+To: <bar@foo.com>
+From: <foo@foobar.com>
+Message-ID: <1250334f-7220-2bff-5d87-b87573758d81@bar.com>
+Date: Sun, 7 May 2017 19:54:00 -0700
+
+base-commit: f8f97927abf7c12382dddc93a144fc9df7919b77 words after the hash are bad
+`,
+		Email{
+			MessageID: "<1250334f-7220-2bff-5d87-b87573758d81@bar.com>",
+			Date:      time.Date(2017, time.May, 7, 19, 54, 0, 0, parseTestZone),
+			Subject:   "[PATCH] Some patch",
+			Author:    "foo@foobar.com",
+			Cc:        []string{"bar@foo.com", "foo@foobar.com"},
+			RawCc:     []string{"bar@foo.com", "foo@foobar.com"},
+			Body: `base-commit: f8f97927abf7c12382dddc93a144fc9df7919b77 words after the hash are bad
+`,
+			BaseCommitHint: "",
+		},
+	},
 }

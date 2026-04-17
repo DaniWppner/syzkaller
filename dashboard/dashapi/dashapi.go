@@ -54,7 +54,7 @@ func New(client, addr, key string, opts ...DashboardOpts) (*Dashboard, error) {
 type (
 	RequestCtor   func(method, url string, body io.Reader) (*http.Request, error)
 	RequestDoer   func(req *http.Request) (*http.Response, error)
-	RequestLogger func(msg string, args ...interface{})
+	RequestLogger func(msg string, args ...any)
 )
 
 // key == "" indicates that the ambient GCE service account authority
@@ -388,6 +388,7 @@ const (
 )
 
 type LogToReproResp struct {
+	ReqID    int64
 	Title    string
 	CrashLog []byte
 	Type     LogToReproType
@@ -401,13 +402,23 @@ func (dash *Dashboard) LogToRepro(req *LogToReproReq) (*LogToReproResp, error) {
 	return resp, err
 }
 
+type ReproTaskDoneReq struct {
+	ReqID   int64
+	Success bool
+	Log     []byte
+}
+
+func (dash *Dashboard) ReproTaskDone(req *ReproTaskDoneReq) error {
+	return dash.Query("repro_task_done", req, nil)
+}
+
 type LogEntry struct {
 	Name string
 	Text string
 }
 
 // Centralized logging on dashboard.
-func (dash *Dashboard) LogError(name, msg string, args ...interface{}) {
+func (dash *Dashboard) LogError(name, msg string, args ...any) {
 	req := &LogEntry{
 		Name: name,
 		Text: fmt.Sprintf(msg, args...),
@@ -988,19 +999,32 @@ type JobInfo struct {
 	OnMergeBase      bool
 }
 
-func (dash *Dashboard) Query(method string, req, reply interface{}) error {
+func (dash *Dashboard) Query(method string, req, reply any) error {
 	if dash.logger != nil {
 		dash.logger("API(%v): %#v", method, req)
 	}
-	err := dash.queryImpl(method, req, reply)
-	if err != nil {
-		if dash.logger != nil {
-			dash.logger("API(%v): ERROR: %v", method, err)
+	for try := 0; ; try++ {
+		err := dash.queryImpl(method, req, reply)
+		if err != nil {
+			if dash.logger != nil {
+				dash.logger("API(%v): ERROR: %v", method, err)
+			}
+			if dash.errorHandler != nil {
+				dash.errorHandler(err)
+			}
+			// API requests episodically fail due to internal datastore errors, some timeouts, etc.
+			// Failure of some requests is especially unpleasant and leads to lots of wasted work
+			// (uploading of syz-ci build info, job completion, etc). So we retry requests
+			// several times. We do this always for all requests, since we don't expect any of them
+			// to legitimately fail (we don't send malformed requests), and it won't harm for any
+			// request types.
+			if try < 3 {
+				time.Sleep(time.Second)
+				continue
+			}
+			return err
 		}
-		if dash.errorHandler != nil {
-			dash.errorHandler(err)
-		}
-		return err
+		break
 	}
 	if dash.logger != nil {
 		dash.logger("API(%v): REPLY: %#v", method, reply)
@@ -1008,7 +1032,7 @@ func (dash *Dashboard) Query(method string, req, reply interface{}) error {
 	return nil
 }
 
-func (dash *Dashboard) queryImpl(method string, req, reply interface{}) error {
+func (dash *Dashboard) queryImpl(method string, req, reply any) error {
 	if reply != nil {
 		// json decoding behavior is somewhat surprising
 		// (see // https://github.com/golang/go/issues/21092).

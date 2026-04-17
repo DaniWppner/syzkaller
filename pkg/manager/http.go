@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,6 +28,7 @@ import (
 	"github.com/google/syzkaller/pkg/cover"
 	"github.com/google/syzkaller/pkg/fuzzer"
 	"github.com/google/syzkaller/pkg/html/pages"
+	"github.com/google/syzkaller/pkg/html/urlutil"
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/report"
@@ -146,9 +148,12 @@ func (serv *HTTPServer) httpAction(w http.ResponseWriter, r *http.Request) {
 }
 
 func (serv *HTTPServer) httpMain(w http.ResponseWriter, r *http.Request) {
+	filterSubsystem := r.FormValue("subsystem")
 	data := &UISummaryData{
-		UIPageHeader: serv.pageHeader(r, "syzkaller"),
-		Log:          log.CachedLogOutput(),
+		UIPageHeader:    serv.pageHeader(r, "syzkaller"),
+		Log:             log.CachedLogOutput(),
+		ShowCore:        serv.Cfg.MemoryDump,
+		FilterSubsystem: filterSubsystem,
 	}
 
 	level := stat.Simple
@@ -163,13 +168,26 @@ func (serv *HTTPServer) httpMain(w http.ResponseWriter, r *http.Request) {
 			Link:  stat.Link,
 		})
 	}
+
 	if serv.CrashStore != nil {
-		var err error
-		if data.Crashes, err = serv.collectCrashes(serv.Cfg.Workdir); err != nil {
+		list, err := serv.CrashStore.BugList()
+		if err != nil {
 			http.Error(w, fmt.Sprintf("failed to collect crashes: %v", err), http.StatusInternalServerError)
 			return
 		}
+
+		var repros map[string]bool
+		if serv.ReproLoop != nil {
+			repros = serv.ReproLoop.Reproducing()
+		}
+		for _, info := range list {
+			if filterSubsystem != "" && !slices.Contains(info.Subsystems, filterSubsystem) {
+				continue
+			}
+			data.Crashes = append(data.Crashes, makeUICrashType(info, serv.StartTime, repros))
+		}
 	}
+
 	if serv.DiffStore != nil {
 		data.PatchedOnly, data.AffectsBoth, data.InProgress = serv.collectDiffCrashes()
 	}
@@ -752,7 +770,12 @@ func (serv *HTTPServer) httpFile(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "oh, oh, oh!", http.StatusInternalServerError)
 		return
 	}
-	data, err := os.ReadFile(filepath.Join(serv.Cfg.Workdir, file))
+	absPath := filepath.Join(serv.Cfg.Workdir, file)
+	if r.FormValue("raw") != "" {
+		http.ServeFile(w, r, absPath)
+		return
+	}
+	data, err := os.ReadFile(absPath)
 	if err != nil {
 		http.Error(w, "failed to read the file", http.StatusInternalServerError)
 		return
@@ -946,7 +969,10 @@ func (serv *HTTPServer) collectDiffCrashes() (patchedOnly, both, inProgress *UID
 }
 
 func (serv *HTTPServer) allDiffCrashes() []UIDiffBug {
-	repros := serv.ReproLoop.Reproducing()
+	var repros map[string]bool
+	if serv.ReproLoop != nil {
+		repros = serv.ReproLoop.Reproducing()
+	}
 	var list []UIDiffBug
 	for _, bug := range serv.DiffStore.List() {
 		list = append(list, UIDiffBug{
@@ -963,19 +989,6 @@ func (serv *HTTPServer) allDiffCrashes() []UIDiffBug {
 		return first.Title < second.Title
 	})
 	return list
-}
-
-func (serv *HTTPServer) collectCrashes(workdir string) ([]UICrashType, error) {
-	list, err := serv.CrashStore.BugList()
-	if err != nil {
-		return nil, err
-	}
-	repros := serv.ReproLoop.Reproducing()
-	var ret []UICrashType
-	for _, info := range list {
-		ret = append(ret, makeUICrashType(info, serv.StartTime, repros))
-	}
-	return ret, nil
 }
 
 func (serv *HTTPServer) httpJobs(w http.ResponseWriter, r *http.Request) {
@@ -1038,7 +1051,7 @@ func reproStatus(hasRepro, hasCRepro, reproducing, nonReproducible bool) string 
 	return status
 }
 
-func executeTemplate(w http.ResponseWriter, templ *template.Template, data interface{}) {
+func executeTemplate(w http.ResponseWriter, templ *template.Template, data any) {
 	buf := new(bytes.Buffer)
 	if err := templ.Execute(buf, data); err != nil {
 		log.Logf(0, "failed to execute template: %v", err)
@@ -1050,12 +1063,18 @@ func executeTemplate(w http.ResponseWriter, templ *template.Template, data inter
 
 type UISummaryData struct {
 	UIPageHeader
-	Stats       []UIStat
-	Crashes     []UICrashType
-	PatchedOnly *UIDiffTable
-	AffectsBoth *UIDiffTable
-	InProgress  *UIDiffTable
-	Log         string
+	Stats           []UIStat
+	Crashes         []UICrashType
+	PatchedOnly     *UIDiffTable
+	AffectsBoth     *UIDiffTable
+	InProgress      *UIDiffTable
+	Log             string
+	ShowCore        bool
+	FilterSubsystem string
+}
+
+func (data UISummaryData) FilterAddURL(sub string) string {
+	return urlutil.SetParam(data.CurrentURL, "subsystem", sub)
 }
 
 type UIDiffTable struct {

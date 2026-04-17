@@ -5,6 +5,7 @@ package prog
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"unicode"
 )
@@ -49,6 +50,7 @@ type SyscallAttrs struct {
 	Automatic       bool
 	AutomaticHelper bool
 	KFuzzTest       bool
+	Snapshot        bool
 	Fsck            string
 	// Filesystem is used in tools/syz-imagegen when fs name cannot be deduced from
 	// the part after $.
@@ -158,7 +160,7 @@ func (v *Value) ForEachValue(cb func(*Value)) {
 }
 
 func (v *Value) Clone() Expression {
-	return &Value{v.Value, append([]string{}, v.Path...)}
+	return &Value{v.Value, slices.Clone(v.Path)}
 }
 
 type BinaryFormat int
@@ -651,6 +653,7 @@ const (
 	TextX86bit64
 	TextArm64
 	TextPpc64
+	TextRiscv64
 )
 
 type BufferType struct {

@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -950,7 +951,7 @@ func TestSubjectTitleParser(t *testing.T) {
 		} else if title != test.outTitle {
 			t.Fatalf("subj: %q, expected title=%q, got %q", test.inSubject, test.outTitle, title)
 		} else if seq != test.outSeq {
-			t.Fatalf("subj: %q, expected seq=%q, got %q", test.inSubject, test.outSeq, seq)
+			t.Fatalf("subj: %q, expected seq=%v, got %v", test.inSubject, test.outSeq, seq)
 		}
 	}
 }
@@ -1063,7 +1064,6 @@ func TestBugFromSubjectInference(t *testing.T) {
 	c.expectEQ(strings.Contains(email.Body, "This crash does not have a reproducer"), true)
 }
 
-// nolint: funlen
 func TestEmailLinks(t *testing.T) {
 	c := NewCtx(t)
 	defer c.Close()
@@ -1142,7 +1142,7 @@ func TestEmailPatchTestingAccess(t *testing.T) {
 	c.expectNoEmail()
 
 	// The patch test job should also not be created.
-	pollResp := client.pollJobs(build.Manager)
+	pollResp := c.globalClient.pollJobs(build.Manager)
 	c.expectEQ(pollResp.ID, "")
 }
 
@@ -1172,7 +1172,8 @@ The specified label value is incorrect.
 Please use one of the supported label values.
 
 The following labels are suported:
-missing-backport, no-reminders, prio: {low, normal, high}, subsystems: {.. see below ..}
+actionable, missing-backport, no-reminders, prio: {low, normal, high}, subsystems: {..
+see below ..}
 The list of subsystems: https://testapp.appspot.com/access-public-email/subsystems?all=true
 
 `)
@@ -1282,7 +1283,8 @@ The specified label "label" is unknown.
 Please use one of the supported labels.
 
 The following labels are suported:
-missing-backport, no-reminders, prio: {low, normal, high}, subsystems: {.. see below ..}
+actionable, missing-backport, no-reminders, prio: {low, normal, high}, subsystems: {..
+see below ..}
 The list of subsystems: https://testapp.appspot.com/access-public-email/subsystems?all=true
 
 `)
@@ -1450,7 +1452,20 @@ Author: someone@mail.com
 			// Ensure that we don't react to replies.
 			c.incomingEmail("syzbot@testapp.appspotmail.com", msg.Body,
 				EmailOptFrom("syzbot@testapp.appspotmail.com"),
-				EmailOptCC(append(append([]string{}, msg.Cc...), msg.To...)))
+				EmailOptCC(append(slices.Clone(msg.Cc), msg.To...)))
+			c.expectNoEmail()
+		})
+
+		t.Run("duplicate-from-mailing-list", func(t *testing.T) {
+			mailingList := c.config().Namespaces["access-public-email"].Reporting[0].Config.(*EmailConfig).Email
+			// Ensure we don't forward the same email when we receive it again via a mailing list.
+			c.incomingEmail(from,
+				"#syz invalid",
+				EmailOptSubject("test subject"),
+				EmailOptMessageID(1),
+				EmailOptFrom("someone@mail.com"),
+				EmailOptCC([]string{"some@list.com"}), // same as original
+				EmailOptSender(mailingList))           // this makes msg.MailingList set
 			c.expectNoEmail()
 		})
 	})

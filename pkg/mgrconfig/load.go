@@ -69,7 +69,7 @@ func LoadFile(filename string) (*Config, error) {
 }
 
 func LoadPartialData(data []byte) (*Config, error) {
-	cfg := defaultValues()
+	cfg := DefaultValues()
 	if err := config.LoadData(data, cfg); err != nil {
 		return nil, err
 	}
@@ -80,7 +80,7 @@ func LoadPartialData(data []byte) (*Config, error) {
 }
 
 func LoadPartialFile(filename string) (*Config, error) {
-	cfg := defaultValues()
+	cfg := DefaultValues()
 	if err := config.LoadFile(filename, cfg); err != nil {
 		return nil, err
 	}
@@ -90,7 +90,7 @@ func LoadPartialFile(filename string) (*Config, error) {
 	return cfg, nil
 }
 
-func defaultValues() *Config {
+func DefaultValues() *Config {
 	return &Config{
 		SSHUser:        "root",
 		Cover:          true,
@@ -112,37 +112,26 @@ func defaultValues() *Config {
 type DescriptionsMode int
 
 const (
-	invalidDescriptions = iota
-	ManualDescriptions
+	ManualDescriptions = 1 << iota
 	AutoDescriptions
-	AnyDescriptions
+	SnapshotDescriptions
+
+	AnyDescriptions = ManualDescriptions | AutoDescriptions
 )
 
 const manualDescriptions = "manual"
 
-var (
-	strToDescriptionsMode = map[string]DescriptionsMode{
-		manualDescriptions: ManualDescriptions,
-		"auto":             AutoDescriptions,
-		"any":              AnyDescriptions,
-	}
-)
+var strToDescriptionsMode = map[string]DescriptionsMode{
+	manualDescriptions: ManualDescriptions,
+	"auto":             AutoDescriptions,
+	"any":              AnyDescriptions,
+}
 
 func SetTargets(cfg *Config) error {
 	var err error
-	cfg.TargetOS, cfg.TargetVMArch, cfg.TargetArch, err = splitTarget(cfg.RawTarget)
-	if err != nil {
-		return err
-	}
-	cfg.Target, err = prog.GetTarget(cfg.TargetOS, cfg.TargetArch)
-	if err != nil {
-		return err
-	}
-	cfg.SysTarget = targets.Get(cfg.TargetOS, cfg.TargetVMArch)
-	if cfg.SysTarget == nil {
-		return fmt.Errorf("unsupported OS/arch: %v/%v", cfg.TargetOS, cfg.TargetVMArch)
-	}
-	return nil
+	cfg.TargetOS, cfg.TargetVMArch, cfg.TargetArch, cfg.Target, cfg.SysTarget,
+		err = SplitTarget(cfg.RawTarget)
+	return err
 }
 
 func Complete(cfg *Config) error {
@@ -194,9 +183,13 @@ func Complete(cfg *Config) error {
 		return fmt.Errorf("fuzzing_vms cannot be less than 0")
 	}
 
+	descriptionsMode := strToDescriptionsMode[cfg.Experimental.DescriptionsMode]
+	if cfg.Snapshot {
+		descriptionsMode |= SnapshotDescriptions
+	}
 	var err error
 	cfg.Syscalls, err = ParseEnabledSyscalls(cfg.Target, cfg.EnabledSyscalls, cfg.DisabledSyscalls,
-		strToDescriptionsMode[cfg.Experimental.DescriptionsMode])
+		descriptionsMode)
 	if err != nil {
 		return err
 	}
@@ -402,35 +395,43 @@ func (cfg *Config) completeFocusAreas() error {
 	return nil
 }
 
-func splitTarget(target string) (string, string, string, error) {
-	if target == "" {
-		return "", "", "", fmt.Errorf("target is empty")
+func SplitTarget(str string) (os, vmarch, arch string, target *prog.Target, sysTarget *targets.Target, err error) {
+	if str == "" {
+		err = fmt.Errorf("target is empty")
+		return
 	}
-	targetParts := strings.Split(target, "/")
+	targetParts := strings.Split(str, "/")
 	if len(targetParts) != 2 && len(targetParts) != 3 {
-		return "", "", "", fmt.Errorf("bad config param target")
+		err = fmt.Errorf("bad config param target")
+		return
 	}
-	os := targetParts[0]
-	vmarch := targetParts[1]
-	arch := targetParts[1]
+	os = targetParts[0]
+	vmarch = targetParts[1]
+	arch = targetParts[1]
 	if len(targetParts) == 3 {
 		arch = targetParts[2]
 	}
-	return os, vmarch, arch, nil
+	sysTarget = targets.Get(os, vmarch)
+	if sysTarget == nil {
+		err = fmt.Errorf("unsupported OS/arch: %v/%v", os, vmarch)
+		return
+	}
+	target, err = prog.GetTarget(os, arch)
+	return
 }
 
 func ParseEnabledSyscalls(target *prog.Target, enabled, disabled []string,
 	descriptionsMode DescriptionsMode) ([]int, error) {
-	if descriptionsMode == invalidDescriptions {
-		return nil, fmt.Errorf("config param descriptions_mode must contain one of auto/manual/any")
-	}
-
 	syscalls := make(map[int]bool)
 	if len(enabled) != 0 {
 		for _, c := range enabled {
 			n := 0
 			for _, call := range target.Syscalls {
-				if MatchSyscall(call.Name, c) {
+				if !MatchSyscall(call.Name, c) {
+					continue
+				}
+				// Skip snapshot attr check for the calls that match exactly.
+				if checkMode(call, descriptionsMode, call.Name != c) {
 					syscalls[call.ID] = true
 					n++
 				}
@@ -441,15 +442,14 @@ func ParseEnabledSyscalls(target *prog.Target, enabled, disabled []string,
 		}
 	} else {
 		for _, call := range target.Syscalls {
+			if !checkMode(call, descriptionsMode, true) {
+				continue
+			}
 			syscalls[call.ID] = true
 		}
 	}
-
 	for call := range syscalls {
-		if target.Syscalls[call].Attrs.Disabled ||
-			descriptionsMode == ManualDescriptions && target.Syscalls[call].Attrs.Automatic ||
-			descriptionsMode == AutoDescriptions &&
-				!target.Syscalls[call].Attrs.Automatic && !target.Syscalls[call].Attrs.AutomaticHelper {
+		if target.Syscalls[call].Attrs.Disabled {
 			delete(syscalls, call)
 		}
 	}
@@ -473,6 +473,24 @@ func ParseEnabledSyscalls(target *prog.Target, enabled, disabled []string,
 		arr = append(arr, id)
 	}
 	return arr, nil
+}
+
+func checkMode(syscall *prog.Syscall, descriptionsMode DescriptionsMode,
+	checkSnapshot bool) bool {
+	if syscall.Attrs.Automatic &&
+		(descriptionsMode&AutoDescriptions) == 0 {
+		return false
+	}
+	if !syscall.Attrs.Automatic &&
+		!syscall.Attrs.AutomaticHelper &&
+		(descriptionsMode&ManualDescriptions) == 0 {
+		return false
+	}
+	if checkSnapshot && syscall.Attrs.Snapshot &&
+		(descriptionsMode&SnapshotDescriptions) == 0 {
+		return false
+	}
+	return true
 }
 
 func ParseNoMutateSyscalls(target *prog.Target, syscalls []string) (map[int]bool, error) {

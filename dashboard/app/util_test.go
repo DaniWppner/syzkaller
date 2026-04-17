@@ -20,18 +20,26 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/google/go-cmp/cmp"
+	"cloud.google.com/go/spanner/admin/database/apiv1"
+	"cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
 	"github.com/google/syzkaller/dashboard/api"
+	"github.com/google/syzkaller/dashboard/app/aidb"
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"github.com/google/syzkaller/pkg/coveragedb/spannerclient"
 	"github.com/google/syzkaller/pkg/covermerger"
 	"github.com/google/syzkaller/pkg/email"
 	"github.com/google/syzkaller/pkg/subsystem"
+	spannertest "github.com/google/syzkaller/syz-cluster/pkg/db"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/appengine/v2"
 	"google.golang.org/appengine/v2/aetest"
 	db "google.golang.org/appengine/v2/datastore"
 	"google.golang.org/appengine/v2/log"
@@ -45,9 +53,13 @@ type Ctx struct {
 	mockedTime       time.Time
 	emailSink        chan *aemail.Message
 	transformContext func(context.Context) context.Context
+	globalClient     *apiClient
+	agentClient      *apiClient
 	client           *apiClient
 	client2          *apiClient
 	publicClient     *apiClient
+	aiClient         *apiClient
+	checkAI          bool
 }
 
 var skipDevAppserverTests = func() bool {
@@ -58,11 +70,16 @@ var skipDevAppserverTests = func() bool {
 }()
 
 func NewCtx(t *testing.T) *Ctx {
+	return newCtx(t, "")
+}
+
+func newCtx(t *testing.T, appID string) *Ctx {
 	if skipDevAppserverTests {
 		t.Skip("skipping test (no dev_appserver.py)")
 	}
 	t.Parallel()
 	inst, err := aetest.NewInstance(&aetest.Options{
+		AppID:          appID,
 		StartupTimeout: 120 * time.Second,
 		// Without this option datastore queries return data with slight delay,
 		// which fails reporting tests.
@@ -75,38 +92,152 @@ func NewCtx(t *testing.T) *Ctx {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := &Ctx{
+	ctx := &Ctx{
 		t:                t,
 		inst:             inst,
 		mockedTime:       time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC),
 		emailSink:        make(chan *aemail.Message, 100),
-		transformContext: func(c context.Context) context.Context { return c },
+		transformContext: func(ctx context.Context) context.Context { return ctx },
+		checkAI:          appID != "",
 	}
-	c.client = c.makeClient(client1, password1, true)
-	c.client2 = c.makeClient(client2, password2, true)
-	c.publicClient = c.makeClient(clientPublicEmail, keyPublicEmail, true)
-	c.ctx = registerRequest(r, c).Context()
-	return c
+	ctx.globalClient = ctx.makeClient(reportingClient, reportingKey, true)
+	ctx.agentClient = ctx.makeClient(agentClient, agentKey, true)
+	ctx.client = ctx.makeClient(client1, password1, true)
+	ctx.client2 = ctx.makeClient(client2, password2, true)
+	ctx.publicClient = ctx.makeClient(clientPublicEmail, keyPublicEmail, true)
+	ctx.aiClient = ctx.makeClient(clientAI, keyAI, true)
+	ctx.ctx = registerRequest(r, ctx).Context()
+	return ctx
 }
 
-func (c *Ctx) config() *GlobalConfig {
-	return getConfig(c.ctx)
-}
+var appIDSeq = uint32(0)
 
-func (c *Ctx) expectOK(err error) {
+func NewSpannerCtx(t *testing.T) *Ctx {
+	ddlStatements, err := loadUpDDLStatements()
 	if err != nil {
-		c.t.Helper()
-		c.t.Fatalf("expected OK, got error: %v", err)
+		t.Fatal(err)
+	}
+	// The code uses AppID as the spanner database URI project.
+	// So to give each test a private isolated instance of the spanner database,
+	// we give each test that uses spanner an unique AppID.
+	appID := fmt.Sprintf("testapp-%v", atomic.AddUint32(&appIDSeq, 1))
+	uri := fmt.Sprintf("projects/%s/instances/%v/databases/%v", appID, aidb.Instance, aidb.Database)
+	spannertest.NewTestDB(t, uri, ddlStatements)
+	return newCtx(t, appID)
+}
+
+func executeSpannerDDL(ctx context.Context, statements []string) error {
+	dbAdmin, err := database.NewDatabaseAdminClient(ctx)
+	if err != nil {
+		return fmt.Errorf("failed NewDatabaseAdminClient: %w", err)
+	}
+	defer dbAdmin.Close()
+	dbOp, err := dbAdmin.UpdateDatabaseDdl(ctx, &databasepb.UpdateDatabaseDdlRequest{
+		Database: fmt.Sprintf("projects/%s/instances/%v/databases/%v",
+			appengine.AppID(ctx), aidb.Instance, aidb.Database),
+		Statements: statements,
+	})
+	if err != nil {
+		return fmt.Errorf("failed UpdateDatabaseDdl: %w", err)
+	}
+	if err := dbOp.Wait(ctx); err != nil {
+		return fmt.Errorf("failed UpdateDatabaseDdl: %w", err)
+	}
+	return nil
+}
+
+func loadUpDDLStatements() ([]string, error) {
+	return loadDDLStatements("*.up.sql", true)
+}
+
+func loadDownDDLStatements() ([]string, error) {
+	return loadDDLStatements("*.down.sql", false)
+}
+
+func loadDDLStatements(wildcard string, forward bool) ([]string, error) {
+	files, err := filepath.Glob(filepath.Join("aidb", "migrations", wildcard))
+	if err != nil {
+		return nil, err
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("loadDDLStatements: wildcard did not match any files: %q", wildcard)
+	}
+	sortedFiles, err := sortMigrationFiles(files, forward)
+	if err != nil {
+		return nil, err
+	}
+	var all []string
+	for _, file := range sortedFiles {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			return nil, err
+		}
+		// We need individual statements. Assume semicolon is not used in other places than statements end.
+		statements := strings.Split(string(data), ";")
+		statements = statements[:len(statements)-1]
+		all = append(all, statements...)
+	}
+	return all, nil
+}
+
+// sortMigrationFiles parses the leading number from migration filenames and sorts them.
+// If forward is true, it sorts in ascending order (e.g., for 'up' migrations).
+// If forward is false, it sorts in descending order (e.g., for 'down' migrations).
+func sortMigrationFiles(files []string, forward bool) ([]string, error) {
+	type migrationFile struct {
+		num  int
+		file string
+	}
+	var mFiles []migrationFile
+	seen := map[int]string{}
+	for _, file := range files {
+		basename := filepath.Base(file)
+		parts := strings.Split(basename, "_")
+		if len(parts) == 0 {
+			return nil, fmt.Errorf("invalid migration filename: %v", basename)
+		}
+		num, err := strconv.Atoi(parts[0])
+		if err != nil {
+			return nil, fmt.Errorf("migration file %v must start with a number: %w", file, err)
+		}
+		if old, ok := seen[num]; ok {
+			return nil, fmt.Errorf("duplicate migration number %v: %v and %v", num, old, file)
+		}
+		seen[num] = file
+		mFiles = append(mFiles, migrationFile{num: num, file: file})
+	}
+	slices.SortFunc(mFiles, func(a, b migrationFile) int {
+		res := a.num - b.num
+		if !forward {
+			res = -res
+		}
+		return res
+	})
+	var result []string
+	for _, f := range mFiles {
+		result = append(result, f.file)
+	}
+	return result, nil
+}
+
+func (ctx *Ctx) config() *GlobalConfig {
+	return getConfig(ctx.ctx)
+}
+
+func (ctx *Ctx) expectOK(err error) {
+	if err != nil {
+		ctx.t.Helper()
+		ctx.t.Fatalf("expected OK, got error: %v", err)
 	}
 }
 
-func (c *Ctx) expectFail(msg string, err error) {
-	c.t.Helper()
+func (ctx *Ctx) expectFail(msg string, err error) {
+	ctx.t.Helper()
 	if err == nil {
-		c.t.Fatalf("expected to fail, but it does not")
+		ctx.t.Fatalf("expected to fail, but it does not")
 	}
 	if !strings.Contains(err.Error(), msg) {
-		c.t.Fatalf("expected to fail with %q, but failed with %q", msg, err)
+		ctx.t.Fatalf("expected to fail with %q, but failed with %q", msg, err)
 	}
 }
 
@@ -121,28 +252,26 @@ func expectFailureStatus(t *testing.T, err error, code int) {
 	}
 }
 
-func (c *Ctx) expectBadReqest(err error) {
-	expectFailureStatus(c.t, err, http.StatusBadRequest)
+func (ctx *Ctx) expectBadReqest(err error) {
+	expectFailureStatus(ctx.t, err, http.StatusBadRequest)
 }
 
-func (c *Ctx) expectEQ(got, want interface{}) {
-	if diff := cmp.Diff(got, want); diff != "" {
-		c.t.Helper()
-		c.t.Fatal(diff)
-	}
+func (ctx *Ctx) expectEQ(got, want any) {
+	ctx.t.Helper()
+	require.Equal(ctx.t, want, got)
 }
 
-func (c *Ctx) expectNE(got, want interface{}) {
+func (ctx *Ctx) expectNE(got, want any) {
 	if reflect.DeepEqual(got, want) {
-		c.t.Helper()
-		c.t.Fatalf("equal: %#v", got)
+		ctx.t.Helper()
+		ctx.t.Fatalf("equal: %#v", got)
 	}
 }
 
-func (c *Ctx) expectTrue(v bool) {
+func (ctx *Ctx) expectTrue(v bool) {
 	if !v {
-		c.t.Helper()
-		c.t.Fatal("failed")
+		ctx.t.Helper()
+		ctx.t.Fatal("failed")
 	}
 }
 
@@ -168,65 +297,77 @@ func caller(skip int) string {
 	return stack
 }
 
-func (c *Ctx) Close() {
-	defer c.inst.Close()
-	if !c.t.Failed() {
+func (ctx *Ctx) Close() {
+	defer ctx.inst.Close()
+	// transformContext may substitute config.
+	if ctx.transformContext == nil && !ctx.t.Failed() {
 		// To avoid per-day reporting limits for left-over emails.
-		c.advanceTime(25 * time.Hour)
+		ctx.advanceTime(25 * time.Hour)
 		// Ensure that we can render main page and all bugs in the final test state.
-		_, err := c.GET("/test1")
-		c.expectOK(err)
-		_, err = c.GET("/test2")
-		c.expectOK(err)
-		_, err = c.GET("/test1/fixed")
-		c.expectOK(err)
-		_, err = c.GET("/test2/fixed")
-		c.expectOK(err)
-		_, err = c.GET("/admin")
-		c.expectOK(err)
+		_, err := ctx.GET("/test1")
+		ctx.expectOK(err)
+		_, err = ctx.GET("/test2")
+		ctx.expectOK(err)
+		_, err = ctx.GET("/test1/fixed")
+		ctx.expectOK(err)
+		_, err = ctx.GET("/test2/fixed")
+		ctx.expectOK(err)
+		_, err = ctx.GET("/admin")
+		ctx.expectOK(err)
 		var bugs []*Bug
-		keys, err := db.NewQuery("Bug").GetAll(c.ctx, &bugs)
+		keys, err := db.NewQuery("Bug").GetAll(ctx.ctx, &bugs)
 		if err != nil {
-			c.t.Errorf("ERROR: failed to query bugs: %v", err)
+			ctx.t.Errorf("ERROR: failed to query bugs: %v", err)
 		}
 		for _, key := range keys {
-			_, err = c.GET(fmt.Sprintf("/bug?id=%v", key.StringID()))
-			c.expectOK(err)
+			_, err = ctx.GET(fmt.Sprintf("/bug?id=%v", key.StringID()))
+			ctx.expectOK(err)
 		}
 		// No pending emails (tests need to consume them).
-		_, err = c.GET("/cron/email_poll")
-		c.expectOK(err)
-		for len(c.emailSink) != 0 {
-			c.t.Errorf("ERROR: leftover email: %v", (<-c.emailSink).Body)
+		_, err = ctx.GET("/cron/email_poll")
+		ctx.expectOK(err)
+		for len(ctx.emailSink) != 0 {
+			ctx.t.Errorf("ERROR: leftover email: %v", (<-ctx.emailSink).Body)
 		}
 		// No pending external reports (tests need to consume them).
-		resp, _ := c.client.ReportingPollBugs("test")
+		resp, _ := ctx.globalClient.ReportingPollBugs("test")
 		for _, rep := range resp.Reports {
-			c.t.Errorf("ERROR: leftover external report:\n%#v", rep)
+			ctx.t.Errorf("ERROR: leftover external report:\n%#v", rep)
+		}
+		if ctx.checkAI {
+			_, err = ctx.GET("/ains/ai/")
+			ctx.expectOK(err)
+			jobs, err := aidb.LoadNamespaceJobs(ctx.ctx, "ains", nil)
+			ctx.expectOK(err)
+			for _, job := range jobs {
+				_, err = ctx.GET(fmt.Sprintf("/ai_job?id=%v", job.ID))
+				ctx.expectOK(err)
+			}
 		}
 	}
-	unregisterContext(c)
+	aidb.CloseClient(ctx.ctx)
+	unregisterContext(ctx)
 	validateGlobalConfig()
 }
 
-func (c *Ctx) advanceTime(d time.Duration) {
-	c.mockedTime = c.mockedTime.Add(d)
+func (ctx *Ctx) advanceTime(d time.Duration) {
+	ctx.mockedTime = ctx.mockedTime.Add(d)
 }
 
-func (c *Ctx) setSubsystems(ns string, list []*subsystem.Subsystem, rev int) {
-	c.transformContext = func(c context.Context) context.Context {
-		newConfig := replaceNamespaceConfig(c, ns, func(cfg *Config) *Config {
+func (ctx *Ctx) setSubsystems(ns string, list []*subsystem.Subsystem, rev int) {
+	ctx.transformContext = func(ctx context.Context) context.Context {
+		newConfig := replaceNamespaceConfig(ctx, ns, func(cfg *Config) *Config {
 			ret := *cfg
 			ret.Subsystems.Service = subsystem.MustMakeService(list, rev)
 			return &ret
 		})
-		return contextWithConfig(c, newConfig)
+		return contextWithConfig(ctx, newConfig)
 	}
 }
 
-func (c *Ctx) setCoverageMocks(ns string, dbClientMock spannerclient.SpannerClient,
+func (ctx *Ctx) setCoverageMocks(ns string, dbClientMock spannerclient.SpannerClient,
 	fileProvMock covermerger.FileVersProvider) {
-	c.transformContext = func(ctx context.Context) context.Context {
+	ctx.transformContext = func(ctx context.Context) context.Context {
 		newConfig := replaceNamespaceConfig(ctx, ns, func(cfg *Config) *Config {
 			ret := *cfg
 			ret.Coverage = &CoverageConfig{WebGitURI: "test-git"}
@@ -238,70 +379,70 @@ func (c *Ctx) setCoverageMocks(ns string, dbClientMock spannerclient.SpannerClie
 	}
 }
 
-func (c *Ctx) setKernelRepos(ns string, list []KernelRepo) {
-	c.transformContext = func(c context.Context) context.Context {
-		newConfig := replaceNamespaceConfig(c, ns, func(cfg *Config) *Config {
+func (ctx *Ctx) setKernelRepos(ns string, list []KernelRepo) {
+	ctx.transformContext = func(ctx context.Context) context.Context {
+		newConfig := replaceNamespaceConfig(ctx, ns, func(cfg *Config) *Config {
 			ret := *cfg
 			ret.Repos = list
 			return &ret
 		})
-		return contextWithConfig(c, newConfig)
+		return contextWithConfig(ctx, newConfig)
 	}
 }
 
-func (c *Ctx) setNoObsoletions() {
-	c.transformContext = func(c context.Context) context.Context {
-		return contextWithNoObsoletions(c)
+func (ctx *Ctx) setNoObsoletions() {
+	ctx.transformContext = func(ctx context.Context) context.Context {
+		return contextWithNoObsoletions(ctx)
 	}
 }
 
-func (c *Ctx) updateReporting(ns, name string, f func(Reporting) Reporting) {
-	c.transformContext = func(c context.Context) context.Context {
-		return contextWithConfig(c, replaceReporting(c, ns, name, f))
+func (ctx *Ctx) updateReporting(ns, name string, f func(Reporting) Reporting) {
+	ctx.transformContext = func(ctx context.Context) context.Context {
+		return contextWithConfig(ctx, replaceReporting(ctx, ns, name, f))
 	}
 }
 
-func (c *Ctx) decommissionManager(ns, oldManager, newManager string) {
-	c.transformContext = func(c context.Context) context.Context {
-		newConfig := replaceManagerConfig(c, ns, oldManager, func(cfg ConfigManager) ConfigManager {
+func (ctx *Ctx) decommissionManager(ns, oldManager, newManager string) {
+	ctx.transformContext = func(ctx context.Context) context.Context {
+		newConfig := replaceManagerConfig(ctx, ns, oldManager, func(cfg ConfigManager) ConfigManager {
 			cfg.Decommissioned = true
 			cfg.DelegatedTo = newManager
 			return cfg
 		})
-		return contextWithConfig(c, newConfig)
+		return contextWithConfig(ctx, newConfig)
 	}
 }
 
-func (c *Ctx) decommission(ns string) {
-	c.transformContext = func(c context.Context) context.Context {
-		newConfig := replaceNamespaceConfig(c, ns, func(cfg *Config) *Config {
+func (ctx *Ctx) decommission(ns string) {
+	ctx.transformContext = func(ctx context.Context) context.Context {
+		newConfig := replaceNamespaceConfig(ctx, ns, func(cfg *Config) *Config {
 			ret := *cfg
 			ret.Decommissioned = true
 			return &ret
 		})
-		return contextWithConfig(c, newConfig)
+		return contextWithConfig(ctx, newConfig)
 	}
 }
 
-func (c *Ctx) setWaitForRepro(ns string, d time.Duration) {
-	c.transformContext = func(c context.Context) context.Context {
-		newConfig := replaceNamespaceConfig(c, ns, func(cfg *Config) *Config {
+func (ctx *Ctx) setWaitForRepro(ns string, d time.Duration) {
+	ctx.transformContext = func(ctx context.Context) context.Context {
+		newConfig := replaceNamespaceConfig(ctx, ns, func(cfg *Config) *Config {
 			ret := *cfg
 			ret.WaitForRepro = d
 			return &ret
 		})
-		return contextWithConfig(c, newConfig)
+		return contextWithConfig(ctx, newConfig)
 	}
 }
 
 // GET sends admin-authorized HTTP GET request to the app.
-func (c *Ctx) GET(url string) ([]byte, error) {
-	return c.AuthGET(AccessAdmin, url)
+func (ctx *Ctx) GET(url string) ([]byte, error) {
+	return ctx.AuthGET(AccessAdmin, url)
 }
 
 // AuthGET sends HTTP GET request to the app with the specified authorization.
-func (c *Ctx) AuthGET(access AccessLevel, url string) ([]byte, error) {
-	w, err := c.httpRequest("GET", url, "", "", access)
+func (ctx *Ctx) AuthGET(access AccessLevel, url string) ([]byte, error) {
+	w, err := ctx.httpRequest("GET", url, "", "", access)
 	if err != nil {
 		return nil, err
 	}
@@ -309,8 +450,8 @@ func (c *Ctx) AuthGET(access AccessLevel, url string) ([]byte, error) {
 }
 
 // POST sends admin-authorized HTTP POST requestd to the app.
-func (c *Ctx) POST(url, body string) ([]byte, error) {
-	w, err := c.httpRequest("POST", url, body, "", AccessAdmin)
+func (ctx *Ctx) POST(url, body string) ([]byte, error) {
+	w, err := ctx.httpRequest("POST", url, body, "", AccessAdmin)
 	if err != nil {
 		return nil, err
 	}
@@ -318,8 +459,8 @@ func (c *Ctx) POST(url, body string) ([]byte, error) {
 }
 
 // POST sends an admin-authorized HTTP POST form to the app.
-func (c *Ctx) POSTForm(url string, form url.Values) ([]byte, error) {
-	w, err := c.httpRequest("POST", url, form.Encode(),
+func (ctx *Ctx) POSTForm(url string, form url.Values) ([]byte, error) {
+	w, err := ctx.httpRequest("POST", url, form.Encode(),
 		"application/x-www-form-urlencoded", AccessAdmin)
 	if err != nil {
 		return nil, err
@@ -328,8 +469,8 @@ func (c *Ctx) POSTForm(url string, form url.Values) ([]byte, error) {
 }
 
 // ContentType returns the response Content-Type header value.
-func (c *Ctx) ContentType(url string) (string, error) {
-	w, err := c.httpRequest("HEAD", url, "", "", AccessAdmin)
+func (ctx *Ctx) ContentType(url string) (string, error) {
+	w, err := ctx.httpRequest("HEAD", url, "", "", AccessAdmin)
 	if err != nil {
 		return "", err
 	}
@@ -340,19 +481,19 @@ func (c *Ctx) ContentType(url string) (string, error) {
 	return values[0], nil
 }
 
-func (c *Ctx) httpRequest(method, url, body, contentType string,
+func (ctx *Ctx) httpRequest(method, url, body, contentType string,
 	access AccessLevel) (*httptest.ResponseRecorder, error) {
-	c.t.Logf("%v: %v", method, url)
-	r, err := c.inst.NewRequest(method, url, strings.NewReader(body))
+	ctx.t.Logf("%v: %v", method, url)
+	r, err := ctx.inst.NewRequest(method, url, strings.NewReader(body))
 	if err != nil {
-		c.t.Fatal(err)
+		ctx.t.Fatal(err)
 	}
 	r.Header.Add("X-Appengine-User-IP", "127.0.0.1")
 	if contentType != "" {
 		r.Header.Add("Content-Type", contentType)
 	}
-	r = registerRequest(r, c)
-	r = r.WithContext(c.transformContext(r.Context()))
+	r = registerRequest(r, ctx)
+	r = r.WithContext(ctx.transformContext(r.Context()))
 	switch access {
 	case AccessAdmin:
 		aetest.Login(makeUser(AuthorizedAdmin), r)
@@ -361,7 +502,7 @@ func (c *Ctx) httpRequest(method, url, body, contentType string,
 	}
 	w := httptest.NewRecorder()
 	http.DefaultServeMux.ServeHTTP(w, r)
-	c.t.Logf("REPLY: %v", w.Code)
+	ctx.t.Logf("REPLY: %v", w.Code)
 	if w.Code != http.StatusOK {
 		return nil, &HTTPError{w.Code, w.Body.String(), w.Result().Header}
 	}
@@ -378,123 +519,123 @@ func (err *HTTPError) Error() string {
 	return fmt.Sprintf("%v: %v", err.Code, err.Body)
 }
 
-func (c *Ctx) loadBug(extID string) (*Bug, *Crash, *Build) {
-	bug, _, err := findBugByReportingID(c.ctx, extID)
+func (ctx *Ctx) loadBug(extID string) (*Bug, *Crash, *Build) {
+	bug, _, err := findBugByReportingID(ctx.ctx, extID)
 	if err != nil {
-		c.t.Fatalf("failed to load bug: %v", err)
+		ctx.t.Fatalf("failed to load bug: %v", err)
 	}
-	return c.loadBugInfo(bug)
+	return ctx.loadBugInfo(bug)
 }
 
-func (c *Ctx) loadBugByHash(hash string) (*Bug, *Crash, *Build) {
+func (ctx *Ctx) loadBugByHash(hash string) (*Bug, *Crash, *Build) {
 	bug := new(Bug)
-	bugKey := db.NewKey(c.ctx, "Bug", hash, 0, nil)
-	c.expectOK(db.Get(c.ctx, bugKey, bug))
-	return c.loadBugInfo(bug)
+	bugKey := db.NewKey(ctx.ctx, "Bug", hash, 0, nil)
+	ctx.expectOK(db.Get(ctx.ctx, bugKey, bug))
+	return ctx.loadBugInfo(bug)
 }
 
-func (c *Ctx) loadBugInfo(bug *Bug) (*Bug, *Crash, *Build) {
-	crash, _, err := findCrashForBug(c.ctx, bug)
+func (ctx *Ctx) loadBugInfo(bug *Bug) (*Bug, *Crash, *Build) {
+	crash, _, err := findCrashForBug(ctx.ctx, bug)
 	if err != nil {
-		c.t.Fatalf("failed to load crash: %v", err)
+		ctx.t.Fatalf("failed to load crash: %v", err)
 	}
-	build := c.loadBuild(bug.Namespace, crash.BuildID)
+	build := ctx.loadBuild(bug.Namespace, crash.BuildID)
 	return bug, crash, build
 }
 
-func (c *Ctx) loadJob(extID string) (*Job, *Build, *Crash) {
-	jobKey, err := jobID2Key(c.ctx, extID)
+func (ctx *Ctx) loadJob(extID string) (*Job, *Build, *Crash) {
+	jobKey, err := jobID2Key(ctx.ctx, extID)
 	if err != nil {
-		c.t.Fatalf("failed to create job key: %v", err)
+		ctx.t.Fatalf("failed to create job key: %v", err)
 	}
 	job := new(Job)
-	if err := db.Get(c.ctx, jobKey, job); err != nil {
-		c.t.Fatalf("failed to get job %v: %v", extID, err)
+	if err := db.Get(ctx.ctx, jobKey, job); err != nil {
+		ctx.t.Fatalf("failed to get job %v: %v", extID, err)
 	}
-	build := c.loadBuild(job.Namespace, job.BuildID)
+	build := ctx.loadBuild(job.Namespace, job.BuildID)
 	crash := new(Crash)
-	crashKey := db.NewKey(c.ctx, "Crash", "", job.CrashID, jobKey.Parent())
-	if err := db.Get(c.ctx, crashKey, crash); err != nil {
-		c.t.Fatalf("failed to load crash for job: %v", err)
+	crashKey := db.NewKey(ctx.ctx, "Crash", "", job.CrashID, jobKey.Parent())
+	if err := db.Get(ctx.ctx, crashKey, crash); err != nil {
+		ctx.t.Fatalf("failed to load crash for job: %v", err)
 	}
 	return job, build, crash
 }
 
-func (c *Ctx) loadBuild(ns, id string) *Build {
-	build, err := loadBuild(c.ctx, ns, id)
-	c.expectOK(err)
+func (ctx *Ctx) loadBuild(ns, id string) *Build {
+	build, err := loadBuild(ctx.ctx, ns, id)
+	ctx.expectOK(err)
 	return build
 }
 
-func (c *Ctx) loadManager(ns, name string) (*Manager, *Build) {
-	mgr, err := loadManager(c.ctx, ns, name)
-	c.expectOK(err)
-	build := c.loadBuild(ns, mgr.CurrentBuild)
+func (ctx *Ctx) loadManager(ns, name string) (*Manager, *Build) {
+	mgr, err := loadManager(ctx.ctx, ns, name)
+	ctx.expectOK(err)
+	build := ctx.loadBuild(ns, mgr.CurrentBuild)
 	return mgr, build
 }
 
-func (c *Ctx) loadSingleBug() (*Bug, *db.Key) {
+func (ctx *Ctx) loadSingleBug() (*Bug, *db.Key) {
 	var bugs []*Bug
-	keys, err := db.NewQuery("Bug").GetAll(c.ctx, &bugs)
-	c.expectEQ(err, nil)
-	c.expectEQ(len(bugs), 1)
+	keys, err := db.NewQuery("Bug").GetAll(ctx.ctx, &bugs)
+	ctx.expectEQ(err, nil)
+	ctx.expectEQ(len(bugs), 1)
 
 	return bugs[0], keys[0]
 }
 
-func (c *Ctx) loadSingleJob() (*Job, *db.Key) {
+func (ctx *Ctx) loadSingleJob() (*Job, *db.Key) {
 	var jobs []*Job
-	keys, err := db.NewQuery("Job").GetAll(c.ctx, &jobs)
-	c.expectEQ(err, nil)
-	c.expectEQ(len(jobs), 1)
+	keys, err := db.NewQuery("Job").GetAll(ctx.ctx, &jobs)
+	ctx.expectEQ(err, nil)
+	ctx.expectEQ(len(jobs), 1)
 
 	return jobs[0], keys[0]
 }
 
-func (c *Ctx) checkURLContents(url string, want []byte) {
-	c.t.Helper()
-	got, err := c.AuthGET(AccessAdmin, url)
+func (ctx *Ctx) checkURLContents(url string, want []byte) {
+	ctx.t.Helper()
+	got, err := ctx.AuthGET(AccessAdmin, url)
 	if err != nil {
-		c.t.Fatalf("%v request failed: %v", url, err)
+		ctx.t.Fatalf("%v request failed: %v", url, err)
 	}
 	if !bytes.Equal(got, want) {
-		c.t.Fatalf("url %v: got:\n%s\nwant:\n%s\n", url, got, want)
+		ctx.t.Fatalf("url %v: got:\n%s\nwant:\n%s\n", url, got, want)
 	}
 }
 
-func (c *Ctx) pollEmailBug() *aemail.Message {
-	_, err := c.GET("/cron/email_poll")
-	c.expectOK(err)
-	if len(c.emailSink) == 0 {
-		c.t.Helper()
-		c.t.Fatal("got no emails")
+func (ctx *Ctx) pollEmailBug() *aemail.Message {
+	_, err := ctx.GET("/cron/email_poll")
+	ctx.expectOK(err)
+	if len(ctx.emailSink) == 0 {
+		ctx.t.Helper()
+		ctx.t.Fatal("got no emails")
 	}
-	return <-c.emailSink
+	return <-ctx.emailSink
 }
 
-func (c *Ctx) pollEmailExtID() string {
-	c.t.Helper()
-	_, extBugID := c.pollEmailAndExtID()
+func (ctx *Ctx) pollEmailExtID() string {
+	ctx.t.Helper()
+	_, extBugID := ctx.pollEmailAndExtID()
 	return extBugID
 }
 
-func (c *Ctx) pollEmailAndExtID() (string, string) {
-	c.t.Helper()
-	msg := c.pollEmailBug()
+func (ctx *Ctx) pollEmailAndExtID() (string, string) {
+	ctx.t.Helper()
+	msg := ctx.pollEmailBug()
 	_, extBugID, err := email.RemoveAddrContext(msg.Sender)
 	if err != nil {
-		c.t.Fatalf("failed to remove addr context: %v", err)
+		ctx.t.Fatalf("failed to remove addr context: %v", err)
 	}
 	return msg.Sender, extBugID
 }
 
-func (c *Ctx) expectNoEmail() {
-	_, err := c.GET("/cron/email_poll")
-	c.expectOK(err)
-	if len(c.emailSink) != 0 {
-		msg := <-c.emailSink
-		c.t.Helper()
-		c.t.Fatalf("got unexpected email: %v\n%s", msg.Subject, msg.Body)
+func (ctx *Ctx) expectNoEmail() {
+	_, err := ctx.GET("/cron/email_poll")
+	ctx.expectOK(err)
+	if len(ctx.emailSink) != 0 {
+		msg := <-ctx.emailSink
+		ctx.t.Helper()
+		ctx.t.Fatalf("got unexpected email: %v\n%s", msg.Subject, msg.Body)
 	}
 }
 
@@ -503,33 +644,33 @@ type apiClient struct {
 	*dashapi.Dashboard
 }
 
-func (c *Ctx) makeClient(client, key string, failOnErrors bool) *apiClient {
-	logger := func(msg string, args ...interface{}) {
-		c.t.Logf("%v: "+msg, append([]interface{}{caller(3)}, args...)...)
+func (ctx *Ctx) makeClient(client, key string, failOnErrors bool) *apiClient {
+	logger := func(msg string, args ...any) {
+		ctx.t.Logf("%v: "+msg, append([]any{caller(3)}, args...)...)
 	}
 	errorHandler := func(err error) {
 		if failOnErrors {
-			c.t.Fatalf("\n%v: %v", caller(2), err)
+			ctx.t.Fatalf("\n%v: %v", caller(2), err)
 		}
 	}
-	dash, err := dashapi.NewCustom(client, "", key, c.inst.NewRequest, c.httpDoer(), logger, errorHandler)
+	dash, err := dashapi.NewCustom(client, "", key, ctx.inst.NewRequest, ctx.httpDoer(), logger, errorHandler)
 	if err != nil {
 		panic(fmt.Sprintf("Impossible error: %v", err))
 	}
 	return &apiClient{
-		Ctx:       c,
+		Ctx:       ctx,
 		Dashboard: dash,
 	}
 }
 
-func (c *Ctx) makeAPIClient() *api.Client {
-	return api.NewTestClient(c.inst.NewRequest, c.httpDoer())
+func (ctx *Ctx) makeAPIClient() *api.Client {
+	return api.NewTestClient(ctx.inst.NewRequest, ctx.httpDoer())
 }
 
-func (c *Ctx) httpDoer() func(*http.Request) (*http.Response, error) {
+func (ctx *Ctx) httpDoer() func(*http.Request) (*http.Response, error) {
 	return func(r *http.Request) (*http.Response, error) {
-		r = registerRequest(r, c)
-		r = r.WithContext(c.transformContext(r.Context()))
+		r = registerRequest(r, ctx)
+		r = r.WithContext(ctx.transformContext(r.Context()))
 		w := httptest.NewRecorder()
 		http.DefaultServeMux.ServeHTTP(w, r)
 		res := &http.Response{
@@ -628,7 +769,7 @@ type (
 	EmailOptSender    string
 )
 
-func (c *Ctx) incomingEmail(to, body string, opts ...interface{}) {
+func (ctx *Ctx) incomingEmail(to, body string, opts ...any) {
 	id := 0
 	subject := "crash1"
 	from := "default@sender.com"
@@ -665,18 +806,30 @@ Content-Type: text/plain
 
 %v
 `, sender, id, subject, from, strings.Join(cc, ","), to, origFrom, body)
-	log.Infof(c.ctx, "sending %s", email)
-	_, err := c.POST("/_ah/mail/"+to, email)
-	c.expectOK(err)
+	log.Infof(ctx.ctx, "sending %s", email)
+	_, err := ctx.POST("/_ah/mail/"+to, email)
+	ctx.expectOK(err)
+}
+
+func (ctx *Ctx) createAIJob(bugExitID, workflow, baseCommit string) string {
+	bug, _, _ := ctx.loadBug(bugExitID)
+	args := map[string]any{}
+	if baseCommit != "" {
+		args["FixedBaseCommit"] = baseCommit
+	}
+	id, err := aiBugJobCreate(ctx.ctx, workflow, bug, args)
+	require.NoError(ctx.t, err)
+	return id
 }
 
 func initMocks() {
 	// Mock time as some functionality relies on real time.
-	timeNow = func(c context.Context) time.Time {
-		return getRequestContext(c).mockedTime
+	timeNow = func(ctx context.Context) time.Time {
+		return getRequestContext(ctx).mockedTime
 	}
-	sendEmail = func(c context.Context, msg *aemail.Message) error {
-		getRequestContext(c).emailSink <- msg
+	aidb.TimeNow = timeNow
+	sendEmail = func(ctx context.Context, msg *aemail.Message) error {
+		getRequestContext(ctx).emailSink <- msg
 		return nil
 	}
 	maxCrashes = func() int {
@@ -698,35 +851,35 @@ var (
 	requestContexts []RequestMapping
 )
 
-func registerRequest(r *http.Request, c *Ctx) *http.Request {
+func registerRequest(r *http.Request, ctx *Ctx) *http.Request {
 	requestMu.Lock()
 	defer requestMu.Unlock()
 
 	requestNum++
 	newContext := context.WithValue(r.Context(), requestIDKey{}, requestNum)
 	newRequest := r.WithContext(newContext)
-	requestContexts = append(requestContexts, RequestMapping{requestNum, c})
+	requestContexts = append(requestContexts, RequestMapping{requestNum, ctx})
 	return newRequest
 }
 
-func getRequestContext(c context.Context) *Ctx {
+func getRequestContext(ctx context.Context) *Ctx {
 	requestMu.Lock()
 	defer requestMu.Unlock()
-	reqID := getRequestID(c)
+	reqID := getRequestID(ctx)
 	for _, m := range requestContexts {
 		if m.id == reqID {
 			return m.ctx
 		}
 	}
-	panic(fmt.Sprintf("no context for: %#v", c))
+	panic(fmt.Sprintf("no context for: %#v", ctx))
 }
 
-func unregisterContext(c *Ctx) {
+func unregisterContext(ctx *Ctx) {
 	requestMu.Lock()
 	defer requestMu.Unlock()
 	n := 0
 	for _, m := range requestContexts {
-		if m.ctx == c {
+		if m.ctx == ctx {
 			continue
 		}
 		requestContexts[n] = m
@@ -737,8 +890,8 @@ func unregisterContext(c *Ctx) {
 
 type requestIDKey struct{}
 
-func getRequestID(c context.Context) int {
-	val, ok := c.Value(requestIDKey{}).(int)
+func getRequestID(ctx context.Context) int {
+	val, ok := ctx.Value(requestIDKey{}).(int)
 	if !ok {
 		panic("the context did not come from a test")
 	}
@@ -746,8 +899,8 @@ func getRequestID(c context.Context) int {
 }
 
 // Create a shallow copy of GlobalConfig with a replaced namespace config.
-func replaceNamespaceConfig(c context.Context, ns string, f func(*Config) *Config) *GlobalConfig {
-	ret := *getConfig(c)
+func replaceNamespaceConfig(ctx context.Context, ns string, f func(*Config) *Config) *GlobalConfig {
+	ret := *getConfig(ctx)
 	newNsMap := map[string]*Config{}
 	for name, nsCfg := range ret.Namespaces {
 		if name == ns {
@@ -759,8 +912,8 @@ func replaceNamespaceConfig(c context.Context, ns string, f func(*Config) *Confi
 	return &ret
 }
 
-func replaceManagerConfig(c context.Context, ns, mgr string, f func(ConfigManager) ConfigManager) *GlobalConfig {
-	return replaceNamespaceConfig(c, ns, func(cfg *Config) *Config {
+func replaceManagerConfig(ctx context.Context, ns, mgr string, f func(ConfigManager) ConfigManager) *GlobalConfig {
+	return replaceNamespaceConfig(ctx, ns, func(cfg *Config) *Config {
 		ret := *cfg
 		newMgrMap := map[string]ConfigManager{}
 		for name, mgrCfg := range ret.Managers {
@@ -774,8 +927,8 @@ func replaceManagerConfig(c context.Context, ns, mgr string, f func(ConfigManage
 	})
 }
 
-func replaceReporting(c context.Context, ns, name string, f func(Reporting) Reporting) *GlobalConfig {
-	return replaceNamespaceConfig(c, ns, func(cfg *Config) *Config {
+func replaceReporting(ctx context.Context, ns, name string, f func(Reporting) Reporting) *GlobalConfig {
+	return replaceNamespaceConfig(ctx, ns, func(cfg *Config) *Config {
 		ret := *cfg
 		var newReporting []Reporting
 		for _, cfg := range ret.Reporting {

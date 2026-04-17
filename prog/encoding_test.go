@@ -245,6 +245,14 @@ func TestDeserialize(t *testing.T) {
 			In: `test$excessive_fields1(0xffffffffffffffff)`,
 		},
 		{
+			In:  `serialize1(&(0x7f0000000000)="0000000000000000", 300000)`,
+			Out: `serialize1(&(0x7f0000000000)=""/8, 0x493e0)`,
+		},
+		{
+			In:  `serialize1(&(0x7f0000000000)="0000000000000000", 010)`,
+			Out: `serialize1(&(0x7f0000000000)=""/8, 0x8)`,
+		},
+		{
 			In: `test$excessive_fields1(0xfffffffffffffffe)`,
 		},
 		{
@@ -262,6 +270,10 @@ func TestDeserialize(t *testing.T) {
 		{
 			In:  `test$auto0(AUTO, &AUTO={AUTO, AUTO, AUTO}, AUTO, 0x0)`,
 			Err: `wrong type *prog.IntType for AUTO`,
+		},
+		{
+			In:  `test$csum_ipv4(&(0x7f0000000000)={AUTO, 0x0, 0x0})`,
+			Out: `test$csum_ipv4(&(0x7f0000000000)={0x0, 0x0, 0x0})`,
 		},
 		{
 			In:  `test$auto1(AUTO, &AUTO=AUTO, AUTO, 0x0)`,
@@ -361,6 +373,22 @@ func TestDeserialize(t *testing.T) {
 			In:  `mutate9(&(0x7f0000000000)='/escaping/filename\x00')`,
 			Err: `escaping filename`,
 		},
+		{
+			In:  "test$opt2(0x0)\r",
+			Out: "test$opt2(0x0)",
+		},
+		{
+			In:  "test$opt2(0x0)\r\n",
+			Out: "test$opt2(0x0)",
+		},
+		{
+			In:  "test$opt2(0x0) \t\r\n",
+			Out: "test$opt2(0x0)",
+		},
+		{
+			In:  "  test$opt2(0x0)",
+			Out: "test$opt2(0x0)",
+		},
 	})
 }
 
@@ -406,6 +434,9 @@ func TestSerializeDeserializeRandom(t *testing.T) {
 		ct := target.DefaultChoiceTable()
 		for i := 0; i < iters; i++ {
 			p0 := target.Generate(rs, 10, ct)
+			if p0.countArgs() > maxArgCutoff {
+				continue
+			}
 			if _, _, ok := testSerializeDeserialize(t, p0); ok {
 				continue
 			}

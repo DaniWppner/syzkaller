@@ -370,6 +370,11 @@ static int netlink_next_msg(struct nlmsg* nlmsg, unsigned int offset,
 #endif
 
 #if SYZ_EXECUTOR || SYZ_NET_DEVICES || SYZ_802154
+
+// Force few TX and RX queues per interface to avoid creating 2 sysfs entries
+// per CPU per interface which takes a long time on machines with many cores.
+static unsigned int queue_count = 2;
+
 static void netlink_add_device_impl(struct nlmsg* nlmsg, const char* type,
 				    const char* name, bool up)
 {
@@ -380,6 +385,10 @@ static void netlink_add_device_impl(struct nlmsg* nlmsg, const char* type,
 	netlink_init(nlmsg, RTM_NEWLINK, NLM_F_EXCL | NLM_F_CREATE, &hdr, sizeof(hdr));
 	if (name)
 		netlink_attr(nlmsg, IFLA_IFNAME, name, strlen(name));
+
+	netlink_attr(nlmsg, IFLA_NUM_TX_QUEUES, &queue_count, sizeof(queue_count));
+	netlink_attr(nlmsg, IFLA_NUM_RX_QUEUES, &queue_count, sizeof(queue_count));
+
 	netlink_nest(nlmsg, IFLA_LINKINFO);
 	netlink_attr(nlmsg, IFLA_INFO_KIND, type, strlen(type));
 }
@@ -405,6 +414,8 @@ static void netlink_add_veth(struct nlmsg* nlmsg, int sock, const char* name,
 	netlink_nest(nlmsg, VETH_INFO_PEER);
 	nlmsg->pos += sizeof(struct ifinfomsg);
 	netlink_attr(nlmsg, IFLA_IFNAME, peer, strlen(peer));
+	netlink_attr(nlmsg, IFLA_NUM_TX_QUEUES, &queue_count, sizeof(queue_count));
+	netlink_attr(nlmsg, IFLA_NUM_RX_QUEUES, &queue_count, sizeof(queue_count));
 	netlink_done(nlmsg);
 	netlink_done(nlmsg);
 	netlink_done(nlmsg);
@@ -628,6 +639,7 @@ static struct nlmsg nlmsg;
 #include <stdbool.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 
 #include <linux/if_ether.h>
 #include <linux/if_tun.h>
@@ -654,12 +666,36 @@ static int tun_frags_enabled;
 #endif
 #endif
 
+// Sometimes, executors like to delete or replace /dev/net/tun and this causes
+// all further executors to fail. Let's make sure it's the right char device.
+static void correct_dev_net_tun(void)
+{
+	struct stat st;
+	if (stat("/dev/net/tun", &st) == 0) {
+		if (S_ISCHR(st.st_mode) && major(st.st_rdev) == 10 && minor(st.st_rdev) == 200)
+			return;
+		if (unlink("/dev/net/tun")) {
+			debug("tun: unlink(/dev/net/tun) failed: %d\n", errno);
+		}
+	}
+	if (mkdir("/dev/net", 0755) && errno != EEXIST) {
+		debug("tun: mkdir(/dev/net) failed: %d\n", errno);
+	}
+	if (mknod("/dev/net/tun", S_IFCHR | 0666, makedev(10, 200))) {
+		debug("tun: mknod(/dev/net/tun) failed: %d\n", errno);
+	}
+	if (chmod("/dev/net/tun", 0666)) {
+		debug("tun: chmod(/dev/net/tun) failed: %d\n", errno);
+	}
+}
+
 static void initialize_tun(void)
 {
 #if SYZ_EXECUTOR
 	if (!flag_net_injection)
 		return;
 #endif
+	correct_dev_net_tun();
 	tunfd = open("/dev/net/tun", O_RDWR | O_NONBLOCK);
 	if (tunfd == -1) {
 #if SYZ_EXECUTOR
@@ -1817,77 +1853,8 @@ static long syz_emit_ethernet(volatile long a0, volatile long a1, volatile long 
 
 #define SIZEOF_IO_URING_SQE 64
 #define SIZEOF_IO_URING_CQE 16
-
-// Once a io_uring is set up by calling io_uring_setup, the offsets to the member fields
-// to be used on the mmap'ed area are set in structs io_sqring_offsets and io_cqring_offsets.
-// Except io_sqring_offsets.array, the offsets are static while all depend on how struct io_rings
-// is organized in code. The offsets can be marked as resources in syzkaller descriptions but
-// this makes it difficult to generate correct programs by the fuzzer. Thus, the offsets are
-// hard-coded here (and in the descriptions), and array offset is later computed once the number
-// of entries is available. Another way to obtain the offsets is to setup another io_uring here
-// and use what it returns. It is slower but might be more maintainable.
-#define SQ_HEAD_OFFSET 0
-#define SQ_TAIL_OFFSET 64
-#define SQ_RING_MASK_OFFSET 256
-#define SQ_RING_ENTRIES_OFFSET 264
-#define SQ_FLAGS_OFFSET 276
-#define SQ_DROPPED_OFFSET 272
-#define CQ_HEAD_OFFSET 128
-#define CQ_TAIL_OFFSET 192
-#define CQ_RING_MASK_OFFSET 260
-#define CQ_RING_ENTRIES_OFFSET 268
-#define CQ_RING_OVERFLOW_OFFSET 284
-#define CQ_FLAGS_OFFSET 280
-#define CQ_CQES_OFFSET 320
-
-#if SYZ_EXECUTOR || __NR_syz_io_uring_complete
-
-// From linux/io_uring.h
-struct io_uring_cqe {
-	uint64 user_data;
-	uint32 res;
-	uint32 flags;
-};
-
-static long syz_io_uring_complete(volatile long a0)
-{
-	// syzlang: syz_io_uring_complete(ring_ptr ring_ptr)
-	// C:       syz_io_uring_complete(char* ring_ptr)
-
-	// It is not checked if the ring is empty
-
-	// Cast to original
-	char* ring_ptr = (char*)a0;
-
-	// Compute the head index and the next head value
-	uint32 cq_ring_mask = *(uint32*)(ring_ptr + CQ_RING_MASK_OFFSET);
-	uint32* cq_head_ptr = (uint32*)(ring_ptr + CQ_HEAD_OFFSET);
-	uint32 cq_head = *cq_head_ptr & cq_ring_mask;
-	uint32 cq_head_next = *cq_head_ptr + 1;
-
-	// Compute the ptr to the src cq entry on the ring
-	char* cqe_src = ring_ptr + CQ_CQES_OFFSET + cq_head * SIZEOF_IO_URING_CQE;
-
-	// Get the cq entry from the ring
-	struct io_uring_cqe cqe;
-	memcpy(&cqe, cqe_src, sizeof(cqe));
-
-	// Advance the head. Head is a free-flowing integer and relies on natural wrapping.
-	// Ensure that the kernel will never see a head update without the preceeding CQE
-	// stores being done.
-	__atomic_store_n(cq_head_ptr, cq_head_next, __ATOMIC_RELEASE);
-
-	// In the descriptions (sys/linux/io_uring.txt), openat and openat2 are passed
-	// with a unique range of sqe.user_data (0x12345 and 0x23456) to identify the operations
-	// which produces an fd instance. Check cqe.user_data, which should be the same
-	// as sqe.user_data for that operation. If it falls in that unique range, return
-	// cqe.res as fd. Otherwise, just return an invalid fd.
-	return (cqe.user_data == 0x12345 || cqe.user_data == 0x23456) ? (long)cqe.res : (long)-1;
-}
-
-#endif
-
-#if SYZ_EXECUTOR || __NR_syz_io_uring_setup
+#define IORING_SETUP_SQE128 (1U << 10)
+#define IORING_SETUP_CQE32 (1U << 11)
 
 struct io_sqring_offsets {
 	uint32 head;
@@ -1898,7 +1865,7 @@ struct io_sqring_offsets {
 	uint32 dropped;
 	uint32 array;
 	uint32 resv1;
-	uint64 resv2;
+	uint64 user_addr;
 };
 
 struct io_cqring_offsets {
@@ -1908,7 +1875,9 @@ struct io_cqring_offsets {
 	uint32 ring_entries;
 	uint32 overflow;
 	uint32 cqes;
-	uint64 resv[2];
+	uint32 flags;
+	uint32 resv1;
+	uint64 user_addr;
 };
 
 struct io_uring_params {
@@ -1923,33 +1892,88 @@ struct io_uring_params {
 	struct io_cqring_offsets cq_off;
 };
 
+#if SYZ_EXECUTOR || __NR_syz_io_uring_setup || __NR_syz_io_uring_submit
+static long io_uring_sqe_size(struct io_uring_params* params)
+{
+	return SIZEOF_IO_URING_SQE << !!(params->flags & IORING_SETUP_SQE128);
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_io_uring_setup || __NR_syz_io_uring_complete
+static long io_uring_cqe_size(struct io_uring_params* params)
+{
+	return SIZEOF_IO_URING_CQE << !!(params->flags & IORING_SETUP_CQE32);
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_io_uring_complete
+
+// From linux/io_uring.h
+struct io_uring_cqe {
+	uint64 user_data;
+	uint32 res;
+	uint32 flags;
+};
+
+static long syz_io_uring_complete(volatile long a0, volatile long a1)
+{
+	// syzlang: syz_io_uring_complete(ring_params_ptr ring_params_ptr, ring_ptr ring_ptr)
+	// C:       syz_io_uring_complete(struct io_uring_params* params, char* ring_ptr)
+
+	// It is not checked if the ring is empty
+
+	// Cast to original
+	struct io_uring_params* params = (struct io_uring_params*)a0;
+	char* ring_ptr = (char*)a1;
+
+	// Compute the head index and the next head value
+	uint32 cq_ring_mask = *(uint32*)(ring_ptr + params->cq_off.ring_mask);
+	uint32* cq_head_ptr = (uint32*)(ring_ptr + params->cq_off.head);
+	uint32 cq_head = *cq_head_ptr & cq_ring_mask;
+	uint32 cq_head_next = *cq_head_ptr + 1;
+
+	// Compute the ptr to the src cq entry on the ring
+	uint32 cqe_off = params->cq_off.cqes + cq_head * io_uring_cqe_size(params);
+	struct io_uring_cqe* cqe = (struct io_uring_cqe*)(ring_ptr + cqe_off);
+	long res = (long)cqe->res;
+
+	// Advance the head. Head is a free-flowing integer and relies on natural wrapping.
+	// Ensure that the kernel will never see a head update without the preceeding CQE
+	// stores being done.
+	__atomic_store_n(cq_head_ptr, cq_head_next, __ATOMIC_RELEASE);
+
+	return res;
+}
+
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_io_uring_setup
+
 #define IORING_OFF_SQ_RING 0
 #define IORING_OFF_SQES 0x10000000ULL
-#define IORING_SETUP_SQE128 (1U << 10)
-#define IORING_SETUP_CQE32 (1U << 11)
 
 #include <sys/mman.h>
 #include <unistd.h>
 
 // Wrapper for io_uring_setup and the subsequent mmap calls that map the ring and the sqes
-static long syz_io_uring_setup(volatile long a0, volatile long a1, volatile long a2, volatile long a3)
+static long syz_io_uring_setup(volatile long a0, volatile long a1, volatile long a2, volatile long a3, volatile long a4)
 {
-	// syzlang: syz_io_uring_setup(entries int32[1:IORING_MAX_ENTRIES], params ptr[inout, io_uring_params], ring_ptr ptr[out, ring_ptr], sqes_ptr ptr[out, sqes_ptr]) fd_io_uring
-	// C:       syz_io_uring_setup(uint32 entries, struct io_uring_params* params, void** ring_ptr_out, void** sqes_ptr_out) // returns uint32 fd_io_uring
+	// syzlang: syz_io_uring_setup(entries int32[1:IORING_MAX_ENTRIES], params ptr[inout, io_uring_params], ring_params_ptr ptr[out, ring_params_ptr], ring_ptr ptr[out, ring_ptr], sqes_ptr ptr[out, sqes_ptr]) fd_io_uring
+	// C:       syz_io_uring_setup(uint32 entries, struct io_uring_params* setup_params, void** ring_params_ptr_out, void** ring_ptr_out, void** sqes_ptr_out) // returns uint32 fd_io_uring
 
 	// Cast to original
 	uint32 entries = (uint32)a0;
 	struct io_uring_params* setup_params = (struct io_uring_params*)a1;
-	void** ring_ptr_out = (void**)a2;
-	void** sqes_ptr_out = (void**)a3;
-	// Temporarily disable IORING_SETUP_CQE32 and IORING_SETUP_SQE128 that may change SIZEOF_IO_URING_CQE and SIZEOF_IO_URING_SQE.
-	// Tracking bug: https://github.com/google/syzkaller/issues/4531.
-	setup_params->flags &= ~(IORING_SETUP_CQE32 | IORING_SETUP_SQE128);
+	void** ring_params_ptr_out = (void**)a2;
+	void** ring_ptr_out = (void**)a3;
+	void** sqes_ptr_out = (void**)a4;
+
 	uint32 fd_io_uring = syscall(__NR_io_uring_setup, entries, setup_params);
+	*ring_params_ptr_out = (void*)setup_params;
 
 	// Compute the ring sizes
 	uint32 sq_ring_sz = setup_params->sq_off.array + setup_params->sq_entries * sizeof(uint32);
-	uint32 cq_ring_sz = setup_params->cq_off.cqes + setup_params->cq_entries * SIZEOF_IO_URING_CQE;
+	uint32 cq_ring_sz = setup_params->cq_off.cqes + setup_params->cq_entries * io_uring_cqe_size(setup_params);
 
 	// Asssumed IORING_FEAT_SINGLE_MMAP, which is always the case with the current implementation
 	// The implication is that the sq_ring_ptr and the cq_ring_ptr are the same but the
@@ -1957,11 +1981,11 @@ static long syz_io_uring_setup(volatile long a0, volatile long a1, volatile long
 	uint32 ring_sz = sq_ring_sz > cq_ring_sz ? sq_ring_sz : cq_ring_sz;
 	*ring_ptr_out = mmap(0, ring_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd_io_uring, IORING_OFF_SQ_RING);
 
-	uint32 sqes_sz = setup_params->sq_entries * SIZEOF_IO_URING_SQE;
+	uint32 sqes_sz = setup_params->sq_entries * io_uring_sqe_size(setup_params);
 	*sqes_ptr_out = mmap(0, sqes_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd_io_uring, IORING_OFF_SQES);
 
 	uint32* array = (uint32*)((uintptr_t)*ring_ptr_out + setup_params->sq_off.array);
-	for (uint32 index = 0; index < entries; index++)
+	for (uint32 index = 0; index < setup_params->sq_entries; index++)
 		array[index] = index;
 
 	return fd_io_uring;
@@ -1971,28 +1995,30 @@ static long syz_io_uring_setup(volatile long a0, volatile long a1, volatile long
 
 #if SYZ_EXECUTOR || __NR_syz_io_uring_submit
 
-static long syz_io_uring_submit(volatile long a0, volatile long a1, volatile long a2)
+static long syz_io_uring_submit(volatile long a0, volatile long a1, volatile long a2, volatile long a3)
 {
-	// syzlang: syz_io_uring_submit(ring_ptr ring_ptr, sqes_ptr sqes_ptr, 		sqe ptr[in, io_uring_sqe])
-	// C:       syz_io_uring_submit(char* ring_ptr,       io_uring_sqe* sqes_ptr,    io_uring_sqe* sqe)
+	// syzlang: syz_io_uring_submit(ring_params_ptr ring_params_ptr, 		ring_ptr ring_ptr, 	sqes_ptr sqes_ptr, 		sqe ptr[in, io_uring_sqe])
+	// C:       syz_io_uring_submit(struct io_uring_params* params, char* ring_ptr,		io_uring_sqe* sqes_ptr,    io_uring_sqe* sqe)
 
 	// It is not checked if the ring is full
 
 	// Cast to original
-	char* ring_ptr = (char*)a0; // This will be exposed to offsets in bytes
-	char* sqes_ptr = (char*)a1;
+	struct io_uring_params* params = (struct io_uring_params*)a0;
+	char* ring_ptr = (char*)a1; // This will be exposed to offsets in bytes
+	char* sqes_ptr = (char*)a2;
 
-	char* sqe = (char*)a2;
+	char* sqe = (char*)a3;
 
-	uint32 sq_ring_mask = *(uint32*)(ring_ptr + SQ_RING_MASK_OFFSET);
-	uint32* sq_tail_ptr = (uint32*)(ring_ptr + SQ_TAIL_OFFSET);
+	uint32 sq_ring_mask = *(uint32*)(ring_ptr + params->sq_off.ring_mask);
+	uint32* sq_tail_ptr = (uint32*)(ring_ptr + params->sq_off.tail);
 	uint32 sq_tail = *sq_tail_ptr & sq_ring_mask;
 
 	// Get the ptr to the destination for the sqe
-	char* sqe_dest = sqes_ptr + sq_tail * SIZEOF_IO_URING_SQE;
+	uint32 sqe_size = io_uring_sqe_size(params);
+	char* sqe_dest = sqes_ptr + sq_tail * sqe_size;
 
 	// Write the sqe entry to its destination in sqes
-	memcpy(sqe_dest, sqe, SIZEOF_IO_URING_SQE);
+	memcpy(sqe_dest, sqe, sqe_size);
 
 	// Write the index to the sqe array
 	uint32 sq_tail_next = *sq_tail_ptr + 1;
@@ -2008,6 +2034,20 @@ static long syz_io_uring_submit(volatile long a0, volatile long a1, volatile lon
 
 #endif
 
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_io_uring_modify_offsets
+static long syz_io_uring_modify_offsets(volatile long a0, volatile long a1, volatile long a2, volatile long a3)
+{
+	char* params = (char*)a0;
+	char* ring_ptr = (char*)a1;
+	uint32 params_off = (uint32)a2;
+	uint32 value = (uint32)a3;
+
+	uint32 ring_off = *(uint32*)(params + params_off);
+	*(uint32*)(ring_ptr + ring_off) = value;
+	return 0;
+}
 #endif
 
 #if SYZ_EXECUTOR || __NR_syz_usbip_server_init
@@ -2259,6 +2299,7 @@ static long syz_btf_id_by_name(volatile long a0)
 
 // Same as memcpy except that it accepts offset to dest and src.
 #if SYZ_EXECUTOR || __NR_syz_memcpy_off
+#if GOARCH_386 || GOARCH_amd64 || GOARCH_arm64 || GOARCH_mips64le || GOARCH_ppc64le || GOARCH_s390x || GOARCH_riscv64
 static long syz_memcpy_off(volatile long a0, volatile long a1, volatile long a2, volatile long a3, volatile long a4)
 {
 	// C:       syz_memcpy_off(void* dest, uint32 dest_off, void* src, uint32 src_off, size_t n)
@@ -2272,6 +2313,7 @@ static long syz_memcpy_off(volatile long a0, volatile long a1, volatile long a2,
 
 	return (long)memcpy(dest + dest_off, src + src_off, n);
 }
+#endif
 #endif
 
 #if SYZ_EXECUTOR || __NR_syz_create_resource
@@ -3188,8 +3230,7 @@ error_clear_loop:
 #endif
 
 #if SYZ_EXECUTOR || __NR_syz_kvm_setup_cpu || __NR_syz_kvm_vgic_v3_setup || __NR_syz_kvm_setup_syzos_vm || __NR_syz_kvm_add_vcpu || __NR_syz_kvm_assert_syzos_uexit || __NR_syz_kvm_assert_reg || __NR_syz_kvm_assert_syzos_kvm_exit
-// KVM is not yet supported on RISC-V
-#if !GOARCH_riscv64 && !GOARCH_arm
+#if !GOARCH_arm
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/kvm.h>
@@ -3206,7 +3247,9 @@ error_clear_loop:
 #include "common_kvm_arm64.h"
 #elif GOARCH_ppc64 || GOARCH_ppc64le
 #include "common_kvm_ppc64.h"
-#elif !GOARCH_arm && (SYZ_EXECUTOR || __NR_syz_kvm_setup_cpu)
+#elif GOARCH_riscv64
+#include "common_kvm_riscv64.h"
+#elif SYZ_EXECUTOR || __NR_syz_kvm_setup_cpu
 static volatile long syz_kvm_setup_cpu(volatile long a0, volatile long a1, volatile long a2, volatile long a3, volatile long a4, volatile long a5, volatile long a6, volatile long a7)
 {
 	return 0;

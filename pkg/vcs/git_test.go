@@ -4,14 +4,17 @@
 package vcs
 
 import (
-	"os"
+	"fmt"
+	"os/exec"
 	"reflect"
+	"slices"
 	"sort"
 	"testing"
 	"time"
 
-	"github.com/google/go-cmp/cmp"
+	"github.com/google/syzkaller/pkg/debugtracer"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestGitParseCommit(t *testing.T) {
@@ -76,9 +79,7 @@ Signed-off-by: Linux Master <linux@linux-foundation.org>
 		if com.Author != res.Author {
 			t.Fatalf("want author %q, got %q", com.Author, res.Author)
 		}
-		if diff := cmp.Diff(com.Recipients, res.Recipients); diff != "" {
-			t.Fatalf("bad CC: %v", diff)
-		}
+		require.Equal(t, com.Recipients, res.Recipients, "bad CC")
 		if !com.Date.Equal(res.Date) {
 			t.Fatalf("want date %v, got %v", com.Date, res.Date)
 		}
@@ -272,17 +273,10 @@ func TestObject(t *testing.T) {
 	firstRev := []byte("First revision")
 	secondRev := []byte("Second revision")
 
-	if err := os.WriteFile(baseDir+"/object.txt", firstRev, 0644); err != nil {
-		t.Fatal(err)
-	}
-	repo.Git("add", "object.txt")
-	repo.Git("commit", "--no-edit", "--allow-empty", "-m", "target")
-
-	if err := os.WriteFile(baseDir+"/object.txt", secondRev, 0644); err != nil {
-		t.Fatal(err)
-	}
-	repo.Git("add", "object.txt")
-	repo.Git("commit", "--no-edit", "--allow-empty", "-m", "target")
+	repo.CommitChangeset("first",
+		FileContent{"object.txt", string(firstRev)})
+	repo.CommitChangeset("second",
+		FileContent{"object.txt", string(secondRev)})
 
 	commits, err := repo.repo.LatestCommits("", time.Time{})
 	if err != nil {
@@ -296,17 +290,13 @@ func TestObject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if diff := cmp.Diff(data, firstRev); diff != "" {
-		t.Fatal(diff)
-	}
+	require.Equal(t, firstRev, data)
 	// And at the second one.
 	data, err = repo.repo.Object("object.txt", commits[0].Hash)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if diff := cmp.Diff(data, secondRev); diff != "" {
-		t.Fatal(diff)
-	}
+	require.Equal(t, secondRev, data)
 	com, err := repo.repo.Commit(commits[0].Hash)
 	if err != nil {
 		t.Fatal(err.Error())
@@ -321,9 +311,7 @@ index 103167d..fbf7a68 100644
 +Second revision
 \ No newline at end of file
 `)
-	if diff := cmp.Diff(com.Patch, patch); diff != "" {
-		t.Fatal(diff)
-	}
+	require.Equal(t, patch, com.Patch)
 }
 
 func TestMergeBase(t *testing.T) {
@@ -455,7 +443,7 @@ func TestGitFetchShortHash(t *testing.T) {
 }
 
 func TestParseGitDiff(t *testing.T) {
-	files := ParseGitDiff([]byte(`diff --git a/a.txt b/a.txt
+	list := ParseGitDiff([]byte(`diff --git a/a.txt b/a.txt
 index 4c5fd91..8fe1e32 100644
 --- a/a.txt
 +++ b/a.txt
@@ -469,9 +457,234 @@ index 0000000..f8a9677
 +++ b/b.txt
 @@ -0,0 +1 @@
 +Second file.
-diff --git a/c/c.txt b/c/c.txt
-new file mode 100644
-index 0000000..e69de29
+diff --git a/c.txt b/c.txt
+deleted file mode 100644
+index f70f10e..0000000
+--- a/c.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-A
 `))
-	assert.ElementsMatch(t, files, []string{"a.txt", "b.txt", "c/c.txt"})
+	assert.Equal(t, list, []ModifiedFile{
+		{
+			Name:     `a.txt`,
+			LeftHash: `4c5fd91`,
+		},
+		{
+			Name:     `b.txt`,
+			LeftHash: `0000000`,
+		},
+		{
+			Name:     `c.txt`,
+			LeftHash: `f70f10e`,
+		},
+	})
+}
+
+func TestGitFileHashes(t *testing.T) {
+	repo := MakeTestRepo(t, t.TempDir())
+	commit1 := repo.CommitChangeset("first commit", FileContent{"object.txt", "some text"})
+	commit2 := repo.CommitChangeset("second commit", FileContent{"object2.txt", "some text2"})
+
+	map1, err := repo.repo.fileHashes(commit1.Hash, []string{"object.txt", "object2.txt"})
+	require.NoError(t, err)
+	assert.NotEmpty(t, map1["object.txt"])
+
+	map2, err := repo.repo.fileHashes(commit2.Hash, []string{"object.txt", "object2.txt"})
+	require.NoError(t, err)
+	assert.NotEmpty(t, map2["object.txt"])
+	assert.NotEmpty(t, map2["object2.txt"])
+}
+
+func TestBaseForDiff(t *testing.T) {
+	repo := MakeTestRepo(t, t.TempDir())
+	repo.CommitChangeset("first commit",
+		FileContent{"a.txt", "content of a.txt"},
+		FileContent{"b.txt", "content of b.txt"},
+	)
+	commit2 := repo.CommitChangeset("second commit",
+		FileContent{"c.txt", "content of c.txt"},
+		FileContent{"d.txt", "content of d.txt"},
+	)
+	// Create a diff.
+	commit3 := repo.CommitChangeset("third commit",
+		FileContent{"a.txt", "update a.txt"},
+	)
+	diff, err := repo.repo.Diff(commit2.Hash, commit3.Hash)
+	require.NoError(t, err)
+	t.Run("conflicting", func(t *testing.T) {
+		_, err := repo.repo.SwitchCommit(commit2.Hash)
+		require.NoError(t, err)
+		// Create a different change on top of commit2.
+		repo.Git("checkout", "-b", "branch-a")
+		repo.CommitChangeset("patch a.txt",
+			FileContent{"a.txt", "another change to a.txt"},
+		)
+		// Yet the patch could only be applied to commit1 or commit2.
+		base, err := repo.repo.BaseForDiff(diff, &debugtracer.TestTracer{T: t})
+		require.NoError(t, err)
+		require.Len(t, base, 1)
+		require.Len(t, base[0].Branches, 2)
+		assert.Equal(t, "branch-a", base[0].Branches[0])
+		// Different git versions name it differently.
+		assert.True(t, base[0].Branches[1] == "master" || base[0].Branches[1] == "main",
+			"branch=%q", base[0].Branches[1])
+		assert.Equal(t, commit2.Hash, base[0].Hash)
+	})
+	t.Run("choose latest", func(t *testing.T) {
+		_, err := repo.repo.SwitchCommit(commit2.Hash)
+		require.NoError(t, err)
+		// Wait a second before adding another commit.
+		// Git does not remember milliseconds, so otherwise the commit sorting may be flaky.
+		time.Sleep(time.Second)
+		repo.Git("checkout", "-b", "branch-b")
+		commit4 := repo.CommitChangeset("unrelated commit",
+			FileContent{"new.txt", "create new file"},
+		)
+		// Since the commit did not touch a.txt, it's the expected one.
+		base, err := repo.repo.BaseForDiff(diff, &debugtracer.TestTracer{T: t})
+		require.NoError(t, err)
+		require.Len(t, base, 2)
+		assert.Equal(t, []string{"branch-b"}, base[0].Branches)
+		assert.Equal(t, commit4.Hash, base[0].Hash)
+		assert.Equal(t, commit2.Hash, base[1].Hash)
+	})
+	t.Run("unknown objects", func(t *testing.T) {
+		// It's not okay if the diff contains unknown hashes.
+		diff2 := `
+diff --git a/b.txt b/b.txt
+deleted file mode 100644
+index f70f10e..0000000
+--- a/b.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-A`
+		twoDiffs := append(slices.Clone(diff), diff2...)
+		base, err := repo.repo.BaseForDiff(twoDiffs, &debugtracer.TestTracer{T: t})
+		require.NoError(t, err)
+		require.Nil(t, base)
+	})
+	t.Run("ignore new files", func(t *testing.T) {
+		diff2 := `
+diff --git a/a.txt b/a.txt
+new file mode 100644
+index 0000000..fa49b07
+--- /dev/null
++++ b/a.txt
+@@ -0,0 +1 @@
++new file
+diff --git a/a.txt b/a.txt
+index fa49b07..01c887f 100644
+--- a/a.txt
++++ b/a.txt
+@@ -1 +1 @@
+-new file
++edit file
+`
+		twoDiffs := append(slices.Clone(diff), diff2...)
+		base, err := repo.repo.BaseForDiff(twoDiffs, &debugtracer.TestTracer{T: t})
+		require.NoError(t, err)
+		require.Len(t, base, 2)
+	})
+	t.Run("empty patch", func(t *testing.T) {
+		base, err := repo.repo.BaseForDiff([]byte{}, &debugtracer.TestTracer{T: t})
+		require.NoError(t, err)
+		require.Nil(t, base)
+	})
+	t.Run("multiple modifications", func(t *testing.T) {
+		map1, _ := repo.repo.fileHashes(commit3.Hash, []string{"a.txt"})
+
+		twoDiffs := []byte(fmt.Sprintf(`diff --git a/a.txt b/a.txt
+index %s..1111111 100644
+--- a/a.txt
++++ b/a.txt
+@@ -1 +1 @@
+-update a.txt
++update a.txt again
+diff --git a/a.txt b/a.txt
+index 1111111..2222222 100644
+--- a/a.txt
++++ b/a.txt
+@@ -1 +1 @@
+-update a.txt again
++update a.txt again and again
+`, map1["a.txt"]))
+
+		base, err := repo.repo.BaseForDiff(twoDiffs, &debugtracer.TestTracer{T: t})
+		require.NoError(t, err)
+		require.Len(t, base, 1)
+
+		assert.Equal(t, commit3.Hash, base[0].Hash)
+	})
+}
+
+func TestBaseForDiffMerge(t *testing.T) {
+	// This is a quite convoluted setup that somewhat resembles the
+	// situations observed in the Linux kernel.
+
+	repo := MakeTestRepo(t, t.TempDir())
+	repo.Git("checkout", "-b", "master")
+	repo.CommitChangeset("init", FileContent{"readme.txt", "readme"})
+
+	repo.Git("checkout", "-b", "branchA")
+	repo.CommitChangeset("c1", FileContent{"a.txt", "A"})
+
+	repo.Git("checkout", "master")
+	repo.Git("checkout", "-b", "branchB")
+	repo.CommitChangeset("c2", FileContent{"b.txt", "B"})
+
+	// Merge branchB into branchA. Resolve conflict to "Merged".
+	repo.Git("checkout", "branchA")
+	repo.Git("merge", "branchB")
+	commitM, err := repo.repo.Commit(HEAD)
+	require.NoError(t, err)
+
+	// Prepare a merge conflict of master with branchA and branchB.
+	repo.Git("checkout", "master")
+	repo.CommitChangeset("c3",
+		FileContent{"a.txt", "A2"}, FileContent{"b.txt", "B2"})
+
+	// Merge master into branchA, resolve the conflict.
+	repo.Git("checkout", "branchA")
+	if err := exec.Command("git", "-C", repo.Dir, "merge", "master").Run(); err == nil {
+		t.Fatalf("conflict expected during merge -> branchA")
+	}
+	repo.CommitChangeset("merge master->branchA",
+		FileContent{"a.txt", "Merged"}, FileContent{"b.txt", "Merged"})
+	// Further bury the changes.
+	repo.CommitChangeset("unrelated", FileContent{"c.txt", "C"})
+
+	// Merge master into branchB, resolve the conflict.
+	repo.Git("checkout", "branchB")
+	if err := exec.Command("git", "-C", repo.Dir, "merge", "master").Run(); err == nil {
+		t.Fatalf("conflict expected during merge -> branchB")
+	}
+	repo.CommitChangeset("merge master->branchB",
+		FileContent{"a.txt", "MergedB"}, FileContent{"b.txt", "MergedB"})
+	// Further bury the changes.
+	repo.CommitChangeset("unrelated", FileContent{"d.txt", "D"})
+
+	hashes, err := repo.repo.fileHashes(commitM.Hash, []string{"a.txt", "b.txt"})
+	require.NoError(t, err)
+
+	diff := []byte(fmt.Sprintf(`diff --git a/a.txt b/a.txt
+index %s..123456 100644
+--- a/a.txt
++++ b/a.txt
+@@ -1 +1 @@
+-Merged
++WorkDir
+
+diff --git a/b.txt b/b.txt
+index %s..123456 100644
+--- a/b.txt
++++ b/b.txt
+@@ -1 +1 @@
+-Merged
++WorkDir
+`, hashes["a.txt"], hashes["b.txt"]))
+	bases, err := repo.repo.BaseForDiff(diff, &debugtracer.TestTracer{T: t})
+	require.NoError(t, err)
+	require.Len(t, bases, 1)
+	assert.Equal(t, commitM.Hash, bases[0].Hash)
 }

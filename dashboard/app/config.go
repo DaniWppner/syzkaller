@@ -10,10 +10,10 @@ import (
 	"net/mail"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
-	"github.com/google/go-cmp/cmp"
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"github.com/google/syzkaller/pkg/email"
 	"github.com/google/syzkaller/pkg/subsystem"
@@ -36,14 +36,16 @@ type GlobalConfig struct {
 	// syz-ci can upload these reports to GCS.
 	CoverPath string
 	// Global API clients that work across namespaces (e.g. external reporting).
-	// The keys are client identities (names), the values are their passwords.
-	Clients map[string]string
+	// The keys are client identities (names).
+	Clients map[string]APIClient
 	// List of emails blocked from issuing test requests.
 	EmailBlocklist []string
 	// Bug obsoleting settings. See ObsoletingConfig for details.
 	Obsoleting ObsoletingConfig
 	// Namespace that is shown by default (no namespace selected yet).
 	DefaultNamespace string
+	// Namespace for the Dungeon feature.
+	DungeonNamespace string
 	// Per-namespace config.
 	// Namespaces are a mechanism to separate groups of different kernels.
 	// E.g. Debian 4.4 kernels and Ubuntu 4.9 kernels.
@@ -87,14 +89,16 @@ type Config struct {
 	// If set, this namespace is not actively tested, no notifications are sent, etc.
 	// It's kept mostly read-only for historical reference.
 	Decommissioned bool
+	// Enable AI workflows for the namespace if non-nil.
+	AI *AIConfig
 	// Name used in UI.
 	DisplayTitle string
 	// Unique string that allows to show "similar bugs" across different namespaces.
 	// Similar bugs are shown only across namespaces with the same value of SimilarityDomain.
 	SimilarityDomain string
 	// Per-namespace clients that act only on a particular namespace.
-	// The keys are client identities (names), the values are their passwords.
-	Clients map[string]string
+	// The keys are client identities (names).
+	Clients map[string]APIClient
 	// A random string used for hashing, can be anything, but once fixed it can't
 	// be changed as it becomes a part of persistent bug identifiers.
 	Key string
@@ -140,6 +144,36 @@ type Config struct {
 	// Reproducers export path.
 	ReproExportPath string
 }
+
+type AIConfig struct {
+	// Whether to upload generated patches to gerrit.
+	UploadPatchesToGerrit bool
+}
+
+type APIClient struct {
+	// Secret key or OAuth subject.
+	Key string
+	// Set of allowed API methods (all if empty).
+	// See predefined vars below.
+	Methods map[string]bool
+	// Suffix of AI jobs this client is allowed to execute.
+	AIWorkflowSuffix string
+	// AIJobNamespaces restricts which namespaces this global client can operate on.
+	// If empty, the client can access all namespaces (useful for development).
+	AIJobNamespaces []string
+}
+
+func (client APIClient) AllowedNamespace(ns string) bool {
+	return slices.Contains(client.AIJobNamespaces, ns)
+}
+
+var (
+	AIMethods = map[string]bool{
+		"ai_job_poll":       true,
+		"ai_job_done":       true,
+		"ai_trajectory_log": true,
+	}
+)
 
 // ACLItem is an Access Control List item.
 // Authorization target may be Email or Domain, not both.
@@ -301,7 +335,7 @@ type Reporting struct {
 	Embargo time.Duration
 	// Type of reporting and its configuration.
 	// The app has one built-in type, EmailConfig, which reports bugs by email.
-	// And ExternalConfig which can be used to attach any external reporting system (e.g. Bugzilla).
+	// The user can implement other types to attach to external reporting systems (e.g. Bugzilla).
 	Config ReportingType
 	// List of labels to notify about (keys are strings of form "label:value").
 	// The value is the string that will be included in the notification message.
@@ -446,15 +480,15 @@ func installConfig(cfg *GlobalConfig) {
 
 var contextConfigKey = "Updated config (to be used during tests). Use only in tests!"
 
-func contextWithConfig(c context.Context, cfg *GlobalConfig) context.Context {
-	return context.WithValue(c, &contextConfigKey, cfg)
+func contextWithConfig(ctx context.Context, cfg *GlobalConfig) context.Context {
+	return context.WithValue(ctx, &contextConfigKey, cfg)
 }
 
-func getConfig(c context.Context) *GlobalConfig {
+func getConfig(ctx context.Context) *GlobalConfig {
 	// Check point.
 	validateGlobalConfig()
 
-	if val, ok := c.Value(&contextConfigKey).(*GlobalConfig); ok {
+	if val, ok := ctx.Value(&contextConfigKey).(*GlobalConfig); ok {
 		return val
 	}
 	return configDontUse // The base config was not overwriten.
@@ -463,14 +497,14 @@ func getConfig(c context.Context) *GlobalConfig {
 func validateGlobalConfig() {
 	if ensureConfigImmutability {
 		currentConfig := configDontUse.marshalJSON()
-		if diff := cmp.Diff(currentConfig, marshaledConfig); diff != "" {
-			panic("global config changed during execution: " + diff)
+		if currentConfig != marshaledConfig {
+			panic(fmt.Sprintf("global config changed during execution. Want:\n%s\nGot:\n%s", marshaledConfig, currentConfig))
 		}
 	}
 }
 
-func getNsConfig(c context.Context, ns string) *Config {
-	return getConfig(c).Namespaces[ns]
+func getNsConfig(ctx context.Context, ns string) *Config {
+	return getConfig(ctx).Namespaces[ns]
 }
 
 func checkConfig(cfg *GlobalConfig) {
@@ -497,12 +531,38 @@ func checkConfig(cfg *GlobalConfig) {
 	if cfg.Namespaces[cfg.DefaultNamespace] == nil {
 		panic(fmt.Sprintf("default namespace %q is not found", cfg.DefaultNamespace))
 	}
-	for ns, cfg := range cfg.Namespaces {
-		checkNamespace(ns, cfg, namespaces, clientNames)
+	if cfg.DungeonNamespace == "" {
+		panic("dungeon namespace is not set")
+	}
+	if cfg.Namespaces[cfg.DungeonNamespace] == nil {
+		panic(fmt.Sprintf("dungeon namespace %q is not found", cfg.DungeonNamespace))
+	}
+	var allNamespaces []string
+	for ns, nsCfg := range cfg.Namespaces {
+		checkNamespace(ns, nsCfg, namespaces, clientNames)
+		allNamespaces = append(allNamespaces, ns)
+	}
+	slices.Sort(allNamespaces)
+	for name, client := range cfg.Clients {
+		if len(client.AIJobNamespaces) == 0 {
+			client.AIJobNamespaces = allNamespaces
+			cfg.Clients[name] = client
+		}
+	}
+	for name, client := range cfg.Clients {
+		checkClientAIJobNamespaces(name, client, namespaces)
 	}
 	checkDiscussionEmails(cfg.DiscussionEmails)
 	checkMonitoredInboxes(cfg.MonitoredInboxes)
 	checkACL(cfg.ACL)
+}
+
+func checkClientAIJobNamespaces(name string, client APIClient, namespaces map[string]bool) {
+	for _, ns := range client.AIJobNamespaces {
+		if !namespaces[ns] {
+			panic(fmt.Sprintf("client %q references unknown namespace %q", name, ns))
+		}
+	}
 }
 
 func checkACL(acls []*ACLItem) {
@@ -727,7 +787,7 @@ func checkKernelRepos(ns string, config *Config, repos []KernelRepo) {
 }
 
 func checkCC(cc *CCConfig) {
-	emails := append(append(append([]string{}, cc.Always...), cc.Maintainers...), cc.BuildMaintainers...)
+	emails := append(append(slices.Clone(cc.Always), cc.Maintainers...), cc.BuildMaintainers...)
 	for _, email := range emails {
 		if _, err := mail.ParseAddress(email); err != nil {
 			panic(fmt.Sprintf("bad email address %q: %v", email, err))
@@ -834,13 +894,13 @@ func checkConfigAccessLevel(current *AccessLevel, parent AccessLevel, what strin
 	}
 }
 
-func checkClients(clientNames map[string]bool, clients map[string]string) {
-	for name, key := range clients {
+func checkClients(clientNames map[string]bool, clients map[string]APIClient) {
+	for name, client := range clients {
 		if !validator.DashClientName(name).Ok {
 			panic(fmt.Sprintf("bad client name: %v", name))
 		}
-		if !validator.DashClientKey(key).Ok {
-			panic(fmt.Sprintf("bad client key: %v", key))
+		if !validator.DashClientKey(client.Key).Ok {
+			panic(fmt.Sprintf("bad client key: %v", client.Key))
 		}
 		if clientNames[name] {
 			panic(fmt.Sprintf("duplicate client name: %v", name))

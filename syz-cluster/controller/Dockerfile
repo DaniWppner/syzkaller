@@ -1,23 +1,15 @@
-FROM golang:1.24-alpine AS controller-builder
-
-WORKDIR /build
-
-# Prepare the dependencies.
-COPY go.mod ./
-COPY go.sum ./
-RUN go mod download
-COPY pkg/gcs/ pkg/gcs/
-
-# Build the tool.
-COPY syz-cluster/controller/ syz-cluster/controller/
-COPY syz-cluster/pkg/ syz-cluster/pkg/
-RUN go build -o /bin/controller /build/syz-cluster/controller
+# syntax=docker.io/docker/dockerfile:1.7-labs
+# Copyright 2025 syzkaller project authors. All rights reserved.
+# Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+ARG IMAGE_PREFIX=local/
+ARG IMAGE_TAG=latest
+FROM ${IMAGE_PREFIX}syz-cluster-build:${IMAGE_TAG} AS builder
 
 # Build the container.
 FROM alpine:latest
 WORKDIR /app
 
-COPY --from=controller-builder /bin/controller /bin/controller
+COPY --from=builder /build/syz-cluster/bin/controller /bin/controller
 
 EXPOSE 8080
 

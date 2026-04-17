@@ -74,7 +74,7 @@ func (ctx *serializer) print(text string) {
 	ctx.printf("%v", text)
 }
 
-func (ctx *serializer) printf(text string, args ...interface{}) {
+func (ctx *serializer) printf(text string, args ...any) {
 	fmt.Fprintf(ctx.buf, text, args...)
 }
 
@@ -469,9 +469,10 @@ func (p *parser) parseArgImpl(typ Type, dir Dir) (Arg, error) {
 		p.eatExcessive(true, "non-nil argument for nil type")
 		return nil, nil
 	}
-	switch p.Char() {
-	case '0':
+	if ch := p.Char(); ch >= '0' && ch <= '9' {
 		return p.parseArgInt(typ, dir)
+	}
+	switch p.Char() {
 	case 'r':
 		return p.parseArgRes(typ, dir)
 	case '&':
@@ -820,7 +821,7 @@ func (p *parser) parseArgUnion(typ Type, dir Dir) (Arg, error) {
 }
 
 // Eats excessive call arguments and struct fields to recover after description changes.
-func (p *parser) eatExcessive(stopAtComma bool, what string, args ...interface{}) {
+func (p *parser) eatExcessive(stopAtComma bool, what string, args ...any) {
 	p.strictFailf(what, args...)
 	paren, brack, brace := 0, 0, 0
 	for !p.EOF() && p.e == nil {
@@ -1165,6 +1166,8 @@ func (p *parser) fixupAutos(prog *Prog) {
 			case *PtrType:
 				a := arg.(*PointerArg)
 				a.Address = s.ma.alloc(nil, a.Res.Size(), a.Res.Type().Alignment())
+			case *CsumType:
+				// Checksums are computed at runtime, no need to fixup.
 			default:
 				panic(fmt.Sprintf("unsupported auto type %T", typ))
 			}
@@ -1187,13 +1190,17 @@ func (p *parser) Scan() bool {
 		return false
 	}
 	nextLine := bytes.IndexByte(p.data, '\n')
+	var line []byte
 	if nextLine != -1 {
-		p.s = string(p.data[:nextLine])
+		line = p.data[:nextLine]
 		p.data = p.data[nextLine+1:]
 	} else {
-		p.s = string(p.data)
+		line = p.data
 		p.data = nil
 	}
+	line = bytes.TrimLeft(line, " \t")
+	line = bytes.TrimRight(line, " \t\r")
+	p.s = string(line)
 	p.i = 0
 	p.l++
 	return true
@@ -1286,14 +1293,14 @@ func (p *parser) Ident() string {
 	return s
 }
 
-func (p *parser) failf(msg string, args ...interface{}) {
+func (p *parser) failf(msg string, args ...any) {
 	if p.e == nil {
 		p.e = fmt.Errorf("%v\nline #%v:%v: %v", fmt.Sprintf(msg, args...), p.l, p.i,
 			highlightError(p.s, p.i))
 	}
 }
 
-func (p *parser) strictFailf(msg string, args ...interface{}) {
+func (p *parser) strictFailf(msg string, args ...any) {
 	if p.strict {
 		p.failf(msg, args...)
 	}

@@ -19,6 +19,7 @@ import (
 	_ "github.com/google/syzkaller/sys"
 	"github.com/google/syzkaller/sys/targets"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func init() {
@@ -38,6 +39,10 @@ func TestGenerate(t *testing.T) {
 	t.Parallel()
 	checked := make(map[string]bool)
 	for _, target := range prog.AllTargets() {
+		// Auto-generated descriptions currently do not properly mark arch-specific syscalls, see
+		// https://github.com/google/syzkaller/issues/5410#issuecomment-3570190241.
+		// Until it's fixed, let's remove these syscalls from csource tests.
+		ct := target.NoAutoChoiceTable()
 		sysTarget := targets.Get(target.OS, target.Arch)
 		if runtime.GOOS != sysTarget.BuildOS {
 			continue
@@ -50,14 +55,14 @@ func TestGenerate(t *testing.T) {
 			if full || !testing.Short() {
 				checked[target.OS] = true
 				t.Parallel()
-				testTarget(t, target, full)
+				testTarget(t, target, full, ct)
 			}
-			testPseudoSyscalls(t, target)
+			testPseudoSyscalls(t, target, ct)
 		})
 	}
 }
 
-func testPseudoSyscalls(t *testing.T, target *prog.Target) {
+func testPseudoSyscalls(t *testing.T, target *prog.Target, ct *prog.ChoiceTable) {
 	// Use options that are as minimal as possible.
 	// We want to ensure that the code can always be compiled.
 	opts := Options{
@@ -65,7 +70,11 @@ func testPseudoSyscalls(t *testing.T, target *prog.Target) {
 	}
 	rs := testutil.RandSource(t)
 	for _, meta := range target.PseudoSyscalls() {
-		p := target.GenSampleProg(meta, rs)
+		if meta.Attrs.KFuzzTest {
+			// KFuzzTest syscalls are generated and serialized in a very special way.
+			continue
+		}
+		p := target.GenSampleProg(meta, rs, ct)
 		t.Run(fmt.Sprintf("single_%s", meta.CallName), func(t *testing.T) {
 			t.Parallel()
 			testOne(t, p, opts)
@@ -73,9 +82,9 @@ func testPseudoSyscalls(t *testing.T, target *prog.Target) {
 	}
 }
 
-func testTarget(t *testing.T, target *prog.Target, full bool) {
+func testTarget(t *testing.T, target *prog.Target, full bool, ct *prog.ChoiceTable) {
 	rs := testutil.RandSource(t)
-	p := target.Generate(rs, 10, target.DefaultChoiceTable())
+	p := target.Generate(rs, 10, ct)
 	// Turns out that fully minimized program can trigger new interesting warnings,
 	// e.g. about NULL arguments for functions that require non-NULL arguments in syz_ functions.
 	// We could append both AllSyzProg as-is and a minimized version of it,
@@ -141,10 +150,9 @@ func testOne(t *testing.T, p *prog.Prog, opts Options) {
 		t.Fatalf("%v", err)
 	}
 	// Executor headers are embedded into the C source. Make sure there are no leftover include guards.
-	if matches := regexp.MustCompile(`(?m)^#define\s+\S+_H\s*\n`).FindAllString(string(src), -1); len(matches) > 0 {
-		t.Fatalf("source contains leftover include guards: %v\nopts: %+v\nprogram:\n%s",
-			matches, opts, p.Serialize())
-	}
+	matches := regexp.MustCompile(`(?m)^#define\s+\S+_H\s*\n`).FindAllString(string(src), -1)
+	require.Empty(t, matches, "source contains leftover include guards: %v\nopts: %+v\nprogram:\n%s",
+		matches, opts, p.Serialize())
 	bin, err := Build(p.Target, src)
 	if err != nil {
 		if atomic.AddUint32(&failedTests, 1) > maxFailures {
@@ -171,9 +179,7 @@ func TestExecutorMacros(t *testing.T) {
 		if strings.HasPrefix(macro, "SYZ_HAVE_") {
 			continue
 		}
-		if _, ok := expected[macro]; !ok {
-			t.Errorf("unexpected macro: %v", macro)
-		}
+		assert.Contains(t, expected, macro)
 	}
 }
 
@@ -281,9 +287,7 @@ syscall(SYS_csource8, /*num=*/(intptr_t)-1);
 				test.target = target64
 			}
 			p, err := test.target.Deserialize([]byte(test.input), prog.Strict)
-			if err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, err)
 			ctx := &context{
 				p:         p,
 				target:    test.target,
@@ -293,13 +297,9 @@ syscall(SYS_csource8, /*num=*/(intptr_t)-1);
 			// This simplifies the expected output. For tests covering comments, see
 			// /pkg/csource/syscall_generation_test.go.
 			calls, _, err := ctx.generateProgCalls(p, false, false)
-			if err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, err)
 			got := regexp.MustCompile(`(\n|^)\t`).ReplaceAllString(strings.Join(calls, ""), "\n")
-			if test.output != got {
-				t.Fatalf("input:\n%v\nwant:\n%v\ngot:\n%v", test.input, test.output, got)
-			}
+			require.True(t, test.output == got, "input:\n%v\nwant:\n%v\ngot:\n%v", test.input, test.output, got)
 		})
 	}
 }
@@ -336,4 +336,38 @@ func TestGenerateSandboxFunctionSignature(t *testing.T) {
 		-1234,                        // sandbox arg
 		"do_sandbox_android(-1234);", // expected
 		"Android sandbox function requires an argument")
+}
+
+func TestWriteLLM(t *testing.T) {
+	t.Parallel()
+	target, err := prog.GetTarget(targets.TestOS, targets.TestArch64)
+	require.NoError(t, err)
+	sysTarget := targets.Get(target.OS, target.Arch)
+	if sysTarget.BrokenCompiler != "" {
+		t.Skipf("compiler is broken: %v", sysTarget.BrokenCompiler)
+	}
+
+	p, err := target.Deserialize([]byte(`
+r0 = csource0(0x1)
+csource1(r0)
+`), prog.Strict)
+	require.NoError(t, err)
+
+	src, err := WriteLLM(p)
+	require.NoError(t, err)
+	require.NotEmpty(t, src)
+
+	require.Contains(t, string(src), "csource0 arguments:")
+	require.NotContains(t, string(src), "loop()")
+	require.NotContains(t, string(src), "do_sandbox_")
+
+	mainIndex := strings.Index(string(src), "int main(")
+	syscallIndex := strings.LastIndex(string(src), "csource0")
+	require.NotEqual(t, -1, syscallIndex, "csource0 call not found in output")
+
+	require.Greater(t, syscallIndex, mainIndex, "syscall appears before main()!")
+
+	bin, err := Build(p.Target, src)
+	require.NoError(t, err)
+	defer os.Remove(bin)
 }

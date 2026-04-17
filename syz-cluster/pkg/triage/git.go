@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/google/syzkaller/pkg/debugtracer"
 	"github.com/google/syzkaller/pkg/vcs"
 	"github.com/google/syzkaller/syz-cluster/pkg/api"
 )
@@ -30,7 +31,7 @@ func NewGitTreeOps(dir string, sandbox bool) (*GitTreeOps, error) {
 
 func (ops *GitTreeOps) HeadCommit(tree *api.Tree) (*vcs.Commit, error) {
 	// See kernel-disk/cron.yaml.
-	return ops.Git.Commit(tree.Name + "-head")
+	return ops.Git.Commit(tree.Name + "/" + tree.Branch)
 }
 
 func (ops *GitTreeOps) Commit(treeName, commitOrBranch string) (*vcs.Commit, error) {
@@ -54,4 +55,8 @@ func (ops *GitTreeOps) ApplySeries(commit string, patches [][]byte) error {
 		}
 	}
 	return nil
+}
+
+func (ops *GitTreeOps) BaseForDiff(patch []byte, tracer debugtracer.DebugTracer) ([]*vcs.BaseCommit, error) {
+	return ops.Git.BaseForDiff(patch, tracer)
 }

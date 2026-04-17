@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/go-cmp/cmp"
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"github.com/google/syzkaller/pkg/email"
 	"github.com/stretchr/testify/assert"
@@ -235,6 +234,8 @@ Bug report`,
 			t.Fatal(err)
 		}
 		msg.RawCc = nil
+		msg.Body = ""
+		msg.Patch = ""
 		emails = append(emails, msg)
 	}
 
@@ -249,9 +250,7 @@ Bug report`,
 	}
 
 	for key, val := range expected {
-		if diff := cmp.Diff(val, got[key]); diff != "" {
-			t.Fatalf("%s: %s", key, diff)
-		}
+		require.Equal(t, val, got[key], key)
 	}
 
 	if len(threads) > len(expected) {
@@ -520,6 +519,40 @@ No patch, just text`,
 				got := s.Patches[i]
 				assert.Equal(t, expectPatch.Seq, got.Seq, "seq differs")
 			}
+		})
+	}
+}
+func TestLink(t *testing.T) {
+	tests := []struct {
+		id     string
+		thread bool
+		want   string
+	}{
+		{
+			id:     "<id@domain>",
+			thread: true,
+			want:   "https://lore.kernel.org/all/id@domain/T/",
+		},
+		{
+			id:     "<id@domain>",
+			thread: false,
+			want:   "https://lore.kernel.org/all/id@domain",
+		},
+		{
+			id:     "id@domain",
+			thread: true,
+			want:   "https://lore.kernel.org/all/id@domain/T/",
+		},
+	}
+	for _, test := range tests {
+		t.Run(fmt.Sprintf("%s/%v", test.id, test.thread), func(t *testing.T) {
+			var got string
+			if test.thread {
+				got = LinkToThread(test.id)
+			} else {
+				got = LinkToMessage(test.id)
+			}
+			assert.Equal(t, test.want, got)
 		})
 	}
 }

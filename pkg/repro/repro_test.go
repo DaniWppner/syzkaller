@@ -9,15 +9,16 @@ import (
 	"math/rand"
 	"regexp"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/google/go-cmp/cmp"
 	"github.com/google/syzkaller/pkg/csource"
 	"github.com/google/syzkaller/pkg/flatrpc"
 	"github.com/google/syzkaller/pkg/instance"
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/report"
+	"github.com/google/syzkaller/pkg/report/crash"
 	"github.com/google/syzkaller/pkg/testutil"
 	"github.com/google/syzkaller/prog"
 	"github.com/google/syzkaller/sys/targets"
@@ -116,12 +117,13 @@ type testExecInterface struct {
 	run func([]byte) (*instance.RunResult, error)
 }
 
-func (tei *testExecInterface) Run(_ context.Context, params instance.ExecParams,
+func (tei *testExecInterface) RunC(_ context.Context, p *prog.Prog, _ instance.RunOptions,
 	_ instance.ExecutorLogger) (*instance.RunResult, error) {
-	syzProg := params.SyzProg
-	if params.CProg != nil {
-		syzProg = params.CProg.Serialize()
-	}
+	return tei.run(p.Serialize())
+}
+
+func (tei *testExecInterface) RunSyz(_ context.Context, syzProg []byte, _ instance.RunOptions,
+	_ instance.ExecutorLogger) (*instance.RunResult, error) {
 	return tei.run(syzProg)
 }
 
@@ -130,6 +132,7 @@ func runTestRepro(t *testing.T, log string, exec execInterface) (*Result, *Stats
 		Derived: mgrconfig.Derived{
 			TargetOS:     targets.Linux,
 			TargetVMArch: targets.AMD64,
+			SysTarget:    targets.Get(targets.Linux, targets.AMD64),
 		},
 		Sandbox: "namespace",
 	}
@@ -179,6 +182,7 @@ func fakeCrashResult(title string) *instance.RunResult {
 	if title != "" {
 		ret.Report = &report.Report{
 			Title: title,
+			Type:  crash.TitleToType(title),
 		}
 	}
 	return ret
@@ -201,9 +205,7 @@ func TestPlainRepro(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if diff := cmp.Diff(expectedReproducer, string(result.Prog.Serialize())); diff != "" {
-		t.Fatal(diff)
-	}
+	require.Equal(t, expectedReproducer, string(result.Prog.Serialize()))
 }
 
 // There happen to be transient errors like ssh/scp connection failures.
@@ -222,11 +224,9 @@ func TestVMErrorResilience(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if diff := cmp.Diff(`pause()
+	require.Equal(t, `pause()
 alarm(0xa)
-`, string(result.Prog.Serialize())); diff != "" {
-		t.Fatal(diff)
-	}
+`, string(result.Prog.Serialize()))
 }
 
 func TestTooManyErrors(t *testing.T) {
@@ -270,11 +270,9 @@ func TestProgConcatenation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if diff := cmp.Diff(`pause()
+	require.Equal(t, `pause()
 alarm(0xa)
-`, string(result.Prog.Serialize())); diff != "" {
-		t.Fatal(diff)
-	}
+`, string(result.Prog.Serialize()))
 }
 
 func TestFlakyCrashes(t *testing.T) {
@@ -347,4 +345,69 @@ func BenchmarkCalculateReliability(b *testing.B) {
 			b.ReportMetric(reliability[len(reliability)*9/10], "p90")
 		})
 	}
+}
+
+func TestBrokenCompilerRepro(t *testing.T) {
+	sysTarget := *targets.Get(targets.Linux, targets.AMD64)
+	sysTarget.BrokenCompiler = "some compiler error"
+
+	mgrConfig := &mgrconfig.Config{
+		Derived: mgrconfig.Derived{
+			TargetOS:     targets.Linux,
+			TargetVMArch: targets.AMD64,
+			SysTarget:    &sysTarget,
+		},
+		Sandbox: "namespace",
+	}
+	var err error
+	mgrConfig.Target, err = prog.GetTarget(targets.Linux, targets.AMD64)
+	require.NoError(t, err)
+	reporter, err := report.NewReporter(mgrConfig)
+	require.NoError(t, err)
+	env := Environment{
+		Config:   mgrConfig,
+		Features: flatrpc.AllFeatures,
+		Fast:     false,
+		Reporter: reporter,
+		logf:     t.Logf,
+	}
+
+	result, _, err := runInner(context.Background(), []byte(testReproLog), env, &testExecInterface{
+		run: testExecRunner,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, false, result.CRepro, "C repro should have been skipped")
+}
+
+func TestAvoidLostConnection(t *testing.T) {
+	const log = `
+2015/12/21 12:18:05 executing program 1:
+pause()
+2015/12/21 12:18:10 executing program 2:
+alarm(0xa)
+`
+	panicLog := log + "\npanic: some error\n"
+
+	result, _, err := runTestRepro(t, panicLog, &testExecInterface{
+		run: func(p []byte) (*instance.RunResult, error) {
+			if strings.Contains(string(p), "alarm(0xa)") && !strings.Contains(string(p), "pause()") {
+				// alarm(0xa) alone causes a system failure.
+				return &instance.RunResult{
+					Report: &report.Report{
+						Title: "lost connection to test machine",
+						Type:  crash.LostConnection,
+					},
+				}, nil
+			}
+			if strings.Contains(string(p), "pause()") && strings.Contains(string(p), "alarm(0xa)") {
+				// The combination causes the target bug.
+				return fakeCrashResult("panic: some error"), nil
+			}
+			return fakeCrashResult(""), nil
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, "pause()\nalarm(0xa)\n", string(result.Prog.Serialize()))
 }

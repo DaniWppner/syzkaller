@@ -8,9 +8,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/syzkaller/pkg/hash"
@@ -18,6 +20,7 @@ import (
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/report"
+	"github.com/google/syzkaller/pkg/subsystem"
 	"github.com/google/syzkaller/prog"
 )
 
@@ -26,6 +29,10 @@ type CrashStore struct {
 	BaseDir      string
 	MaxCrashLogs int
 	MaxReproLogs int
+	Extractor    *subsystem.Extractor
+	Reporter     *report.Reporter
+	subsystemMu  sync.RWMutex
+	subsystems   map[string][]string
 }
 
 const reproFileName = "repro.prog"
@@ -40,12 +47,14 @@ func NewCrashStore(cfg *mgrconfig.Config) *CrashStore {
 		BaseDir:      cfg.Workdir,
 		MaxCrashLogs: cfg.MaxCrashLogs,
 		MaxReproLogs: MaxReproAttempts,
+		subsystems:   make(map[string][]string),
 	}
 }
 
 func ReadCrashStore(workdir string) *CrashStore {
 	return &CrashStore{
-		BaseDir: workdir,
+		BaseDir:    workdir,
+		subsystems: make(map[string][]string),
 	}
 }
 
@@ -93,6 +102,12 @@ func (cs *CrashStore) SaveCrash(crash *Crash) (bool, error) {
 	writeOrRemove("machineInfo", crash.MachineInfo)
 	if err := report.AddTitleStat(filepath.Join(dir, "title-stat"), reps); err != nil {
 		return false, fmt.Errorf("report.AddTitleStat: %w", err)
+	}
+
+	if crash.MemoryDump != "" {
+		if err := osutil.Rename(crash.MemoryDump, filepath.Join(dir, "vmcore")); err != nil {
+			return false, fmt.Errorf("failed to move memory dump: %w", err)
+		}
 	}
 
 	return first, nil
@@ -214,17 +229,19 @@ type CrashInfo struct {
 }
 
 type BugInfo struct {
-	ID            string
-	Title         string
-	TailTitles    []*report.TitleFreqRank
-	FirstTime     time.Time
-	LastTime      time.Time
-	HasRepro      bool
-	HasCRepro     bool
-	StraceFile    string // relative to the workdir
-	ReproAttempts int
-	Crashes       []*CrashInfo
-	Rank          int
+	ID             string
+	Title          string
+	TailTitles     []*report.TitleFreqRank
+	FirstTime      time.Time
+	LastTime       time.Time
+	HasRepro       bool
+	HasCRepro      bool
+	StraceFile     string // relative to the workdir
+	MemoryDumpFile string // relative to the workdir
+	ReproAttempts  int
+	Crashes        []*CrashInfo
+	Rank           int
+	Subsystems     []string
 }
 
 func (cs *CrashStore) BugInfo(id string, full bool) (*BugInfo, error) {
@@ -235,11 +252,16 @@ func (cs *CrashStore) BugInfo(id string, full bool) (*BugInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	stat, err := os.Stat(filepath.Join(dir, "description"))
+	ret.FirstTime, ret.LastTime, err = osutil.FileTimes(filepath.Join(dir, "description"))
 	if err != nil {
 		return nil, err
 	}
 	ret.Title = strings.TrimSpace(string(desc))
+
+	ret.Subsystems, err = cs.getSubsystems(id, dir, ret.Title)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get subsystems: %w", err)
+	}
 
 	// Bug rank may go up over time if we observe higher ranked bugs as a consequence of the first failure.
 	ret.Rank = report.TitlesToImpact(ret.Title)
@@ -250,8 +272,6 @@ func (cs *CrashStore) BugInfo(id string, full bool) (*BugInfo, error) {
 		}
 	}
 
-	ret.FirstTime = osutil.CreationTime(stat)
-	ret.LastTime = stat.ModTime()
 	files, err := osutil.ListDir(dir)
 	if err != nil {
 		return nil, err
@@ -273,6 +293,8 @@ func (cs *CrashStore) BugInfo(id string, full bool) (*BugInfo, error) {
 			ret.StraceFile = filepath.Join(dir, f)
 		} else if strings.HasPrefix(f, "repro") {
 			ret.ReproAttempts++
+		} else if f == "vmcore" {
+			ret.MemoryDumpFile = filepath.Join("crashes", id, f)
 		}
 	}
 	if !full {
@@ -293,6 +315,69 @@ func (cs *CrashStore) BugInfo(id string, full bool) (*BugInfo, error) {
 		return ret.Crashes[i].Time.After(ret.Crashes[j].Time)
 	})
 	return ret, nil
+}
+
+func (cs *CrashStore) getSubsystems(id, dir, title string) ([]string, error) {
+	cs.subsystemMu.Lock()
+	defer cs.subsystemMu.Unlock()
+	if cs.subsystems == nil {
+		cs.subsystems = make(map[string][]string)
+	}
+	if subs, ok := cs.subsystems[id]; ok {
+		return subs, nil
+	}
+
+	if subs, err := cs.querySubsystems(dir, title); err != nil {
+		return nil, err
+	} else {
+		slices.Sort(subs)
+		cs.subsystems[id] = subs
+		return subs, nil
+	}
+}
+
+func (cs *CrashStore) querySubsystems(dir, title string) ([]string, error) {
+	if cs.Extractor == nil || cs.Reporter == nil {
+		return nil, nil
+	}
+
+	var reportBytes []byte
+	reportPath := filepath.Join(dir, "repro.report")
+	reportBytes, err := os.ReadFile(reportPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("failed to read %s: %w", reportPath, err)
+		}
+		reportPath = filepath.Join(dir, "report0")
+		reportBytes, err = os.ReadFile(reportPath)
+		if err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("failed to read %s: %w", reportPath, err)
+		}
+	}
+
+	guiltyFile := ""
+	if len(reportBytes) > 0 {
+		guiltyFile = cs.Reporter.ReportToGuiltyFile(title, reportBytes)
+	}
+
+	var syzRepro []byte
+	reproPath := filepath.Join(dir, reproFileName)
+	syzRepro, err = os.ReadFile(reproPath)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("failed to read %s: %w", reproPath, err)
+	}
+
+	extracted := cs.Extractor.Extract([]*subsystem.Crash{{
+		GuiltyPath: guiltyFile,
+		SyzRepro:   syzRepro,
+	}})
+
+	var subs []string
+	for _, s := range extracted {
+		subs = append(subs, s.Name)
+	}
+
+	return subs, nil
 }
 
 func (cs *CrashStore) BugList() ([]*BugInfo, error) {
@@ -332,4 +417,8 @@ func crashHash(title string) string {
 
 func (cs *CrashStore) path(title string) string {
 	return filepath.Join(cs.BaseDir, "crashes", crashHash(title))
+}
+
+func (cs *CrashStore) HasMemoryDump(title string) bool {
+	return osutil.IsExist(filepath.Join(cs.path(title), "vmcore"))
 }

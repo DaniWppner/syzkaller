@@ -4,6 +4,7 @@
 package triage
 
 import (
+	"slices"
 	"sort"
 	"strings"
 
@@ -44,4 +45,24 @@ func SelectTrees(series *api.Series, trees []*api.Tree) []*api.Tree {
 		return tagsMap[result[i].Name] && !tagsMap[result[j].Name]
 	})
 	return result
+}
+
+func FindTree(trees []*api.Tree, branch string) (int, string) {
+	for idx, tree := range trees {
+		branchName, ok := strings.CutPrefix(branch, tree.Name+"/")
+		if ok {
+			return idx, branchName
+		}
+	}
+	return -1, ""
+}
+
+func FindTreeByName(trees []*api.Tree, name string) *api.Tree {
+	idx := slices.IndexFunc(trees, func(t *api.Tree) bool {
+		return t.Name == name
+	})
+	if idx != -1 {
+		return trees[idx]
+	}
+	return nil
 }

@@ -13,6 +13,10 @@ import (
 	"github.com/google/syzkaller/pkg/testutil"
 )
 
+// maxArgCutoff is the threshold of arguments above which we skip the program in tests
+// to prevent quadratic-time slowdowns during validation or minimization.
+const maxArgCutoff = 10000
+
 func TestGeneration(t *testing.T) {
 	target, rs, iters := initTest(t)
 	ct := target.DefaultChoiceTable()
@@ -201,7 +205,9 @@ func testCrossTarget(t *testing.T, target *Target, crossTargets []*Target) {
 	if testing.Short() {
 		iters /= 10
 	}
-	for i := 0; i < iters; i++ {
+	// The test is de facto O(N^2) for the number of arguments in the program.
+	// Let's filter out particularly large programs to avoid timeouts.
+	for i := 0; i < iters; {
 		p := target.Generate(rs, 20, ct)
 		testCrossArchProg(t, p, crossTargets)
 		p, err := target.Deserialize(p.Serialize(), NonStrict)
@@ -211,6 +217,10 @@ func testCrossTarget(t *testing.T, target *Target, crossTargets []*Target) {
 		testCrossArchProg(t, p, crossTargets)
 		p.Mutate(rs, 20, ct, nil, nil)
 		testCrossArchProg(t, p, crossTargets)
+		if p.countArgs() > maxArgCutoff {
+			continue
+		}
+		i++
 		p, _ = Minimize(p, -1, MinimizeCorpus, func(*Prog, int) bool {
 			return rs.Int63()%2 == 0
 		})
@@ -489,4 +499,17 @@ func TestSanitizeRandom(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestPtrRecursion(t *testing.T) {
+	target, rs, _ := initRandomTargetTest(t, "test", "64")
+	call := target.SyscallMap["test$recur_ptr"]
+	if call == nil {
+		t.Fatal("call test$recur_ptr not found")
+	}
+	enabled := map[*Syscall]bool{call: true}
+	ct := target.BuildChoiceTable(nil, enabled)
+	for i := 0; i < 100; i++ {
+		target.Generate(rs, 1, ct)
+	}
 }

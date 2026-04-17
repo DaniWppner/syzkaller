@@ -11,6 +11,9 @@
 // (e.g. generate switch tables).
 #define noinline __attribute__((noinline))
 
+// Force inlining as much as possible.
+#define always_inline __attribute__((always_inline)) inline
+
 // __no_stack_protector disables -fstack-protector which may introduce unwanted global accesses.
 // TODO(glider): once syz-env-old migrates to GCC>11 we can just use
 // __attribute__((no_stack_protector)).
@@ -35,10 +38,45 @@
 #define __addrspace_guest
 #endif
 
+// Disable optimizations for a particular function.
+#if defined(__clang__)
+#define __optnone __attribute__((optnone))
+#elif defined(__GNUC__)
+#define __optnone __attribute__((optimize("O0")))
+#else
+#define __optnone
+#endif
+
 // Host will map the code in this section into the guest address space.
 #define GUEST_CODE __attribute__((section("guest"))) __no_stack_protector __addrspace_guest
 
 // Start/end of the guest section.
 extern char *__start_guest, *__stop_guest;
+
+// Common SYZOS API call descriptors.
+struct api_call_header {
+	uint64 call;
+	uint64 size;
+};
+
+struct api_call_1 {
+	struct api_call_header header;
+	uint64 arg;
+};
+
+struct api_call_2 {
+	struct api_call_header header;
+	uint64 args[2];
+};
+
+struct api_call_3 {
+	struct api_call_header header;
+	uint64 args[3];
+};
+
+struct api_call_5 {
+	struct api_call_header header;
+	uint64 args[5];
+};
 
 #endif // EXECUTOR_COMMON_KVM_SYZOS_H

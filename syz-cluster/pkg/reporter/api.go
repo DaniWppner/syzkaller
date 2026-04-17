@@ -31,13 +31,13 @@ func (s *APIServer) Mux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/reports/{report_id}/upstream", s.upstreamReport)
 	mux.HandleFunc("/reports/{report_id}/confirm", s.confirmReport)
+	mux.HandleFunc("/reports/{report_id}/invalidate", s.invalidateReport)
 	mux.HandleFunc("/reports/record_reply", s.recordReply)
 	mux.HandleFunc("/reports/last_reply", s.lastReply)
 	mux.HandleFunc("/reports", s.nextReports)
 	return mux
 }
 
-// nolint: dupl
 func (s *APIServer) upstreamReport(w http.ResponseWriter, r *http.Request) {
 	req := api.ParseJSON[api.UpstreamReportReq](w, r)
 	if req == nil {
@@ -45,7 +45,13 @@ func (s *APIServer) upstreamReport(w http.ResponseWriter, r *http.Request) {
 	}
 	// TODO: journal the action.
 	err := s.reportService.Upstream(r.Context(), r.PathValue("report_id"), req)
-	reply[interface{}](w, nil, err)
+	reply[any](w, nil, err)
+}
+
+func (s *APIServer) invalidateReport(w http.ResponseWriter, r *http.Request) {
+	// TODO: journal the action.
+	err := s.reportService.Invalidate(r.Context(), r.PathValue("report_id"))
+	reply[any](w, nil, err)
 }
 
 func (s *APIServer) nextReports(w http.ResponseWriter, r *http.Request) {
@@ -55,7 +61,7 @@ func (s *APIServer) nextReports(w http.ResponseWriter, r *http.Request) {
 
 func (s *APIServer) confirmReport(w http.ResponseWriter, r *http.Request) {
 	err := s.reportService.Confirm(r.Context(), r.PathValue("report_id"))
-	reply[interface{}](w, nil, err)
+	reply[any](w, nil, err)
 }
 
 func (s *APIServer) recordReply(w http.ResponseWriter, r *http.Request) {

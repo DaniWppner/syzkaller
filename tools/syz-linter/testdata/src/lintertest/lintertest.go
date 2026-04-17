@@ -4,6 +4,7 @@
 package lintertest
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -143,4 +144,40 @@ func loopvar() {
 		i, v := i, v // want "Don't duplicate loop variables.*"
 		_, _ = i, v
 	}
+}
+
+func anyInterface() interface{} {	// want "Use any instead of interface{}"
+	var v interface{}		// want "Use any instead of interface{}"
+	func(interface{}) {} (v)	// want "Use any instead of interface{}"
+	var y any
+	func(any) {} (y)
+	return v
+}
+
+func contextArgsGood1(ctx context.Context) {
+}
+
+func contextArgsBad1(c context.Context) { // want "Context variable must be named 'ctx'"
+}
+
+func contextArgsBad2(a int, ctx context.Context) { // want "Context must be the first argument"
+}
+
+func contextArgsGood2(ctx context.Context, a int) {
+}
+
+func TestContextArgsGood(t *testing.T, ctx context.Context) {
+}
+
+func TestContextArgsBad1(t *testing.T, c context.Context) { // want "Context variable must be named 'ctx'"
+}
+
+func TestContextArgsBad2(t *testing.T, a int, ctx context.Context) { // want "Context must be the second argument"
+}
+
+func sliceClones() {
+	var x []int
+	i := 0
+	_ = append([]int{}, i)
+	_ = append([]int{}, x...)  // want "Use slices.Clone instead of append"
 }

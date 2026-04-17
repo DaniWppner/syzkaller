@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/google/syzkaller/dashboard/api"
 	"github.com/google/syzkaller/dashboard/dashapi"
@@ -23,10 +24,14 @@ func TestJSONAPIIntegration(t *testing.T) {
 	"version": 1,
 	"title": "title1",
 	"id": "cb1dbe55dc6daa7e739a0d09a0ae4d5e3e5a10c8",
+	"status": "reporting1: reported on 2000/01/01 00:01",
+	"first-crash": "2000-01-01T00:01:00Z",
+	"last-crash": "2000-01-01T00:01:00Z",
 	"crashes": [
 		{
 			"title": "title1",
 			"kernel-config": "/text?tag=KernelConfig\u0026x=a989f27ebc47e2dc",
+			"kernel-source-git": "repo1",
 			"kernel-source-commit": "1111111111111111111111111111111111111111",
 			"syzkaller-git": "https://github.com/google/syzkaller/commits/syzkaller_commit1",
 			"syzkaller-commit": "syzkaller_commit1",
@@ -40,12 +45,17 @@ func TestJSONAPIIntegration(t *testing.T) {
 	"version": 1,
 	"title": "title2",
 	"id": "fc00fbc0cddd9a4ef2ae33e40cd21636081466ce",
+	"status": "reporting1: reported C repro on 2000/01/01 00:01",
+	"first-crash": "2000-01-01T00:01:00Z",
+	"last-crash": "2000-01-01T00:01:00Z",
 	"crashes": [
 		{
 			"title": "title2",
 			"syz-reproducer": "/text?tag=ReproSyz\u0026x=13000000000000",
 			"c-reproducer": "/text?tag=ReproC\u0026x=17000000000000",
+			"repro-opts": "repro opts 2",
 			"kernel-config": "/text?tag=KernelConfig\u0026x=a989f27ebc47e2dc",
+			"kernel-source-git": "repo1",
 			"kernel-source-commit": "1111111111111111111111111111111111111111",
 			"syzkaller-git": "https://github.com/google/syzkaller/commits/syzkaller_commit1",
 			"syzkaller-commit": "syzkaller_commit1",
@@ -100,18 +110,19 @@ func TestJSONAPIIntegration(t *testing.T) {
 	c.client.UploadBuild(build)
 
 	crash1 := testCrash(build, 1)
+	c.advanceTime(time.Minute)
 	c.client.ReportCrash(crash1)
-	bugReport1 := c.client.pollBug()
+	bugReport1 := c.globalClient.pollBug()
 	checkBugPageJSONIs(c, bugReport1.ID, sampleCrashDescr)
 
 	crash2 := testCrashWithRepro(build, 2)
 	c.client.ReportCrash(crash2)
-	bugReport2 := c.client.pollBug()
+	bugReport2 := c.globalClient.pollBug()
 	checkBugPageJSONIs(c, bugReport2.ID, sampleCrashWithReproDescr)
 
 	checkBugGroupPageJSONIs(c, "/test1?json=1", sampleOpenBugGroupDescr)
 
-	c.client.ReportingUpdate(&dashapi.BugUpdate{
+	c.globalClient.ReportingUpdate(&dashapi.BugUpdate{
 		ID:         bugReport2.ID,
 		Status:     dashapi.BugStatusOpen,
 		FixCommits: []string{"foo: fix1", "foo: fix2"},
@@ -121,6 +132,7 @@ func TestJSONAPIIntegration(t *testing.T) {
 }
 
 func checkBugPageJSONIs(c *Ctx, ID string, expectedContent []byte) {
+	c.t.Helper()
 	url := fmt.Sprintf("/bug?extid=%v&json=1", ID)
 
 	contentType, _ := c.client.ContentType(url)
@@ -131,6 +143,7 @@ func checkBugPageJSONIs(c *Ctx, ID string, expectedContent []byte) {
 }
 
 func checkBugGroupPageJSONIs(c *Ctx, url string, expectedContent []byte) {
+	c.t.Helper()
 	contentType, _ := c.client.ContentType(url)
 	c.expectEQ(contentType, "application/json")
 
@@ -147,17 +160,24 @@ func TestJSONAPIFixCommits(t *testing.T) {
 
 	crash1 := testCrash(build1, 1)
 	c.client.ReportCrash(crash1)
-	rep1 := c.client.pollBug()
+	rep1 := c.globalClient.pollBug()
 
 	// Specify fixing commit for the bug.
-	c.client.ReportingUpdate(&dashapi.BugUpdate{
+	c.advanceTime(time.Hour)
+	c.globalClient.ReportingUpdate(&dashapi.BugUpdate{
 		ID:         rep1.ID,
 		Status:     dashapi.BugStatusOpen,
 		FixCommits: []string{"foo: fix1", "foo: fix2"},
 	})
 
 	c.client.UploadCommits([]dashapi.Commit{
-		{Hash: "hash1", Title: "foo: fix1"},
+		{
+			Hash:       "hash1",
+			Title:      "foo: fix1",
+			Author:     "aidan@black.com",
+			AuthorName: "Aidan Black",
+			Date:       time.Date(2026, 2, 24, 12, 0, 0, 0, time.UTC),
+		},
 	})
 
 	c.client.CommitPoll()
@@ -166,12 +186,19 @@ func TestJSONAPIFixCommits(t *testing.T) {
 	"version": 1,
 	"title": "title1",
 	"id": "cb1dbe55dc6daa7e739a0d09a0ae4d5e3e5a10c8",
+	"status": "reporting1: reported on 2000/01/01 00:00",
+	"first-crash": "2000-01-01T00:00:00Z",
+	"last-crash": "2000-01-01T00:00:00Z",
+	"fix-time": "2000-01-01T01:00:00Z",
 	"fix-commits": [
 		{
 			"title": "foo: fix1",
 			"hash": "hash1",
 			"repo": "git://syzkaller.org",
-			"branch": "branch10"
+			"branch": "branch10",
+			"author": "aidan@black.com",
+			"author-name": "Aidan Black",
+			"date": "2026-02-24T12:00:00Z"
 		},
 		{
 			"title": "foo: fix2",
@@ -183,6 +210,7 @@ func TestJSONAPIFixCommits(t *testing.T) {
 		{
 			"title": "title1",
 			"kernel-config": "/text?tag=KernelConfig\u0026x=a989f27ebc47e2dc",
+			"kernel-source-git": "repo1",
 			"kernel-source-commit": "1111111111111111111111111111111111111111",
 			"syzkaller-git": "https://github.com/google/syzkaller/commits/syzkaller_commit1",
 			"syzkaller-commit": "syzkaller_commit1",
@@ -210,18 +238,24 @@ func TestJSONAPICauseBisection(t *testing.T) {
 	"version": 1,
 	"title": "title1",
 	"id": "70ce63ecb151d563976728208edccc6879191f9f",
+	"status": "reporting2: reported C repro on 2000/01/31 00:00",
+	"first-crash": "2000-01-01T00:00:00Z",
+	"last-crash": "2000-01-01T00:00:00Z",
 	"cause-commit": {
 		"title": "kernel: add a bug",
 		"hash": "36e65cb4a0448942ec316b24d60446bbd5cc7827",
 		"repo": "repo1",
-		"branch": "branch1"
+		"branch": "branch1",
+		"date": "2000-02-09T04:05:06Z"
 	},
 	"crashes": [
 		{
 			"title": "title1",
 			"syz-reproducer": "/text?tag=ReproSyz\u0026x=16000000000000",
 			"c-reproducer": "/text?tag=ReproC\u0026x=11000000000000",
+			"repro-opts": "repro opts 1",
 			"kernel-config": "/text?tag=KernelConfig\u0026x=4d11162a90e18f28",
+			"kernel-source-git": "repo1",
 			"kernel-source-commit": "1111111111111111111111111111111111111111",
 			"syzkaller-git": "https://github.com/google/syzkaller/commits/syzkaller_commit1",
 			"syzkaller-commit": "syzkaller_commit1",
@@ -232,16 +266,16 @@ func TestJSONAPICauseBisection(t *testing.T) {
 }
 
 func TestPublicJSONAPI(t *testing.T) {
-	c := NewCtx(t)
+	c := NewSpannerCtx(t)
 	defer c.Close()
 
 	client := c.makeClient(clientPublic, keyPublic, true)
 	build := testBuild(1)
 	client.UploadBuild(build)
 	client.ReportCrash(testCrashWithRepro(build, 1))
-	rep := client.pollBug()
-	client.updateBug(rep.ID, dashapi.BugStatusUpstream, "")
-	_ = client.pollBug()
+	rep := c.globalClient.pollBug()
+	c.globalClient.updateBug(rep.ID, dashapi.BugStatusUpstream, "")
+	_ = c.globalClient.pollBug()
 
 	cli := c.makeAPIClient()
 	bugs, err := cli.BugGroups("access-public", api.BugGroupAll)

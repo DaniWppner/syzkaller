@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/google/syzkaller/pkg/cover/backend"
@@ -72,6 +73,8 @@ type Report struct {
 	MachineInfo []byte
 	// If the crash happened in the context of the syz-executor process, Executor will hold more info.
 	Executor *ExecutorInfo
+	// Whether the kernel has panicked after the report (Linux-specific).
+	Panicked bool
 	// reportPrefixLen is length of additional prefix lines that we added before actual crash report.
 	reportPrefixLen int
 	// symbolized is set if the report is symbolized. It prevents double symbolization.
@@ -597,7 +600,7 @@ type extractedFrame struct {
 }
 
 func extractStackFrame(params *stackParams, stack *stackFmt, output []byte) ([]extractedFrame, bool) {
-	skip := append([]string{}, params.skipPatterns...)
+	skip := slices.Clone(params.skipPatterns)
 	skip = append(skip, stack.skip...)
 	var skipRe *regexp.Regexp
 	if len(skip) != 0 {
@@ -716,7 +719,7 @@ func appendStackFrame(frames []string, match [][]byte, skipRe *regexp.Regexp) []
 }
 
 func canonicalArgs(prefix []any, frames []extractedFrame) []any {
-	ret := append([]any{}, prefix...)
+	ret := slices.Clone(prefix)
 	for _, frame := range frames {
 		ret = append(ret, frame.canonical)
 	}
@@ -745,7 +748,7 @@ func partiallyStrippedArgs(prefix []any, frames []extractedFrame, params *stackP
 			list = append(list, trimmed)
 		}
 		if add {
-			list = append(append([]any{}, prefix...), list...)
+			list = append(slices.Clone(prefix), list...)
 			ret = append(ret, list)
 		}
 	}
@@ -800,7 +803,7 @@ func simpleLineParser(output []byte, oopses []*oops, params *stackParams, ignore
 	rep.Report = output[rep.StartPos:]
 	rep.Corrupted = corrupted != ""
 	rep.CorruptedReason = corrupted
-	rep.Type = TitleToCrashType(rep.Title)
+	rep.Type = crash.TitleToType(rep.Title)
 	return rep
 }
 
@@ -931,17 +934,6 @@ var groupGoRuntimeErrors = oops{
 		compile("ALSA"),
 		compile("fatal error: cannot create timer"),
 	},
-}
-
-func TitleToCrashType(title string) crash.Type {
-	for _, t := range titleToType {
-		for _, prefix := range t.includePrefixes {
-			if strings.HasPrefix(title, prefix) {
-				return t.crashType
-			}
-		}
-	}
-	return crash.UnknownType
 }
 
 const reportSeparator = "\n<<<<<<<<<<<<<<< tail report >>>>>>>>>>>>>>>\n\n"

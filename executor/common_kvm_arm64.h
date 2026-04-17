@@ -70,8 +70,8 @@ static void vm_set_user_memory_region(int vmfd, uint32 slot, uint32 flags, uint6
 #define ADRP_OPCODE 0x90000000
 #define ADRP_OPCODE_MASK 0x9f000000
 
-// Code loading SyzOS into guest memory does not handle data relocations (see
-// https://github.com/google/syzkaller/issues/5565), so SyzOS will crash soon after encountering an
+// Code loading SYZOS into guest memory does not handle data relocations (see
+// https://github.com/google/syzkaller/issues/5565), so SYZOS will crash soon after encountering an
 // ADRP instruction. Detect these instructions to catch regressions early.
 // The most common reason for using data relocaions is accessing global variables and constants.
 // Sometimes the compiler may choose to emit a read-only constant to zero-initialize a structure
@@ -81,7 +81,7 @@ static void validate_guest_code(void* mem, size_t size)
 	uint32* insns = (uint32*)mem;
 	for (size_t i = 0; i < size / 4; i++) {
 		if ((insns[i] & ADRP_OPCODE_MASK) == ADRP_OPCODE)
-			fail("ADRP instruction detected in SyzOS, exiting");
+			fail("ADRP instruction detected in SYZOS, exiting");
 	}
 }
 
@@ -89,7 +89,7 @@ static void install_syzos_code(void* host_mem, size_t mem_size)
 {
 	size_t size = (char*)&__stop_guest - (char*)&__start_guest;
 	if (size > mem_size)
-		fail("SyzOS size exceeds guest memory");
+		fail("SYZOS size exceeds guest memory");
 	memcpy(host_mem, &__start_guest, size);
 	validate_guest_code(host_mem, size);
 }
@@ -362,17 +362,32 @@ static long syz_kvm_vgic_v3_setup(volatile long a0, volatile long a1, volatile l
 #endif
 
 #if SYZ_EXECUTOR || __NR_syz_kvm_assert_syzos_uexit
-static long syz_kvm_assert_syzos_uexit(volatile long a0, volatile long a1)
+static long syz_kvm_assert_syzos_uexit(volatile long a0, volatile long a1,
+				       volatile long a2)
 {
-	struct kvm_run* run = (struct kvm_run*)a0;
-	uint64 expect = a1;
+#if !SYZ_EXECUTOR
+	int cpufd = (int)a0;
+#endif
+	struct kvm_run* run = (struct kvm_run*)a1;
+	uint64 expect = a2;
 
-	if (!run || (run->exit_reason != KVM_EXIT_MMIO) || (run->mmio.phys_addr != ARM64_ADDR_UEXIT)) {
+	if (!run || (run->exit_reason != KVM_EXIT_MMIO) ||
+	    (run->mmio.phys_addr != ARM64_ADDR_UEXIT)) {
+#if !SYZ_EXECUTOR
+		fprintf(stderr, "[SYZOS-DEBUG] Assertion Triggered on VCPU %d\n", cpufd);
+#endif
 		errno = EINVAL;
 		return -1;
 	}
 
-	if ((((uint64*)(run->mmio.data))[0]) != expect) {
+	uint64 actual_code = ((uint64*)(run->mmio.data))[0];
+	if (actual_code != expect) {
+#if !SYZ_EXECUTOR
+		fprintf(stderr, "[SYZOS-DEBUG] Exit Code Mismatch on VCPU %d\n", cpufd);
+		fprintf(stderr, "   Expected: 0x%lx\n", (unsigned long)expect);
+		fprintf(stderr, "   Actual:   0x%lx\n",
+			(unsigned long)actual_code);
+#endif
 		errno = EDOM;
 		return -1;
 	}

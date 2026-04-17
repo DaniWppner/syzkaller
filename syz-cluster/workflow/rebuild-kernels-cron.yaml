@@ -11,8 +11,8 @@ kind: CronWorkflow
 metadata:
   name: rebuild-kernels-cron
 spec:
-  # Twice each day.
-  schedule: "30 */12 * * *"
+  # Three times per day.
+  schedule: "30 */8 * * *"
   concurrencyPolicy: "Replace"
   startingDeadlineSeconds: 0
   workflowSpec:
@@ -93,8 +93,8 @@ spec:
                   value: "{{inputs.parameters.request-json}}"
         - - name: run-build
             templateRef:
-              name: build-step-template
-              template: build-step
+              name: build-action-template
+              template: build-action
             arguments:
               parameters:
                 - name: smoke-build

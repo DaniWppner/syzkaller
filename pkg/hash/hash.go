@@ -8,6 +8,7 @@ import (
 	"crypto/sha1"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 )
 
@@ -16,7 +17,19 @@ type Sig [sha1.Size]byte
 func Hash(pieces ...any) Sig {
 	h := sha1.New()
 	for _, data := range pieces {
-		binary.Write(h, binary.LittleEndian, data)
+		if str, ok := data.(string); ok {
+			data = []byte(str)
+		}
+	retry:
+		if binary.Write(h, binary.LittleEndian, data) == nil {
+			continue
+		}
+		marshalled, err := json.Marshal(data)
+		if err != nil {
+			panic(err)
+		}
+		data = marshalled
+		goto retry
 	}
 	var sig Sig
 	copy(sig[:], h.Sum(nil))

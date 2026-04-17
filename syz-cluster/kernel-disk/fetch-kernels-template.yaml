@@ -36,6 +36,7 @@ spec:
         url: "http://controller-service:8080/trees"
         method: "GET"
     - name: process-tree
+      serviceAccountName: kernel-fetcher-ksa
       inputs:
         parameters:
           - name: tree
@@ -61,6 +62,10 @@ spec:
           - "-c"
           - |
             cd /repo.git
+            if [ -f "packed-refs.lock" ]; then
+              echo "Found stale 'packed-refs.lock' at start. Removing it."
+              rm -f packed-refs.lock
+            fi
             if [ ! -d "refs" ]; then
               git init --bare
             fi
@@ -71,4 +76,4 @@ spec:
             git remote remove ${NAME} || true
             git remote add ${NAME} ${REPO}
             git fetch ${NAME} ${BRANCH} --tags "+refs/heads/*:refs/heads/${NAME}/*" "+refs/tags/*:refs/tags/${NAME}/*"
-            git tag -f ${NAME}-head ${NAME}/${BRANCH}
+            git log -1 --format="%h %an %ad %s" ${NAME}/${BRANCH}

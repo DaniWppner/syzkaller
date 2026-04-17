@@ -41,8 +41,14 @@ func TestDeterminism(t *testing.T) {
 		seed := rs.Int63()
 		rs1 := rand.NewSource(seed)
 		p1 := generateProg(t, target, rs1, ct, corpus)
+		if p1 == nil {
+			continue
+		}
 		rs2 := rand.NewSource(seed)
 		p2 := generateProg(t, target, rs2, ct, corpus)
+		if p2 == nil {
+			continue
+		}
 		ps1 := string(p1.Serialize())
 		ps2 := string(p2.Serialize())
 		r1 := rs1.Int63()
@@ -57,6 +63,9 @@ func TestDeterminism(t *testing.T) {
 func generateProg(t *testing.T, target *Target, rs rand.Source, ct *ChoiceTable, corpus []*Prog) *Prog {
 	p := target.Generate(rs, 5, ct)
 	p.Mutate(rs, 10, ct, nil, corpus)
+	if p.countArgs() > maxArgCutoff {
+		return nil
+	}
 	for i, c := range p.Calls {
 		comps := make(CompMap)
 		for v := range extractValues(c) {

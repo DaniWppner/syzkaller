@@ -66,10 +66,7 @@ func GeneratePatched(cfg *api.FuzzConfig) (*mgrconfig.Config, error) {
 }
 
 func applyFuzzConfig(mgrCfg *mgrconfig.Config, cfg *api.FuzzConfig) error {
-	if len(cfg.Focus) == 0 {
-		noFocus(mgrCfg)
-		return nil
-	}
+	haveFocus := map[string]bool{}
 	for _, focus := range cfg.Focus {
 		cb := setFocus[focus]
 		if cb == nil {
@@ -79,6 +76,16 @@ func applyFuzzConfig(mgrCfg *mgrconfig.Config, cfg *api.FuzzConfig) error {
 		if err != nil {
 			return fmt.Errorf("failed to apply focus %s: %w", focus, err)
 		}
+		haveFocus[focus] = true
+	}
+	if len(haveFocus) == 0 {
+		noFlakyFsCalls(mgrCfg)
+		noFlakyTraceCalls(mgrCfg)
+	}
+	// This could have been done in a more generic ways, but so far
+	// there are not too many such cases.
+	if haveFocus[api.FocusNet] && !haveFocus[api.FocusBPF] {
+		noFlakyTraceCalls(mgrCfg)
 	}
 	return nil
 }
@@ -162,7 +169,7 @@ var setFocus = map[string]func(*mgrconfig.Config) error{
 	},
 	api.FocusIoUring: func(mgrCfg *mgrconfig.Config) error {
 		mgrCfg.EnabledSyscalls = append(mgrCfg.EnabledSyscalls,
-			"io_uring_*", "syz_io_uring_*", "syz_memcpy_off", "mmap", "madvise",
+			"io_uring_*", "syz_io_uring_*", "mmap", "madvise",
 			"mprotect", "eventfd", "socket", "setsockopt", "accept", "open", "close",
 			"clock_gettime", "ioctl$sock_SIOCGIFINDEX", "ioctl$IOCTL_GET_NCIDEV_IDX",
 			"openat", "epoll_create",
@@ -183,6 +190,12 @@ var setFocus = map[string]func(*mgrconfig.Config) error{
 	},
 }
 
-func noFocus(mgrCfg *mgrconfig.Config) {
-	mgrCfg.DisabledSyscalls = []string{"perf_event_open*", "syz_mount_image$hfs", "syz_mount_image$gfs*"}
+func noFlakyFsCalls(mgrCfg *mgrconfig.Config) {
+	mgrCfg.DisabledSyscalls = append(mgrCfg.DisabledSyscalls,
+		"syz_mount_image$hfs", "syz_mount_image$gfs*")
+}
+
+func noFlakyTraceCalls(mgrCfg *mgrconfig.Config) {
+	mgrCfg.DisabledSyscalls = append(mgrCfg.DisabledSyscalls,
+		"perf_event_open*", "ioctl$PERF*", "bpf$BPF_RAW_TRACEPOINT_OPEN")
 }

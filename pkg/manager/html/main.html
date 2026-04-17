@@ -20,24 +20,35 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 	</tbody>
 </table>
 
+{{if .FilterSubsystem}}
+<b>Filter by subsystem: {{.FilterSubsystem}}</b> [<a href="/">clear</a>]
+{{end}}
+
 {{if .Crashes}}
 <table class="list_table">
 	<caption>Crashes:</caption>
 	<thead>
 	<tr>
 		<th><a onclick="return sortTable(this, 'Description', textSort)" href="#">Description</a></th>
+		<th><a onclick="return sortTable(this, 'Subsystems', textSort)" href="#">Subsystems</a></th>
 		<th><a onclick="return sortTable(this, 'Rank', numSort)" href="#">Rank</a></th>
 		<th><a onclick="return sortTable(this, 'Count', numSort)" href="#">Count</a></th>
 		<th><a onclick="return sortTable(this, 'First Time', textSort, true)" href="#">First Time</a></th>
 		<th><a onclick="return sortTable(this, 'Last Time', textSort, true)" href="#">Last Time</a></th>
 		<th><a onclick="return sortTable(this, 'Report', textSort)" href="#">Report</a></th>
-		<th><a onclick="return sortTable(this, 'Repro Attempt Count', numSort)" href="#">Repro Attempt Count</a></th>
+		{{if .ShowCore}}
+		<th><a onclick="return sortTable(this, 'Core', textSort)" href="#">Core</a></th>
+		{{end}}
+		<th><a onclick="return sortTable(this, 'Repro Attempts', numSort)" href="#">Repro Attempts</a></th>
 	</tr>
 	</thead>
 	<tbody>
 	{{range $c := $.Crashes}}
 	<tr>
 		<td class="title"><a href="/crash?id={{$c.ID}}">{{$c.Title}}</a></td>
+		<td>
+			{{range $i, $s := $c.Subsystems}}{{if $i}}, {{end}}<a href="{{$.FilterAddURL $s}}">{{$s}}</a>{{end}}
+		</td>
 		<td class="rank {{if not $c.Active}}inactive{{end}}">
 			{{if $c.RankTooltip}}
 				<b>{{$c.Rank}}</b>
@@ -57,7 +68,14 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 				<a href="/file?name={{$c.StraceFile}}">Strace</a>
 			{{end}}
 		</td>
-		<td class="stat">{{if $c.ReproAttempts}}{{$c.ReproAttempts}}{{end}}</td>
+		{{if $.ShowCore}}
+		<td>
+			{{if $c.MemoryDumpFile}}
+			<a href="/file?name={{$c.MemoryDumpFile}}&raw=1">Dump</a>
+			{{end}}
+		</td>
+		{{end}}
+		<td class="stat {{if not $c.ReproAttempts}}inactive{{end}}">{{$c.ReproAttempts}}</td>
 	</tr>
 	{{end}}
 	</tbody>

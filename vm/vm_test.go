@@ -28,7 +28,7 @@ func (pool *testPool) Count() int {
 
 func (pool *testPool) Create(_ context.Context, workdir string, index int) (vmimpl.Instance, error) {
 	return &testInstance{
-		outc: make(chan []byte, 10),
+		outc: make(chan vmimpl.Chunk, 10),
 		errc: make(chan error, 1),
 	}, nil
 }
@@ -38,7 +38,7 @@ func (pool *testPool) Close() error {
 }
 
 type testInstance struct {
-	outc           chan []byte
+	outc           chan vmimpl.Chunk
 	errc           chan error
 	diagnoseBug    bool
 	diagnoseNoWait bool
@@ -53,7 +53,7 @@ func (inst *testInstance) Forward(port int) (string, error) {
 }
 
 func (inst *testInstance) Run(ctx context.Context, command string) (
-	outc <-chan []byte, errc <-chan error, err error) {
+	outc <-chan vmimpl.Chunk, errc <-chan error, err error) {
 	return inst.outc, inst.errc, nil
 }
 
@@ -69,7 +69,7 @@ func (inst *testInstance) Diagnose(rep *report.Report) ([]byte, bool) {
 		return diag, false
 	}
 
-	inst.outc <- diag
+	inst.outc <- vmimpl.Chunk{Data: diag}
 	return nil, true
 }
 
@@ -100,24 +100,23 @@ type Test struct {
 	Exit           ExitCondition
 	DiagnoseBug    bool // Diagnose produces output that is detected as kernel crash.
 	DiagnoseNoWait bool // Diagnose returns output directly rather than to console.
-	Body           func(outc chan []byte, errc chan error)
-	BodyExecuting  func(outc chan []byte, errc chan error, inject chan<- bool)
+	Body           func(outc chan vmimpl.Chunk, errc chan error)
+	BodyExecuting  func(outc chan vmimpl.Chunk, errc chan error, inject chan<- bool)
 	Report         *report.Report
 }
 
-// nolint: goconst // "DIAGNOSE\n", "BUG: bad\n" and "other output\n"
 var tests = []*Test{
 	{
 		Name: "program-exits-normally",
 		Exit: ExitNormal,
-		Body: func(outc chan []byte, errc chan error) {
+		Body: func(outc chan vmimpl.Chunk, errc chan error) {
 			time.Sleep(time.Second)
 			errc <- nil
 		},
 	},
 	{
 		Name: "program-exits-when-it-should-not",
-		Body: func(outc chan []byte, errc chan error) {
+		Body: func(outc chan vmimpl.Chunk, errc chan error) {
 			time.Sleep(time.Second)
 			errc <- nil
 		},
@@ -130,13 +129,13 @@ var tests = []*Test{
 		Name:        "#875-diagnose-bugs",
 		Exit:        ExitNormal,
 		DiagnoseBug: true,
-		Body: func(outc chan []byte, errc chan error) {
+		Body: func(outc chan vmimpl.Chunk, errc chan error) {
 			errc <- nil
 		},
 	},
 	{
 		Name: "#875-diagnose-bugs-2",
-		Body: func(outc chan []byte, errc chan error) {
+		Body: func(outc chan vmimpl.Chunk, errc chan error) {
 			errc <- nil
 		},
 		Report: &report.Report{
@@ -149,7 +148,7 @@ var tests = []*Test{
 	},
 	{
 		Name: "diagnose-no-wait",
-		Body: func(outc chan []byte, errc chan error) {
+		Body: func(outc chan vmimpl.Chunk, errc chan error) {
 			errc <- nil
 		},
 		DiagnoseNoWait: true,
@@ -165,10 +164,10 @@ var tests = []*Test{
 	},
 	{
 		Name: "diagnose-bug-no-wait",
-		Body: func(outc chan []byte, errc chan error) {
-			outc <- []byte("BUG: bad\n")
+		Body: func(outc chan vmimpl.Chunk, errc chan error) {
+			outc <- vmimpl.Chunk{Data: []byte("BUG: bad\n")}
 			time.Sleep(time.Second)
-			outc <- []byte("other output\n")
+			outc <- vmimpl.Chunk{Data: []byte("other output\n")}
 		},
 		DiagnoseNoWait: true,
 		Report: &report.Report{
@@ -188,10 +187,10 @@ var tests = []*Test{
 	},
 	{
 		Name: "kernel-crashes",
-		Body: func(outc chan []byte, errc chan error) {
-			outc <- []byte("BUG: bad\n")
+		Body: func(outc chan vmimpl.Chunk, errc chan error) {
+			outc <- vmimpl.Chunk{Data: []byte("BUG: bad\n")}
 			time.Sleep(time.Second)
-			outc <- []byte("other output\n")
+			outc <- vmimpl.Chunk{Data: []byte("other output\n")}
 		},
 		Report: &report.Report{
 			Title: "BUG: bad",
@@ -204,18 +203,18 @@ var tests = []*Test{
 	},
 	{
 		Name: "fuzzer-is-preempted",
-		Body: func(outc chan []byte, errc chan error) {
-			outc <- []byte("BUG: bad\n")
-			outc <- []byte(executorPreemptedStr + "\n")
+		Body: func(outc chan vmimpl.Chunk, errc chan error) {
+			outc <- vmimpl.Chunk{Data: []byte("BUG: bad\n")}
+			outc <- vmimpl.Chunk{Data: []byte(executorPreemptedStr + "\n")}
 		},
 	},
 	{
 		Name: "program-exits-but-kernel-crashes-afterwards",
 		Exit: ExitNormal,
-		Body: func(outc chan []byte, errc chan error) {
+		Body: func(outc chan vmimpl.Chunk, errc chan error) {
 			errc <- nil
 			time.Sleep(time.Second)
-			outc <- []byte("BUG: bad\n")
+			outc <- vmimpl.Chunk{Data: []byte("BUG: bad\n")}
 		},
 		Report: &report.Report{
 			Title: "BUG: bad",
@@ -228,13 +227,13 @@ var tests = []*Test{
 	{
 		Name: "timeout",
 		Exit: ExitTimeout,
-		Body: func(outc chan []byte, errc chan error) {
+		Body: func(outc chan vmimpl.Chunk, errc chan error) {
 			errc <- vmimpl.ErrTimeout
 		},
 	},
 	{
 		Name: "bad-timeout",
-		Body: func(outc chan []byte, errc chan error) {
+		Body: func(outc chan vmimpl.Chunk, errc chan error) {
 			errc <- vmimpl.ErrTimeout
 		},
 		Report: &report.Report{
@@ -243,7 +242,7 @@ var tests = []*Test{
 	},
 	{
 		Name: "program-crashes",
-		Body: func(outc chan []byte, errc chan error) {
+		Body: func(outc chan vmimpl.Chunk, errc chan error) {
 			errc <- fmt.Errorf("error")
 		},
 		Report: &report.Report{
@@ -254,13 +253,13 @@ var tests = []*Test{
 	{
 		Name: "program-crashes-expected",
 		Exit: ExitError,
-		Body: func(outc chan []byte, errc chan error) {
+		Body: func(outc chan vmimpl.Chunk, errc chan error) {
 			errc <- fmt.Errorf("error")
 		},
 	},
 	{
 		Name: "no-output-1",
-		Body: func(outc chan []byte, errc chan error) {
+		Body: func(outc chan vmimpl.Chunk, errc chan error) {
 		},
 		Report: &report.Report{
 			Title: noOutputCrash,
@@ -268,10 +267,10 @@ var tests = []*Test{
 	},
 	{
 		Name: "no-output-2",
-		Body: func(outc chan []byte, errc chan error) {
+		Body: func(outc chan vmimpl.Chunk, errc chan error) {
 			for i := 0; i < 5; i++ {
 				time.Sleep(time.Second)
-				outc <- []byte("something\n")
+				outc <- vmimpl.Chunk{Data: []byte("something\n")}
 			}
 		},
 		Report: &report.Report{
@@ -281,10 +280,10 @@ var tests = []*Test{
 	{
 		Name: "no-no-output",
 		Exit: ExitNormal,
-		Body: func(outc chan []byte, errc chan error) {
+		Body: func(outc chan vmimpl.Chunk, errc chan error) {
 			for i := 0; i < 5; i++ {
 				time.Sleep(time.Second)
-				outc <- []byte(executedProgramsStart + "\n")
+				outc <- vmimpl.Chunk{Data: []byte(executedProgramsStart + "\n")}
 			}
 			errc <- nil
 		},
@@ -292,7 +291,7 @@ var tests = []*Test{
 	{
 		Name: "outc-closed",
 		Exit: ExitTimeout,
-		Body: func(outc chan []byte, errc chan error) {
+		Body: func(outc chan vmimpl.Chunk, errc chan error) {
 			close(outc)
 			time.Sleep(time.Second)
 			errc <- vmimpl.ErrTimeout
@@ -301,9 +300,9 @@ var tests = []*Test{
 	{
 		Name: "lots-of-output",
 		Exit: ExitTimeout,
-		Body: func(outc chan []byte, errc chan error) {
+		Body: func(outc chan vmimpl.Chunk, errc chan error) {
 			for i := 0; i < 100; i++ {
-				outc <- []byte("something\n")
+				outc <- vmimpl.Chunk{Data: []byte("something\n")}
 			}
 			time.Sleep(time.Second)
 			errc <- vmimpl.ErrTimeout
@@ -312,7 +311,7 @@ var tests = []*Test{
 	{
 		Name: "split-line",
 		Exit: ExitNormal,
-		Body: func(outc chan []byte, errc chan error) {
+		Body: func(outc chan vmimpl.Chunk, errc chan error) {
 			// "ODEBUG:" lines should be ignored, however the curPos logic
 			// used to trim the lines so that we could see just "BUG:" later
 			// and detect it as crash.
@@ -324,7 +323,7 @@ var tests = []*Test{
 			}
 			output := buf.Bytes()
 			for i := range output {
-				outc <- output[i : i+1]
+				outc <- vmimpl.Chunk{Data: output[i : i+1]}
 			}
 			errc <- nil
 		},
@@ -332,7 +331,7 @@ var tests = []*Test{
 	{
 		Name: "inject-executing",
 		Exit: ExitNormal,
-		BodyExecuting: func(outc chan []byte, errc chan error, inject chan<- bool) {
+		BodyExecuting: func(outc chan vmimpl.Chunk, errc chan error, inject chan<- bool) {
 			for i := 0; i < 6; i++ {
 				time.Sleep(time.Second)
 				inject <- true
@@ -351,7 +350,7 @@ func TestMonitorExecution(t *testing.T) {
 	}
 }
 
-func makeLinuxAMD64Futex(t *testing.T) (*Instance, *report.Reporter) {
+func makeLinuxAMD64Futex(t *testing.T, poolName string) (*Instance, *report.Reporter) {
 	cfg := &mgrconfig.Config{
 		Derived: mgrconfig.Derived{
 			TargetOS:     targets.Linux,
@@ -365,7 +364,7 @@ func makeLinuxAMD64Futex(t *testing.T) (*Instance, *report.Reporter) {
 			SysTarget: targets.Get(targets.Linux, targets.AMD64),
 		},
 		Workdir: t.TempDir(),
-		Type:    "test",
+		Type:    poolName,
 	}
 	pool, err := Create(cfg, false)
 	if err != nil {
@@ -385,7 +384,7 @@ func makeLinuxAMD64Futex(t *testing.T) (*Instance, *report.Reporter) {
 }
 
 func testMonitorExecution(t *testing.T, test *Test) {
-	inst, reporter := makeLinuxAMD64Futex(t)
+	inst, reporter := makeLinuxAMD64Futex(t, "test")
 	testInst := inst.impl.(*testInstance)
 	testInst.diagnoseBug = test.DiagnoseBug
 	testInst.diagnoseNoWait = test.DiagnoseNoWait
@@ -397,7 +396,7 @@ func testMonitorExecution(t *testing.T, test *Test) {
 		inject = make(chan bool, 10)
 		injectExecuting = WithInjectExecuting(inject)
 	} else {
-		test.BodyExecuting = func(outc chan []byte, errc chan error, inject chan<- bool) {
+		test.BodyExecuting = func(outc chan vmimpl.Chunk, errc chan error, inject chan<- bool) {
 			test.Body(outc, errc)
 		}
 	}
@@ -459,7 +458,7 @@ func TestVMType(t *testing.T) {
 }
 
 func TestExtractMultipleErrors(t *testing.T) {
-	inst, reporter := makeLinuxAMD64Futex(t)
+	inst, reporter := makeLinuxAMD64Futex(t, "test")
 	mon := &monitor{
 		RunOptions: &RunOptions{},
 		inst:       inst,
