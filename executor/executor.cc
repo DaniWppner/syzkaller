@@ -1244,13 +1244,12 @@ uint32 write_signal(flatbuffers::FlatBufferBuilder& fbb, int index, cover_t* cov
 	// Write out feedback signals.
 	// Currently it is code edges computed as xor of two subsequent basic block PCs.
 	fbb.StartVector<uint64_t>(0);
-	cover_data_t* cover_data = (cover_data_t*)(cov->data + cov->data_offset);
-	if ((char*)(cover_data + cov->size) > cov->data_end)
-		failmsg("too much cover", "cov=%u", cov->size);
+	cover_data_t* cover_data = (cover_data_t*)(cov->pc_data);
+	// Checking of data overflow is now done on parse_kcov_buffer
 	uint32 nsig = 0;
 	cover_data_t prev_pc = 0;
 	bool prev_filter = true;
-	for (uint32 i = 0; i < cov->size; i++) {
+	for (uint32 i = 0; i < cov->pc_size; i++) {
 		cover_data_t pc = cover_data[i] + cov->pc_offset;
 		uint64 sig = pc;
 		if (use_cover_edges) {
@@ -1277,8 +1276,8 @@ uint32 write_signal(flatbuffers::FlatBufferBuilder& fbb, int index, cover_t* cov
 template <typename cover_data_t>
 uint32 write_cover(flatbuffers::FlatBufferBuilder& fbb, cover_t* cov)
 {
-	uint32 cover_size = cov->size;
-	cover_data_t* cover_data = (cover_data_t*)(cov->data + cov->data_offset);
+	uint32 cover_size = cov->pc_size;
+	cover_data_t* cover_data = (cover_data_t*)(cov->pc_data);
 	if (flag_dedup_cover) {
 		cover_data_t* end = cover_data + cover_size;
 		std::sort(cover_data, end);
@@ -1393,24 +1392,29 @@ void copyout_call_results(thread_t* th)
 template <typename cover_data_t>
 void parse_kcov_buffer(cover_t* cov)
 {
-	// cov->data is of type char*. Casting it to cover_data_t*
-	// will allow for well-aligned element iteration.  
-	cover_data_t* cover_data = (cover_data_t*)(cov->data + cov->data_offset);
-
-	// we're going to fill tmp_data with pc entries front-to-back,
-	// and back-to-front with store_func_pointer entries.
-	cover_data_t* tmp_data = (cover_data_t*)malloc(sizeof(cover_data_t) * cov->data_size);
-	uint32 tmp_data_end_index = cov->data_size - 1;
-
 	uint32 pc_count = 0;
 	uint32 store_func_count = 0;
-	uint64 i = 1;
+	// cov->data is of type char*. Casting it to cover_data_t*
+	// will allow for well-aligned element iteration.
+	cover_data_t* cover_data = (cover_data_t*)(cov->data + cov->data_offset);
+	// Doing black pointer size arithmetic to figure out
+	// what is actually the last valid index in cover_data will pay out.
+	// This is because cov->data_size is the amount of readable bytes.
+	uint32 data_size_words = (cov->data_size) / sizeof(cover_data_t);
 
+	// We're going to fill tmp_data with pc entries front-to-back,
+	// and back-to-front with store_func_pointer entries.
+	cover_data_t* tmp_data = (cover_data_t*)malloc(cov->data_size);
+	uint32 tmp_data_end_index = data_size_words - 1;
+
+	// Since we're starting from cov->data + cov->data_offset,
+	// position 0 is already the first kcov entry.
+	uint64 i = 0;
 	while (i <= cov->size) {
 		cover_data_t entry_type = cover_data[i];
 
 		if (entry_type == KCOV_ENTRY_TYPE_HEADER_PC) {
-			if (i + KCOV_ENTRY_WORD_SIZE_PC > cov->data_size) {
+			if (i + KCOV_ENTRY_WORD_SIZE_PC > data_size_words) {
 				failmsg("too much cover", "cov=%u", cov->size);
 			}
 			tmp_data[pc_count] = cover_data[i + 1];
@@ -1419,7 +1423,7 @@ void parse_kcov_buffer(cover_t* cov)
 			i += KCOV_ENTRY_WORD_SIZE_PC + 1;
 
 		} else if (entry_type == KCOV_ENTRY_TYPE_HEADER_FUN_POINTER) {
-			if (i + KCOV_ENTRY_WORD_SIZE_FUN_POINTER > cov->data_size) {
+			if (i + KCOV_ENTRY_WORD_SIZE_FUN_POINTER > data_size_words) {
 				failmsg("too much cover", "cov=%u", cov->size);
 			}
 
@@ -1433,25 +1437,25 @@ void parse_kcov_buffer(cover_t* cov)
 			i += KCOV_ENTRY_WORD_SIZE_FUN_POINTER + 1;
 
 		} else {
-			// upcast to uint64 for printf compatibility
-			failmsg("unknown kcov entry type", "type=%llu", (uint64) entry_type);
+			// FIXME: if cover_data_t is uint32, this will probably be the default case,
+			// as the kcov type headers assume 64 bit constants.
+
+			// Upcast to uint64 for printf compatibility
+			failmsg("unknown kcov entry type", "type=%llu", (uint64)entry_type);
 		}
 	}
-	*cover_data = pc_count;
-	uint32 data_idx = 1;
+	uint32 data_idx = 0;
 	uint32 store_func_start;
 
 	// copy all pc entries to the beginning of cover_data
-	for (i = 0; i < pc_count; i++) {
+	for (uint32 i = 0; i < pc_count; i++) {
 		cover_data[data_idx] = tmp_data[i];
 		data_idx++;
 	}
 
 	// copy all store_func_pointer entries just after cover_data
 	store_func_start = data_idx;
-	cover_data[store_func_start] = store_func_count;
-	data_idx++;
-	for (i = 0; i < store_func_count; i++) {
+	for (uint32 i = 0; i < store_func_count; i++) {
 		uint32 curr_idx = tmp_data_end_index - (i * KCOV_ENTRY_WORD_SIZE_FUN_POINTER);
 		cover_data[data_idx] = tmp_data[curr_idx]; // pc
 		cover_data[data_idx + 1] = tmp_data[curr_idx - 1]; // store_addr
@@ -1472,10 +1476,6 @@ void parse_kcov_buffer(cover_t* cov)
 
 void write_output(int index, cover_t* cov, rpc::CallFlag flags, uint32 error, bool all_signal)
 {
-	if (is_kernel_64_bit)
-		parse_kcov_buffer<uint64>(cov);
-	else
-		parse_kcov_buffer<uint32>(cov);
 	CoverAccessScope scope(cov);
 	auto& fbb = *output_builder;
 	const uint32 start_size = output_builder->GetSize();
@@ -1486,6 +1486,14 @@ void write_output(int index, cover_t* cov, rpc::CallFlag flags, uint32 error, bo
 	if (flag_comparisons) {
 		comps_off = write_comparisons(fbb, cov);
 	} else {
+		// write_comparisons still assumes the original kcov formatting,
+		// which is luckily maintained by the patch when kcov_mode = comparisons.
+		// It should be OK to attempt to parse cov->data only when in kcov_mode=pc.
+		if (is_kernel_64_bit)
+			parse_kcov_buffer<uint64>(cov);
+		else
+			parse_kcov_buffer<uint32>(cov);
+
 		if (flag_collect_signal) {
 			if (is_kernel_64_bit)
 				signal_off = write_signal<uint64>(fbb, index, cov, all_signal);
