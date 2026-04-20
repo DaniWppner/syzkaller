@@ -4,6 +4,7 @@
 // +build
 
 #include <algorithm>
+#include <cstdlib>
 #include <errno.h>
 #include <limits.h>
 #include <signal.h>
@@ -339,6 +340,11 @@ static const uint64 arg_csum_chunk_const = 1;
 
 typedef intptr_t(SYSCALLAPI* syscall_t)(intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t);
 
+#define KCOV_ENTRY_TYPE_HEADER_PC 0xdeadbeeffffffffeULL
+#define KCOV_ENTRY_TYPE_HEADER_FUN_POINTER 0xdeadbeefffffffffULL
+#define KCOV_ENTRY_WORD_SIZE_PC 1
+#define KCOV_ENTRY_WORD_SIZE_FUN_POINTER 3
+
 struct call_t {
 	const char* name;
 	int sys_nr;
@@ -379,6 +385,16 @@ struct cover_t {
 	bool overflow;
 	// True if cover_enable() was called for this object.
 	bool enabled;
+
+	// Arrays used to store KCOV data after parsing.
+	// Uninitialized after collection at first.
+	// Array for standard PC coverage
+	char* pc_data;
+	uint32 pc_size;
+
+	// Array for function pointer stores
+	char* store_func_data;
+	uint32 store_func_size;
 };
 
 struct thread_t {
@@ -1374,8 +1390,92 @@ void copyout_call_results(thread_t* th)
 	}
 }
 
+template <typename cover_data_t>
+void parse_kcov_buffer(cover_t* cov)
+{
+	// cov->data is of type char*. Casting it to cover_data_t*
+	// will allow for well-aligned element iteration.  
+	cover_data_t* cover_data = (cover_data_t*)(cov->data + cov->data_offset);
+
+	// we're going to fill tmp_data with pc entries front-to-back,
+	// and back-to-front with store_func_pointer entries.
+	cover_data_t* tmp_data = (cover_data_t*)malloc(sizeof(cover_data_t) * cov->data_size);
+	uint32 tmp_data_end_index = cov->data_size - 1;
+
+	uint32 pc_count = 0;
+	uint32 store_func_count = 0;
+	uint64 i = 1;
+
+	while (i <= cov->size) {
+		cover_data_t entry_type = cover_data[i];
+
+		if (entry_type == KCOV_ENTRY_TYPE_HEADER_PC) {
+			if (i + KCOV_ENTRY_WORD_SIZE_PC > cov->data_size) {
+				failmsg("too much cover", "cov=%u", cov->size);
+			}
+			tmp_data[pc_count] = cover_data[i + 1];
+			pc_count++;
+
+			i += KCOV_ENTRY_WORD_SIZE_PC + 1;
+
+		} else if (entry_type == KCOV_ENTRY_TYPE_HEADER_FUN_POINTER) {
+			if (i + KCOV_ENTRY_WORD_SIZE_FUN_POINTER > cov->data_size) {
+				failmsg("too much cover", "cov=%u", cov->size);
+			}
+
+			uint32 curr_idx = tmp_data_end_index - (store_func_count * KCOV_ENTRY_WORD_SIZE_FUN_POINTER);
+
+			tmp_data[curr_idx] = cover_data[i + 1]; // pc
+			tmp_data[curr_idx - 1] = cover_data[i + 2]; // store_addr
+			tmp_data[curr_idx - 2] = cover_data[i + 3]; // stored_value
+			store_func_count++;
+
+			i += KCOV_ENTRY_WORD_SIZE_FUN_POINTER + 1;
+
+		} else {
+			// upcast to uint64 for printf compatibility
+			failmsg("unknown kcov entry type", "type=%llu", (uint64) entry_type);
+		}
+	}
+	*cover_data = pc_count;
+	uint32 data_idx = 1;
+	uint32 store_func_start;
+
+	// copy all pc entries to the beginning of cover_data
+	for (i = 0; i < pc_count; i++) {
+		cover_data[data_idx] = tmp_data[i];
+		data_idx++;
+	}
+
+	// copy all store_func_pointer entries just after cover_data
+	store_func_start = data_idx;
+	cover_data[store_func_start] = store_func_count;
+	data_idx++;
+	for (i = 0; i < store_func_count; i++) {
+		uint32 curr_idx = tmp_data_end_index - (i * KCOV_ENTRY_WORD_SIZE_FUN_POINTER);
+		cover_data[data_idx] = tmp_data[curr_idx]; // pc
+		cover_data[data_idx + 1] = tmp_data[curr_idx - 1]; // store_addr
+		cover_data[data_idx + 2] = tmp_data[curr_idx - 2]; // stored_value
+		data_idx += KCOV_ENTRY_WORD_SIZE_FUN_POINTER;
+	}
+
+	// We need to cast back to char* in order to be able to store in cov->data.
+	// Fear not as write_signal, etc. will know what format to expect in the byte array.
+	cov->pc_size = pc_count;
+	cov->pc_data = (char*)cover_data;
+
+	cov->store_func_size = store_func_count;
+	cov->store_func_data = (char*)(cover_data + store_func_start);
+
+	free(tmp_data);
+}
+
 void write_output(int index, cover_t* cov, rpc::CallFlag flags, uint32 error, bool all_signal)
 {
+	if (is_kernel_64_bit)
+		parse_kcov_buffer<uint64>(cov);
+	else
+		parse_kcov_buffer<uint32>(cov);
 	CoverAccessScope scope(cov);
 	auto& fbb = *output_builder;
 	const uint32 start_size = output_builder->GetSize();
