@@ -7,6 +7,8 @@ package signal
 import (
 	"fmt"
 	"strings"
+
+	"github.com/google/syzkaller/pkg/flatrpc"
 )
 
 type (
@@ -31,6 +33,23 @@ func (s Signal) Copy() Signal {
 		c[e] = p
 	}
 	return c
+}
+
+func StorePreview(raw []*flatrpc.FuncPointerStore) string {
+	if len(raw) > 0 {
+		var sb strings.Builder
+		sb.WriteByte('[')
+		for i, entry := range raw {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			fmt.Fprintf(&sb, "{PC: 0x%x, StoreAddr: 0x%x, StoredValue: 0x%x}",
+				entry.Pc, entry.StoreAddr, entry.StoreValue)
+		}
+		sb.WriteByte(']')
+		return sb.String()
+	}
+	return ""
 }
 
 func RawPreview(raw []uint64) string {

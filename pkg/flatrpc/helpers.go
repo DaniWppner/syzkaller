@@ -37,6 +37,7 @@ type CorpusTriaged = CorpusTriagedRawT
 type ExecutingMessage = ExecutingMessageRawT
 type CallInfo = CallInfoRawT
 type Comparison = ComparisonRawT
+type FuncPointerStore = StoreFunPointerRawT
 type ExecOpts = ExecOptsRawT
 type ProgInfo = ProgInfoRawT
 type ExecResult = ExecResultRawT

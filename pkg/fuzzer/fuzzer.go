@@ -232,6 +232,9 @@ func (fuzzer *Fuzzer) triageProgCall(p *prog.Prog, info *flatrpc.CallInfo, call 
 	}
 	prio := signalPrio(p, info, call)
 	newMaxSignal := fuzzer.Cover.addRawMaxSignal(info.Signal, prio)
+	fuzzer.Logf(3, "[prog-%p] stored function pointers in call #%d [%s]: %s",
+		p, call, p.CallName(call), signal.StorePreview(info.FuncStores))
+
 	if newMaxSignal.Empty() {
 		return
 	}
