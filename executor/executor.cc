@@ -1274,6 +1274,29 @@ uint32 write_signal(flatbuffers::FlatBufferBuilder& fbb, int index, cover_t* cov
 }
 
 template <typename cover_data_t>
+uint32 write_function_pointer_stores(flatbuffers::FlatBufferBuilder& fbb, cover_t* cov)
+{
+	rpc::StoreFunPointerRaw* out_vector;
+	uint32 store_count = cov->store_func_size;
+	cover_data_t* store_data = (cover_data_t*)(cov->store_func_data);
+	// out_vector will get allocated to a buffer we can write to
+	auto ret_vector = fbb.CreateUninitializedVectorOfStructs<rpc::StoreFunPointerRaw>(
+	    store_count, &out_vector);
+	for (uint32 i = 0; i < store_count; i++) {
+		// This implementation creates a rpc::StoreFunPointerRaw for each entry
+		// without assuming the size of each word will necessatily be uint64
+		uint32 entry_start_index = i * KCOV_ENTRY_WORD_SIZE_FUN_POINTER;
+		out_vector[i] = rpc::StoreFunPointerRaw(
+		    store_data[entry_start_index + cov->pc_offset], // pc
+		    store_data[entry_start_index + 1], // store addr
+		    store_data[entry_start_index + 2] // stored value
+		);
+	}
+	// TO DO: Why is this what we want to return?
+	return ret_vector.o;
+}
+
+template <typename cover_data_t>
 uint32 write_cover(flatbuffers::FlatBufferBuilder& fbb, cover_t* cov)
 {
 	uint32 cover_size = cov->pc_size;
@@ -1483,6 +1506,7 @@ void write_output(int index, cover_t* cov, rpc::CallFlag flags, uint32 error, bo
 	uint32 signal_off = 0;
 	uint32 cover_off = 0;
 	uint32 comps_off = 0;
+	uint32 stores_off = 0;
 	if (flag_comparisons) {
 		comps_off = write_comparisons(fbb, cov);
 	} else {
@@ -1495,10 +1519,13 @@ void write_output(int index, cover_t* cov, rpc::CallFlag flags, uint32 error, bo
 			parse_kcov_buffer<uint32>(cov);
 
 		if (flag_collect_signal) {
-			if (is_kernel_64_bit)
+			if (is_kernel_64_bit) {
 				signal_off = write_signal<uint64>(fbb, index, cov, all_signal);
-			else
+				stores_off = write_function_pointer_stores<uint64>(fbb, cov);
+			} else {
 				signal_off = write_signal<uint32>(fbb, index, cov, all_signal);
+				stores_off = write_function_pointer_stores<uint32>(fbb, cov);
+			}
 		}
 		if (flag_collect_cover) {
 			if (is_kernel_64_bit)
@@ -1513,8 +1540,10 @@ void write_output(int index, cover_t* cov, rpc::CallFlag flags, uint32 error, bo
 		flags |= rpc::CallFlag::CoverageOverflow;
 	builder.add_flags(flags);
 	builder.add_error(error);
-	if (signal_off)
+	if (signal_off) {
 		builder.add_signal(signal_off);
+		builder.add_func_stores(stores_off);
+	}
 	if (cover_off)
 		builder.add_cover(cover_off);
 	if (comps_off)
