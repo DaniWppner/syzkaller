@@ -4,10 +4,13 @@
 package lore
 
 import (
+	"cmp"
 	"fmt"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
+
+	"golang.org/x/exp/maps"
 	"strings"
 
 	"github.com/google/syzkaller/dashboard/dashapi"
@@ -121,8 +124,8 @@ func PatchSeries(emails []*Email) []*Series {
 			series.Corrupted = "0 patches"
 			continue
 		}
-		sort.Slice(series.Patches, func(i, j int) bool {
-			return series.Patches[i].Seq < series.Patches[j].Seq
+		slices.SortFunc(series.Patches, func(a, b Patch) int {
+			return cmp.Compare(a.Seq, b.Seq)
 		})
 	}
 	return ret
@@ -171,7 +174,7 @@ func parsePatchSubject(subject string) (PatchSubject, bool) {
 		}
 		ret.Tags = append(ret.Tags, tag)
 	}
-	sort.Strings(ret.Tags)
+	slices.Sort(ret.Tags)
 	if groups[3] != "" {
 		if val, err := strconv.Atoi(groups[3]); err == nil {
 			ret.Seq.Set(val)
@@ -220,11 +223,12 @@ func (c *parseCtx) process() {
 				unique[id] = struct{}{}
 			}
 		}
-		var ids []string
-		for id := range unique {
-			ids = append(ids, id)
+		ids := maps.Keys(unique)
+		if len(ids) == 0 {
+			ids = nil
+		} else {
+			slices.Sort(ids)
 		}
-		sort.Strings(ids)
 		thread.BugIDs = ids
 	}
 }

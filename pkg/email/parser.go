@@ -13,10 +13,12 @@ import (
 	"net/mail"
 	"net/url"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
+
+	"golang.org/x/exp/maps"
 )
 
 type Email struct {
@@ -179,6 +181,7 @@ func Parse(r io.Reader, ownEmails, goodLists, domains []string) (*Email, error) 
 		mailingList = CanonicalEmail(sender)
 	}
 	date, _ := mail.ParseDate(msg.Header.Get("Date"))
+	date = date.UTC()
 	email := &Email{
 		BugIDs:         unique(bugIDs),
 		MessageID:      msg.Header.Get("Message-ID"),
@@ -534,11 +537,8 @@ func MergeEmailLists(lists ...[]string) []string {
 			merged[addr.Address] = true
 		}
 	}
-	var result []string
-	for e := range merged {
-		result = append(result, e)
-	}
-	sort.Strings(result)
+	result := maps.Keys(merged)
+	slices.Sort(result)
 	if len(result) > maxEmails {
 		result = result[:maxEmails]
 	}
@@ -553,7 +553,7 @@ func mergeRawAddresses(lists ...[]*mail.Address) []string {
 		}
 	}
 	emails = unique(emails)
-	sort.Strings(emails)
+	slices.Sort(emails)
 	return emails
 }
 

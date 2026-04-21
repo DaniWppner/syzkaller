@@ -4,8 +4,10 @@
 package stat
 
 import (
+	"cmp"
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -360,7 +362,7 @@ func (s *set) compress() {
 	s.historyScale *= 2
 	for _, graph := range s.graphs {
 		for _, line := range graph.lines {
-			for i := 0; i < half; i++ {
+			for i := range half {
 				if line.hist != nil {
 					h1, h2 := line.hist[2*i], line.hist[2*i+1]
 					line.hist[2*i], line.hist[2*i+1] = nil, nil
@@ -412,8 +414,8 @@ func (s *set) RenderGraphs() []UIGraph {
 		for _, ln := range graph.lines {
 			lines = append(lines, ln)
 		}
-		sort.Slice(lines, func(i, j int) bool {
-			return lines[i].order < lines[j].order
+		slices.SortFunc(lines, func(a, b *line) int {
+			return cmp.Compare(a.order, b.order)
 		})
 		g := UIGraph{
 			ID:      len(graphs),
@@ -422,19 +424,19 @@ func (s *set) RenderGraphs() []UIGraph {
 			Level:   graph.level,
 			Points:  make([]UIPoint, s.historyPos),
 		}
-		for i := 0; i < s.historyPos; i++ {
+		for i := range s.historyPos {
 			g.Points[i].X = i * tick
 		}
 		for _, ln := range lines {
 			if ln.hist == nil {
 				g.Lines = append(g.Lines, ln.name+": "+ln.desc)
-				for i := 0; i < s.historyPos; i++ {
+				for i := range s.historyPos {
 					g.Points[i].Y = append(g.Points[i].Y, ln.data[i])
 				}
 			} else {
 				for _, percent := range []int{10, 50, 90} {
 					g.Lines = append(g.Lines, fmt.Sprintf("%v%%", percent))
-					for i := 0; i < s.historyPos; i++ {
+					for i := range s.historyPos {
 						v := 0.0
 						if ln.hist[i] != nil {
 							v = ln.hist[i].Quantile(float64(percent) / 100)

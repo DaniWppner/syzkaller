@@ -73,6 +73,7 @@ func run(p *analysis.Pass) (any, error) {
 				pass.checkFlagDefinition(n)
 				pass.checkLogErrorFormat(n)
 				pass.checkSliceClone(n)
+				pass.checkSortUsage(n)
 			case *ast.GenDecl:
 				pass.checkVarDecl(n)
 			case *ast.IfStmt:
@@ -81,6 +82,10 @@ func run(p *analysis.Pass) (any, error) {
 				pass.checkAssignStmt(n)
 			case *ast.InterfaceType:
 				pass.checkInterfaceType(n)
+			case *ast.BlockStmt:
+				pass.checkWhileStyleForLoop(n)
+			case *ast.ForStmt:
+				pass.checkRangeOverIntegers(n)
 			}
 			return true
 		})
@@ -465,5 +470,121 @@ func (pass *Pass) checkAssignStmt(n *ast.AssignStmt) {
 func (pass *Pass) checkInterfaceType(n *ast.InterfaceType) {
 	if len(n.Methods.List) == 0 {
 		pass.report(n, "Use any instead of interface{}")
+	}
+}
+
+// checkSortUsage flags usages of sort.Strings and sort.Slice that can be replaced with slices package.
+func (pass *Pass) checkSortUsage(n *ast.CallExpr) {
+	// Check if the function call is a selector expression (e.g., package.Function).
+	sel, ok := n.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return
+	}
+	// Check if the package name is "sort".
+	ident, ok := sel.X.(*ast.Ident)
+	if !ok || ident.Name != "sort" {
+		return
+	}
+	switch sel.Sel.Name {
+	case "Strings":
+		// Suggest slices.Sort for sort.Strings.
+		pass.report(n, "Use slices.Sort instead of sort.Strings")
+	case "Slice":
+		// For sort.Slice, we expect at least 2 arguments: the slice and the less function.
+		if len(n.Args) < 2 {
+			return
+		}
+		// Check if the second argument is a function literal (anonymous function).
+		fn, ok := n.Args[1].(*ast.FuncLit)
+		if !ok {
+			return
+		}
+		// We only look for simple one-line functions.
+		if len(fn.Body.List) != 1 {
+			return
+		}
+		// Check if the single statement is a return statement.
+		ret, ok := fn.Body.List[0].(*ast.ReturnStmt)
+		if !ok || len(ret.Results) != 1 {
+			return
+		}
+		// Check if the return value is a binary expression (e.g., a < b or a > b).
+		bin, ok := ret.Results[0].(*ast.BinaryExpr)
+		if !ok || (bin.Op != token.LSS && bin.Op != token.GTR) {
+			return // We only look for '<' or '>' operators for simplicity.
+		}
+
+		// Suggest alternatives for any simple one-line predicate using '<'.
+		pass.report(n, "Use slices.Sort or slices.SortFunc instead of sort.Slice with a simple predicate")
+	}
+}
+
+// checkRangeOverIntegers warns about traditional for loops that can be replaced with range over integers.
+func (pass *Pass) checkRangeOverIntegers(n *ast.ForStmt) {
+	if n.Init == nil || n.Cond == nil || n.Post == nil {
+		return
+	}
+
+	// Check Init: i := 0 or i = 0
+	assign, ok := n.Init.(*ast.AssignStmt)
+	if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
+		return
+	}
+	ident, ok := assign.Lhs[0].(*ast.Ident)
+	if !ok {
+		return
+	}
+	if !pass.isIntZeroLiteral(assign.Rhs[0]) {
+		return
+	}
+
+	// Check Cond: i < N
+	bin, ok := n.Cond.(*ast.BinaryExpr)
+	if !ok || bin.Op != token.LSS {
+		return
+	}
+	condIdent, ok := bin.X.(*ast.Ident)
+	if !ok || condIdent.Name != ident.Name {
+		return
+	}
+
+	// Check Post: i++
+	inc, ok := n.Post.(*ast.IncDecStmt)
+	if !ok || inc.Tok != token.INC {
+		return
+	}
+	postIdent, ok := inc.X.(*ast.Ident)
+	if !ok || postIdent.Name != ident.Name {
+		return
+	}
+
+	pass.report(n, "Use range over integer instead of traditional for loop")
+}
+
+// checkWhileStyleForLoop warns about while-style loops with external counter initialization
+// that can be replaced with a traditional for loop header to limit scope.
+func (pass *Pass) checkWhileStyleForLoop(n *ast.BlockStmt) {
+	for i := range len(n.List) - 1 {
+		assign, ok := n.List[i].(*ast.AssignStmt)
+		if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
+			continue
+		}
+		ident, ok := assign.Lhs[0].(*ast.Ident)
+		if !ok || !pass.isIntZeroLiteral(assign.Rhs[0]) {
+			continue
+		}
+		forStmt, ok := n.List[i+1].(*ast.ForStmt)
+		if !ok || forStmt.Init != nil || forStmt.Post != nil || forStmt.Cond == nil {
+			continue
+		}
+		bin, ok := forStmt.Cond.(*ast.BinaryExpr)
+		if !ok || bin.Op != token.LSS {
+			continue
+		}
+		condIdent, ok := bin.X.(*ast.Ident)
+		if !ok || condIdent.Name != ident.Name {
+			continue
+		}
+		pass.report(forStmt, "Consider using for %v := 0; %v < ...; { to scope the loop variable", ident.Name, ident.Name)
 	}
 }

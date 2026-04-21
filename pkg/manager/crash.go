@@ -4,12 +4,12 @@
 package manager
 
 import (
+	"cmp"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -73,7 +73,7 @@ func (cs *CrashStore) SaveCrash(crash *Crash) (bool, error) {
 	// to be able to understand if a particular bug still happens or already fixed.
 	oldestI, first := 0, false
 	var oldestTime time.Time
-	for i := 0; i < cs.MaxCrashLogs; i++ {
+	for i := range cs.MaxCrashLogs {
 		info, err := os.Stat(filepath.Join(dir, fmt.Sprintf("log%v", i)))
 		if err != nil {
 			oldestI = i
@@ -119,7 +119,7 @@ func (cs *CrashStore) HasRepro(title string) bool {
 
 func (cs *CrashStore) MoreReproAttempts(title string) bool {
 	dir := cs.path(title)
-	for i := 0; i < cs.MaxReproLogs; i++ {
+	for i := range cs.MaxReproLogs {
 		if !osutil.IsExist(filepath.Join(dir, fmt.Sprintf("repro%v", i))) {
 			return true
 		}
@@ -130,7 +130,7 @@ func (cs *CrashStore) MoreReproAttempts(title string) bool {
 func (cs *CrashStore) SaveFailedRepro(title string, log []byte) error {
 	dir := cs.path(title)
 	osutil.MkdirAll(dir)
-	for i := 0; i < cs.MaxReproLogs; i++ {
+	for i := range cs.MaxReproLogs {
 		name := filepath.Join(dir, fmt.Sprintf("repro%v", i))
 		if !osutil.IsExist(name) && len(log) > 0 {
 			err := osutil.WriteFile(name, log)
@@ -311,8 +311,8 @@ func (cs *CrashStore) BugInfo(id string, full bool) (*BugInfo, error) {
 			crash.Report = reportFile
 		}
 	}
-	sort.Slice(ret.Crashes, func(i, j int) bool {
-		return ret.Crashes[i].Time.After(ret.Crashes[j].Time)
+	slices.SortFunc(ret.Crashes, func(a, b *CrashInfo) int {
+		return b.Time.Compare(a.Time)
 	})
 	return ret, nil
 }
@@ -401,8 +401,8 @@ func (cs *CrashStore) BugList() ([]*BugInfo, error) {
 		}
 		ret = append(ret, info)
 	}
-	sort.Slice(ret, func(i, j int) bool {
-		return strings.ToLower(ret[i].Title) < strings.ToLower(ret[j].Title)
+	slices.SortFunc(ret, func(a, b *BugInfo) int {
+		return cmp.Compare(strings.ToLower(a.Title), strings.ToLower(b.Title))
 	})
 	if lastErr != nil {
 		log.Logf(0, "some stored crashes are inconsistent: %d skipped, last error %v", errCount, lastErr)

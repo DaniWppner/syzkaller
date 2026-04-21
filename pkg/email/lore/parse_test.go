@@ -5,7 +5,7 @@ package lore
 
 import (
 	"fmt"
-	"sort"
+	"slices"
 	"testing"
 	"time"
 
@@ -109,7 +109,7 @@ Content-Type: text/plain
 Bug report`,
 	}
 
-	zone := time.FixedZone("", -7*60*60)
+	zone := time.UTC
 	expected := map[string]*Thread{
 		"<A-Base>": {
 			Subject:   "Thread A",
@@ -120,7 +120,7 @@ Bug report`,
 					Email: &email.Email{
 						MessageID: "<A-Base>",
 						Subject:   "Thread A",
-						Date:      time.Date(2017, time.May, 7, 19, 54, 0, 0, zone),
+						Date:      time.Date(2017, time.May, 8, 2, 54, 0, 0, zone),
 						Author:    "a@user.com",
 						Cc:        []string{"a@user.com"},
 					},
@@ -129,7 +129,7 @@ Bug report`,
 					Email: &email.Email{
 						MessageID: "<A-Child-1>",
 						Subject:   "Re: Thread A",
-						Date:      time.Date(2017, time.May, 7, 19, 55, 0, 0, zone),
+						Date:      time.Date(2017, time.May, 8, 2, 55, 0, 0, zone),
 						Author:    "b@user.com",
 						Cc:        []string{"a@user.com", "b@user.com"},
 						InReplyTo: "<A-Base>",
@@ -139,7 +139,7 @@ Bug report`,
 					Email: &email.Email{
 						MessageID: "<A-Child-1-1>",
 						Subject:   "Re: Re: Thread A",
-						Date:      time.Date(2017, time.May, 7, 19, 56, 0, 0, zone),
+						Date:      time.Date(2017, time.May, 8, 2, 56, 0, 0, zone),
 						Author:    "c@user.com",
 						Cc:        []string{"a@user.com", "b@user.com", "c@user.com"},
 						InReplyTo: "<A-Child-1>",
@@ -158,9 +158,10 @@ Bug report`,
 						MessageID: "<Bug>",
 						BugIDs:    []string{"4564456"},
 						Subject:   "[syzbot] Some bug",
-						Date:      time.Date(2017, time.May, 7, 19, 57, 0, 0, zone),
+						Date:      time.Date(2017, time.May, 8, 2, 57, 0, 0, zone),
 						Author:    "syzbot@bar.com",
 						OwnEmail:  true,
+						Cc:        []string{},
 					},
 				},
 				{
@@ -168,7 +169,7 @@ Bug report`,
 						MessageID: "<Bug-Reply1>",
 						BugIDs:    []string{"4564456"},
 						Subject:   "Re: [syzbot] Some bug",
-						Date:      time.Date(2017, time.May, 7, 19, 58, 0, 0, zone),
+						Date:      time.Date(2017, time.May, 8, 2, 58, 0, 0, zone),
 						Author:    "c@user.com",
 						Cc:        []string{"c@user.com"},
 						InReplyTo: "<Bug>",
@@ -179,7 +180,7 @@ Bug report`,
 						MessageID: "<Bug-Reply2>",
 						BugIDs:    []string{"4564456"},
 						Subject:   "Re: [syzbot] Some bug",
-						Date:      time.Date(2017, time.May, 7, 19, 58, 1, 0, zone),
+						Date:      time.Date(2017, time.May, 8, 2, 58, 1, 0, zone),
 						Author:    "d@user.com",
 						Cc:        []string{"d@user.com"},
 						InReplyTo: "<Bug>",
@@ -198,7 +199,7 @@ Bug report`,
 						MessageID: "<Patch>",
 						BugIDs:    []string{"12345"},
 						Subject:   "[PATCH] Some bug fixed",
-						Date:      time.Date(2017, time.May, 7, 19, 58, 1, 0, zone),
+						Date:      time.Date(2017, time.May, 8, 2, 58, 1, 0, zone),
 						Author:    "e@user.com",
 						Cc:        []string{"e@user.com"},
 					},
@@ -215,7 +216,7 @@ Bug report`,
 					Email: &email.Email{
 						MessageID: "<Sub-Discussion>",
 						InReplyTo: "<Unknown>",
-						Date:      time.Date(2017, time.May, 7, 19, 57, 0, 0, zone),
+						Date:      time.Date(2017, time.May, 8, 2, 57, 0, 0, zone),
 						BugIDs:    []string{"4564456"},
 						Cc:        []string{"person@email.com"},
 						Subject:   "Another bug discussion",
@@ -243,8 +244,8 @@ Bug report`,
 	got := map[string]*Thread{}
 
 	for _, d := range threads {
-		sort.Slice(d.Messages, func(i, j int) bool {
-			return d.Messages[i].Date.Before(d.Messages[j].Date)
+		slices.SortFunc(d.Messages, func(a, b *Email) int {
+			return a.Date.Compare(b.Date)
 		})
 		got[d.MessageID] = d
 	}

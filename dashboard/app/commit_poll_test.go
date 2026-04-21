@@ -4,7 +4,7 @@
 package main
 
 import (
-	"sort"
+	"slices"
 	"testing"
 
 	"github.com/google/syzkaller/dashboard/dashapi"
@@ -44,11 +44,11 @@ func TestCommitPoll(t *testing.T) {
 	c.expectEQ(reply.OK, true)
 
 	// The commit should appear in commit poll.
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		commitPollResp, err = c.client.CommitPoll()
 		c.expectOK(err)
 		c.expectEQ(len(commitPollResp.Commits), 2)
-		sort.Strings(commitPollResp.Commits)
+		slices.Sort(commitPollResp.Commits)
 		c.expectEQ(commitPollResp.Commits[0], "foo: fix1")
 		c.expectEQ(commitPollResp.Commits[1], "foo: fix2")
 	}
@@ -64,7 +64,7 @@ func TestCommitPoll(t *testing.T) {
 	commitPollResp, err = c.client.CommitPoll()
 	c.expectOK(err)
 	c.expectEQ(len(commitPollResp.Commits), 2)
-	sort.Strings(commitPollResp.Commits)
+	slices.Sort(commitPollResp.Commits)
 	c.expectEQ(commitPollResp.Commits[0], "foo: fix1")
 	c.expectEQ(commitPollResp.Commits[1], "foo: fix2")
 

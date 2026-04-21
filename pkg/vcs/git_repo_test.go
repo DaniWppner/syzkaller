@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"testing"
 
 	"github.com/google/syzkaller/pkg/debugtracer"
@@ -299,7 +299,7 @@ func TestBisect(t *testing.T) {
 	repoDir := t.TempDir()
 	repo := MakeTestRepo(t, repoDir)
 	var commits []string
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		repo.CommitChange(fmt.Sprintf("commit %v", i))
 		com, err := repo.repo.Commit(HEAD)
 		if err != nil {
@@ -379,8 +379,8 @@ func TestBisect(t *testing.T) {
 		for _, com := range result {
 			got = append(got, com.Hash)
 		}
-		sort.Strings(got) // git result order is non-deterministic (wat)
-		sort.Strings(test.result)
+		slices.Sort(got) // git result order is non-deterministic (wat)
+		slices.Sort(test.result)
 		if !assert.Equal(t, test.result, got) {
 			t.Logf("result: %+v", got)
 			t.FailNow()
