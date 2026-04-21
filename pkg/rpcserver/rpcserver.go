@@ -69,6 +69,7 @@ type Manager interface {
 	BugFrames() (leaks []string, races []string)
 	MachineChecked(features flatrpc.Feature, syscalls map[*prog.Syscall]bool) (queue.Source, error)
 	CoverageFilter(modules []*vminfo.KernelModule) ([]uint64, error)
+	DebugFilter(modules []*vminfo.KernelModule) ([]uint64, error)
 }
 
 type Server interface {
@@ -100,6 +101,7 @@ type server struct {
 	setupFeatures    flatrpc.Feature
 	canonicalModules *cover.Canonicalizer
 	coverFilter      []uint64
+	debugFilter      []uint64
 
 	mu            sync.Mutex
 	runners       map[int]*Runner
@@ -389,6 +391,11 @@ func (serv *server) handleMachineInfo(infoReq *flatrpc.InfoRequestRawT) (handsha
 		serv.canonicalModules = cover.NewCanonicalizer(modules, serv.cfg.Cover)
 		var err error
 		serv.coverFilter, err = serv.mgr.CoverageFilter(modules)
+		if err != nil {
+			retErr = fmt.Errorf("%w: %w", errFatal, err)
+			return
+		}
+		serv.debugFilter, err = serv.mgr.DebugFilter(modules)
 		if err != nil {
 			retErr = fmt.Errorf("%w: %w", errFatal, err)
 			return

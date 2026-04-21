@@ -208,3 +208,46 @@ func sortUsage() {
 		return ints[i] > ints[j]
 	})
 }
+
+func rangeOverIntegers() {
+	for i := 0; i < 10; i++ { // want "Use range over integer instead of traditional for loop"
+	}
+
+	count := 10
+	for i := 0; i < count; i++ { // want "Use range over integer instead of traditional for loop"
+	}
+
+	// Negative cases.
+	for i := 1; i < 10; i++ {
+	}
+	for i := 0; i <= 10; i++ {
+	}
+	for i := 0; i < 10; i += 2 {
+	}
+	for i := 10; i > 0; i-- {
+	}
+}
+
+func whileStyleLoops() {
+	i := 0
+	for i < 10 { // want "Consider using for i := 0; i < ...; { to scope the loop variable"
+		i++
+	}
+
+	count := 10
+	j := 0
+	for j < count { // want "Consider using for j := 0; j < ...; { to scope the loop variable"
+		j++
+	}
+
+	// Negative cases.
+	k := 1
+	for k < 10 {
+		k++
+	}
+
+	l := 0
+	for l <= 10 {
+		l++
+	}
+}

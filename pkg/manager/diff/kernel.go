@@ -246,6 +246,10 @@ func (kc *kernelContext) CoverageFilter(modules []*vminfo.KernelModule) ([]uint6
 	return pcs, nil
 }
 
+func (kc *kernelContext) DebugFilter(modules []*vminfo.KernelModule) ([]uint64, error) {
+	return []uint64{}, nil
+}
+
 func (kc *kernelContext) fuzzerInstance(ctx context.Context, inst *vm.Instance, updInfo dispatcher.UpdateInfo) {
 	index := inst.Index()
 	injectExec := make(chan bool, 10)

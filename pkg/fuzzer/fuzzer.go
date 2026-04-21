@@ -167,8 +167,9 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 				queue:    queue.Append(),
 				calls:    triage,
 				info: &JobInfo{
-					Name: req.Prog.String(),
-					Type: "triage",
+					Name:   req.Prog.String(),
+					Type:   "triage",
+					ProgId: fmt.Sprintf("%p", req.Prog),
 				},
 			}
 			for id := range triage {
@@ -222,6 +223,7 @@ type Config struct {
 	NewInputFilter func(call string) bool
 	PatchTest      bool
 	ModeKFuzzTest  bool
+	DebugFilters   map[uint64]struct{}
 }
 
 func (fuzzer *Fuzzer) triageProgCall(p *prog.Prog, info *flatrpc.CallInfo, call int, triage *map[int]*triageCall) {
@@ -236,7 +238,7 @@ func (fuzzer *Fuzzer) triageProgCall(p *prog.Prog, info *flatrpc.CallInfo, call 
 	if !fuzzer.Config.NewInputFilter(p.CallName(call)) {
 		return
 	}
-	fuzzer.Logf(2, "found new signal in call %d in %s", call, p)
+	fuzzer.Logf(3, "found new signal in call #%d [%s] in %s", call, p.CallName(call), p)
 	if *triage == nil {
 		*triage = make(map[int]*triageCall)
 	}
@@ -326,6 +328,11 @@ func (fuzzer *Fuzzer) startJob(stat *stat.Val, newJob job) {
 		}
 
 		newJob.run(fuzzer)
+
+		if job_obj, ok := newJob.(jobIntrospector); ok {
+			job_logbytes := job_obj.getInfo().Bytes()
+			fuzzer.Logf(5, string(job_logbytes))
+		}
 	}()
 }
 

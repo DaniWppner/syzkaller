@@ -4,6 +4,11 @@
 // Package signal provides types for working with feedback signal.
 package signal
 
+import (
+	"fmt"
+	"strings"
+)
+
 type (
 	elemType uint64
 	prioType int8
@@ -26,6 +31,22 @@ func (s Signal) Copy() Signal {
 		c[e] = p
 	}
 	return c
+}
+
+func RawPreview(raw []uint64) string {
+	if len(raw) > 0 {
+		var sb strings.Builder
+		sb.WriteString(" (")
+		for i, x := range raw {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			fmt.Fprintf(&sb, "0x%x", x)
+		}
+		sb.WriteByte(')')
+		return sb.String()
+	}
+	return ""
 }
 
 func FromRaw(raw []uint64, prio uint8) Signal {

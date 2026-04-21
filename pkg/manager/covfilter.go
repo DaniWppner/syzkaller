@@ -136,6 +136,29 @@ type CoverageFilters struct {
 	ExecutorFilter map[uint64]struct{}
 }
 
+func PrepareDebugFilters(source *ReportGeneratorWrapper, cfg *mgrconfig.Config, strict bool) (map[uint64]struct{}, error) {
+	ret := make(map[uint64]struct{})
+	for _, cfgFilter := range cfg.Experimental.DebugFilters {
+		pcs, err := CoverageFilter(source, cfgFilter, strict)
+		if err != nil {
+			return ret, err
+		}
+		// This is copy-pasted from PrepareCoverageFilters
+		// KCOV will point to the next instruction, so we need to adjust the map.
+		for pc := range pcs {
+			next := backend.NextInstructionPC(cfg.SysTarget, cfg.Type, pc)
+			ret[next] = struct{}{}
+		}
+	}
+	keys := make([]uint64, 0, len(ret))
+	for k := range ret {
+		keys = append(keys, k)
+	}
+	log.Logf(3, "debug coverage filter PCs: %#x", keys)
+
+	return ret, nil
+}
+
 func PrepareCoverageFilters(source *ReportGeneratorWrapper, cfg *mgrconfig.Config,
 	strict bool) (CoverageFilters, error) {
 	var ret CoverageFilters

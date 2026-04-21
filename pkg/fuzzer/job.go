@@ -29,10 +29,11 @@ type jobIntrospector interface {
 }
 
 type JobInfo struct {
-	Name  string
-	Calls []string
-	Type  string
-	Execs atomic.Int32
+	Name   string
+	Calls  []string
+	Type   string
+	Execs  atomic.Int32
+	ProgId string
 
 	syncBuffer
 }
@@ -69,6 +70,19 @@ func mutateProgRequest(fuzzer *Fuzzer, rnd *rand.Rand) *queue.Request {
 		ExecOpts: setFlags(flatrpc.ExecFlagCollectSignal),
 		Stat:     fuzzer.statExecFuzz,
 	}
+}
+
+func filteredCoverage(slice []uint64, set map[uint64]struct{}) []uint64 {
+	res := make([]uint64, 0, len(slice))
+	if len(slice) == 0 || len(set) == 0 {
+		return res
+	}
+	for _, v := range slice {
+		if _, ok := set[v]; ok {
+			res = append(res, v)
+		}
+	}
+	return res
 }
 
 // triageJob are programs for which we noticed potential new coverage during
@@ -143,6 +157,12 @@ func (job *triageJob) run(fuzzer *Fuzzer) {
 	for call, info := range job.calls {
 		job.info.Logf("call #%d [%s]: |new signal|=%d%s",
 			call, job.p.CallName(call), info.newSignal.Len(), signalPreview(info.newSignal))
+
+		filteredRawSignal := filteredCoverage(info.newSignal.ToRaw(), job.fuzzer.Config.DebugFilters)
+		if len(filteredRawSignal) > 0 {
+			job.info.Logf("call #%d [%s]: |new filtered signal|=%d%s",
+				call, job.p.CallName(call), len(filteredRawSignal), signal.RawPreview(filteredRawSignal))
+		}
 	}
 
 	// Compute input coverage and non-flaky signal for minimization.
@@ -174,6 +194,12 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 		}
 	}
 	callName := p.CallName(call)
+
+	filteredRaw := filteredCoverage(info.cover.Serialize(), job.fuzzer.Config.DebugFilters)
+	if len(filteredRaw) > 0 {
+		job.info.Logf("handle call #%d [%s] with flagged coverage: %s", call, callName, signal.RawPreview(filteredRaw))
+	}
+
 	if !job.fuzzer.Config.NewInputFilter(callName) {
 		return
 	}
@@ -182,9 +208,10 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 			exec: job.fuzzer.smashQueue,
 			p:    p.Clone(),
 			info: &JobInfo{
-				Name:  p.String(),
-				Type:  "smash",
-				Calls: []string{p.CallName(call)},
+				Name:   p.String(),
+				Type:   "smash",
+				Calls:  []string{p.CallName(call)},
+				ProgId: job.info.ProgId,
 			},
 		})
 		if job.fuzzer.Config.Comparisons && call >= 0 {
@@ -193,9 +220,10 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 				p:    p.Clone(),
 				call: call,
 				info: &JobInfo{
-					Name:  p.String(),
-					Type:  "hints",
-					Calls: []string{p.CallName(call)},
+					Name:   p.String(),
+					Type:   "hints",
+					Calls:  []string{p.CallName(call)},
+					ProgId: job.info.ProgId,
 				},
 			})
 		}
@@ -204,10 +232,16 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 				exec: job.fuzzer.smashQueue,
 				p:    p.Clone(),
 				call: call,
+				info: &JobInfo{
+					Name:   p.String(),
+					Type:   "fault-injection",
+					Calls:  []string{p.CallName(call)},
+					ProgId: job.info.ProgId,
+				},
 			})
 		}
 	}
-	job.fuzzer.Logf(2, "added new input for %v to the corpus: %s", callName, p)
+	job.info.Logf("added new input for #%d [%s] to the corpus with program:\n%s", call, callName, p.Serialize())
 	input := corpus.NewInput{
 		Prog:     p,
 		Call:     call,
@@ -266,6 +300,9 @@ func (job *triageJob) deflake(exec func(*queue.Request, ProgFlags) *queue.Result
 			if len(info.rawCover) == 0 && job.fuzzer.Config.FetchRawCover {
 				info.rawCover = res.Cover
 			}
+			if len(filteredCoverage(res.Cover, job.fuzzer.Config.DebugFilters)) > 0 {
+				job.info.Logf("call #%d [%s] triggered flagged coverage during deflake", call, job.p.CallName(call))
+			}
 			// Since the signal is frequently flaky, we may get some new new max signal.
 			// Merge it into the new signal we are chasing.
 			// Most likely we won't conclude it's stable signal b/c we already have at least one
@@ -296,6 +333,14 @@ func (job *triageJob) deflake(exec func(*queue.Request, ProgFlags) *queue.Result
 		job.info.Logf("call #%d [%s]: |stable signal|=%d, |new stable signal|=%d%s",
 			call, job.p.CallName(call), info.stableSignal.Len(), info.newStableSignal.Len(),
 			signalPreview(info.newStableSignal))
+
+		newStableFilteredSignal := filteredCoverage(info.newStableSignal.ToRaw(), job.fuzzer.Config.DebugFilters)
+		stableFilteredSignal := filteredCoverage(info.stableSignal.ToRaw(), job.fuzzer.Config.DebugFilters)
+
+		if len(stableFilteredSignal) > 0 {
+			job.info.Logf("call #%d [%s]: |stable filtered signal|=%d, |new stable filtered signal|=%d%s",
+				call, job.p.CallName(call), len(stableFilteredSignal), len(newStableFilteredSignal), signal.RawPreview(newStableFilteredSignal))
+		}
 	}
 	return false
 }
@@ -341,7 +386,7 @@ func (job *triageJob) stopDeflake(run, needRuns int, noNewSignal bool) bool {
 }
 
 func (job *triageJob) minimize(call int, info *triageCall) (*prog.Prog, int) {
-	job.info.Logf("[call #%d] minimize started", call)
+	job.info.Logf("call #%d [%s]: minimize started", call, job.p.CallName(call))
 	minimizeAttempts := 3
 	if job.fuzzer.Config.Snapshot {
 		minimizeAttempts = 2
@@ -356,7 +401,7 @@ func (job *triageJob) minimize(call int, info *triageCall) (*prog.Prog, int) {
 			return false
 		}
 		var mergedSignal signal.Signal
-		for i := 0; i < minimizeAttempts; i++ {
+		for range minimizeAttempts {
 			result := job.execute(&queue.Request{
 				Prog:            p1,
 				ExecOpts:        setFlags(flatrpc.ExecFlagCollectSignal),
@@ -378,12 +423,12 @@ func (job *triageJob) minimize(call int, info *triageCall) (*prog.Prog, int) {
 				mergedSignal.Merge(thisSignal)
 			}
 			if info.newStableSignal.Intersection(mergedSignal).Len() == info.newStableSignal.Len() {
-				job.info.Logf("[call #%d] minimization step success (|calls| = %d)",
-					call, len(p1.Calls))
+				job.info.Logf("call #%d [%s] minimization step success (|calls| = %d)",
+					call, job.p.CallName(call), len(p1.Calls))
 				return true
 			}
 		}
-		job.info.Logf("[call #%d] minimization step failure", call)
+		job.info.Logf("call #%d [%s] minimization step failure", call, job.p.CallName(call))
 		return false
 	})
 	if stop {
@@ -445,12 +490,12 @@ type smashJob struct {
 }
 
 func (job *smashJob) run(fuzzer *Fuzzer) {
-	fuzzer.Logf(2, "smashing the program %s:", job.p)
+	job.info.Logf("smashing the program %s:", job.p)
 	job.info.Logf("\n%s", job.p.Serialize())
 
 	const iters = 25
 	rnd := fuzzer.rand()
-	for i := 0; i < iters; i++ {
+	for range iters {
 		p := job.p.Clone()
 		p.Mutate(rnd, prog.RecommendedCalls,
 			fuzzer.ChoiceTable(),
@@ -498,12 +543,13 @@ type faultInjectionJob struct {
 	exec queue.Executor
 	p    *prog.Prog
 	call int
+	info *JobInfo
 }
 
 func (job *faultInjectionJob) run(fuzzer *Fuzzer) {
 	for nth := 1; nth <= 100; nth++ {
-		fuzzer.Logf(2, "injecting fault into call %v, step %v",
-			job.call, nth)
+		job.info.Logf("injecting fault into call #%d [%s], step %v",
+			job.call, job.p.CallName(job.call), nth)
 		newProg := job.p.Clone()
 		newProg.Calls[job.call].Props.FailNth = nth
 		result := fuzzer.execute(job.exec, &queue.Request{
@@ -521,6 +567,10 @@ func (job *faultInjectionJob) run(fuzzer *Fuzzer) {
 	}
 }
 
+func (job *faultInjectionJob) getInfo() *JobInfo {
+	return job.info
+}
+
 type hintsJob struct {
 	exec queue.Executor
 	p    *prog.Prog
@@ -535,7 +585,7 @@ func (job *hintsJob) run(fuzzer *Fuzzer) {
 	job.info.Logf("\n%s", p.Serialize())
 
 	var comps prog.CompMap
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		result := fuzzer.execute(job.exec, &queue.Request{
 			Prog:     p,
 			ExecOpts: setFlags(flatrpc.ExecFlagCollectComps),
@@ -587,13 +637,13 @@ type syncBuffer struct {
 	buf bytes.Buffer
 }
 
-func (sb *syncBuffer) Logf(logFmt string, args ...any) {
-	sb.mu.Lock()
-	defer sb.mu.Unlock()
+func (ji *JobInfo) Logf(logFmt string, args ...any) {
+	ji.mu.Lock()
+	defer ji.mu.Unlock()
 
-	fmt.Fprintf(&sb.buf, "%s: ", time.Now().Format(time.DateTime))
-	fmt.Fprintf(&sb.buf, logFmt, args...)
-	sb.buf.WriteByte('\n')
+	fmt.Fprintf(&ji.buf, "%s [%s-%s] [prog-%s]: ", time.Now().Format(time.DateTime), ji.Type, ji.ID(), ji.ProgId)
+	fmt.Fprintf(&ji.buf, logFmt, args...)
+	ji.buf.WriteByte('\n')
 }
 
 func (sb *syncBuffer) Bytes() []byte {

@@ -259,6 +259,11 @@ type Experimental struct {
 	// E.g. "focus_areas": [ {"filter": {"files": ["^net"]}, "weight": 10.0}, {"weight": 1.0} ].
 	FocusAreas []FocusArea `json:"focus_areas,omitempty"`
 
+	// DebugFilters is like FocusAreas:
+	// It configures for what areas of the kernel syzkaller should provide additional debug information.
+	// For example, whenever a TriageJob handles coverage that covers an area matching the filter, output additional information regarding that triage.
+	DebugFilters []CovFilterCfg `json:"debug_filters,omitempty"`
+
 	// Enable dynamic discovery and fuzzing of KFuzzTest targets.
 	EnableKFuzzTest bool `json:"enable_kfuzztest"`
 }

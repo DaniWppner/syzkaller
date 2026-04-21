@@ -84,6 +84,7 @@ type Manager struct {
 	reportGenerator *manager.ReportGeneratorWrapper
 	fresh           bool
 	coverFilters    manager.CoverageFilters
+	debugFilters    map[uint64]struct{}
 
 	dash *dashapi.Dashboard
 	// This is specifically separated from dash, so that we can keep dash = nil when
@@ -1238,9 +1239,6 @@ func (mgr *Manager) MachineChecked(features flatrpc.Feature,
 			NoMutateCalls:  mgr.cfg.NoMutateCalls,
 			FetchRawCover:  mgr.cfg.RawCover,
 			Logf: func(level int, msg string, args ...any) {
-				if level != 0 {
-					return
-				}
 				log.Logf(level, msg, args...)
 			},
 			NewInputFilter: func(call string) bool {
@@ -1249,6 +1247,7 @@ func (mgr *Manager) MachineChecked(features flatrpc.Feature,
 				return !mgr.saturatedCalls[call]
 			},
 			ModeKFuzzTest: mgr.cfg.Experimental.EnableKFuzzTest,
+			DebugFilters:  mgr.debugFilters,
 		}, rnd, mgr.target)
 		fuzzerObj.AddCandidates(candidates)
 		mgr.fuzzer.Store(fuzzerObj)
@@ -1540,6 +1539,20 @@ func (mgr *Manager) dashboardReproTasks() {
 			}
 		}
 	}
+}
+
+func (mgr *Manager) DebugFilter(modules []*vminfo.KernelModule) ([]uint64, error) {
+	filters, err := manager.PrepareDebugFilters(mgr.reportGenerator, mgr.cfg, true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to init debug filter: %w", err)
+	}
+	mgr.debugFilters = filters
+	// No store in mgr.http.Cover?
+	var pcs []uint64
+	for pc := range filters {
+		pcs = append(pcs, pc)
+	}
+	return pcs, nil
 }
 
 func (mgr *Manager) CoverageFilter(modules []*vminfo.KernelModule) ([]uint64, error) {
