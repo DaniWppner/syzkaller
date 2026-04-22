@@ -103,7 +103,7 @@ static NORETURN void doexit_thread(int status);
 static PRINTF(1, 2) void debug(const char* msg, ...);
 void debug_dump_data(const char* data, int length);
 
-#if 0
+#if 1
 #define debug_verbose(...) debug(__VA_ARGS__)
 #else
 #define debug_verbose(...) (void)0
@@ -1433,7 +1433,7 @@ void parse_kcov_buffer(cover_t* cov)
 	// Since we're starting from cov->data + cov->data_offset,
 	// position 0 is already the first kcov entry.
 	uint64 i = 0;
-	while (i <= cov->size) {
+	while (i < cov->size) {
 		cover_data_t entry_type = cover_data[i];
 
 		if (entry_type == KCOV_ENTRY_TYPE_HEADER_PC) {
@@ -1513,10 +1513,12 @@ void write_output(int index, cover_t* cov, rpc::CallFlag flags, uint32 error, bo
 		// write_comparisons still assumes the original kcov formatting,
 		// which is luckily maintained by the patch when kcov_mode = comparisons.
 		// It should be OK to attempt to parse cov->data only when in kcov_mode=pc.
+		debug("parse_kcov_buffer on call %d start", index);
 		if (is_kernel_64_bit)
 			parse_kcov_buffer<uint64>(cov);
 		else
 			parse_kcov_buffer<uint32>(cov);
+		debug("parse_kcov_buffer on call %d ended", index);
 
 		if (flag_collect_signal) {
 			if (is_kernel_64_bit) {
@@ -1557,8 +1559,8 @@ void write_output(int index, cover_t* cov, rpc::CallFlag flags, uint32 error, bo
 	call.offset = off;
 	output_data->consumed.store(output_builder->GetSize(), std::memory_order_release);
 	output_data->completed.store(slot + 1, std::memory_order_release);
-	debug_verbose("out #%u: index=%u errno=%d flags=0x%x total_size=%u\n",
-		      slot + 1, index, error, static_cast<unsigned>(flags), call.data_size - start_size);
+	debug_verbose("out #%u: index=%u errno=%d flags=0x%x total_size=?\n",
+		      slot + 1, index, error, static_cast<unsigned>(flags));
 }
 
 void write_call_output(thread_t* th, bool finished)
