@@ -43,7 +43,7 @@ func StorePreview(raw []*flatrpc.FuncPointerStore) string {
 			if i > 0 {
 				sb.WriteString(", ")
 			}
-			fmt.Fprintf(&sb, "{PC: 0x%x, StoreAddr: 0x%x, StoredValue: 0x%x}",
+			fmt.Fprintf(&sb, "{\"PC\": \"0x%x\", \"StoreAddr\": \"0x%x\", \"StoredValue\": \"0x%x\"}",
 				entry.Pc, entry.StoreAddr, entry.StoreValue)
 		}
 		sb.WriteByte(']')
