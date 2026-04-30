@@ -6,15 +6,18 @@ package fuzzer
 import (
 	"sync"
 
+	"github.com/google/syzkaller/pkg/cover"
 	"github.com/google/syzkaller/pkg/signal"
 	"github.com/google/syzkaller/pkg/stat"
 )
 
 // Cover keeps track of the signal known to the fuzzer.
 type Cover struct {
-	mu        sync.RWMutex
-	maxSignal signal.Signal // max signal ever observed (including flakes)
-	newSignal signal.Signal // newly identified max signal
+	mu                       sync.RWMutex
+	maxSignal                signal.Signal          // max signal ever observed (including flakes)
+	newSignal                signal.Signal          // newly identified max signal
+	maxFuncPointerStateCover cover.FuncPointerCover // max function pointer state coverage observed
+	newFuncPointerStateCover cover.FuncPointerCover // newly identified pointer state coverage (clarify the need of these two)
 }
 
 func newCover() *Cover {

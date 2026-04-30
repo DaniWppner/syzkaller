@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/syzkaller/pkg/corpus"
+	"github.com/google/syzkaller/pkg/cover"
 	"github.com/google/syzkaller/pkg/csource"
 	"github.com/google/syzkaller/pkg/flatrpc"
 	"github.com/google/syzkaller/pkg/fuzzer/queue"
@@ -233,7 +234,7 @@ func (fuzzer *Fuzzer) triageProgCall(p *prog.Prog, info *flatrpc.CallInfo, call 
 	prio := signalPrio(p, info, call)
 	newMaxSignal := fuzzer.Cover.addRawMaxSignal(info.Signal, prio)
 	fuzzer.Logf(3, "[prog-%p] stored function pointers in call #%d [%s]: %s",
-		p, call, p.CallName(call), signal.StorePreview(info.FuncStores))
+		p, call, p.CallName(call), cover.StorePreview(info.FuncStores))
 
 	if newMaxSignal.Empty() {
 		return

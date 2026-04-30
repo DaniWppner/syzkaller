@@ -102,15 +102,18 @@ type triageJob struct {
 }
 
 type triageCall struct {
-	errno     int32
-	newSignal signal.Signal
+	errno               int32
+	newSignal           signal.Signal
+	newFuncPointerCover cover.FuncPointerCover
 
 	// Filled after deflake:
-	signals         [deflakeNeedRuns]signal.Signal
-	stableSignal    signal.Signal
-	newStableSignal signal.Signal
-	cover           cover.Cover
-	rawCover        []uint64
+	signals                   [deflakeNeedRuns]signal.Signal
+	stableSignal              signal.Signal
+	newStableSignal           signal.Signal
+	stableFuncPointerCover    cover.FuncPointerCover
+	newStableFuncPointerCover cover.FuncPointerCover
+	cover                     cover.Cover
+	rawCover                  []uint64
 }
 
 // As demonstrated in #4639, programs reproduce with a very high, but not 100% probability.

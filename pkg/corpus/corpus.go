@@ -21,12 +21,13 @@ import (
 // Corpus object represents a set of syzkaller-found programs that
 // cover the kernel up to the currently reached frontiers.
 type Corpus struct {
-	ctx      context.Context
-	mu       sync.RWMutex
-	progsMap map[string]*Item
-	signal   signal.Signal // total signal of all items
-	cover    cover.Cover   // total coverage of all items
-	updates  chan<- NewItemEvent
+	ctx                 context.Context
+	mu                  sync.RWMutex
+	progsMap            map[string]*Item
+	signal              signal.Signal          // total signal of all items
+	cover               cover.Cover            // total coverage of all items
+	funcPointStateCover cover.FuncPointerCover // total function pointer state coverage of all items
+	updates             chan<- NewItemEvent
 
 	*ProgramsList
 	StatProgs  *stat.Val
@@ -96,14 +97,15 @@ type ItemUpdate struct {
 // too hard to synchonize accesses to them across the whole project.
 // When Corpus updates one of its items, it saves a copy of it.
 type Item struct {
-	Sig       string
-	Call      int
-	Prog      *prog.Prog
-	HasAny    bool // whether the prog contains squashed arguments
-	Signal    signal.Signal
-	Timestamp time.Time
-	Cover     []uint64
-	Updates   []ItemUpdate
+	Sig              string
+	Call             int
+	Prog             *prog.Prog
+	HasAny           bool // whether the prog contains squashed arguments
+	Signal           signal.Signal
+	Timestamp        time.Time
+	Cover            []uint64
+	FuncPointerCover cover.FuncPointerCover
+	Updates          []ItemUpdate
 
 	areas map[*focusAreaState]struct{}
 }
@@ -113,18 +115,21 @@ func (item Item) StringCall() string {
 }
 
 type NewInput struct {
-	Prog     *prog.Prog
-	Call     int
-	Signal   signal.Signal
-	Cover    []uint64
-	RawCover []uint64
+	Prog                *prog.Prog
+	Call                int
+	Signal              signal.Signal
+	Cover               []uint64
+	RawCover            []uint64
+	FuncPointerCover    cover.FuncPointerCoverFlat
+	RawFuncPointerCover cover.FuncPointerCoverFlat
 }
 
 type NewItemEvent struct {
-	Sig      string
-	Exists   bool
-	ProgData []byte
-	NewCover []uint64
+	Sig                 string
+	Exists              bool
+	ProgData            []byte
+	NewCover            []uint64
+	NewFuncPointerCover cover.FuncPointerCoverFlat
 }
 
 func (corpus *Corpus) Save(inp NewInput) {
