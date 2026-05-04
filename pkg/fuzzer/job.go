@@ -185,7 +185,7 @@ func (job *triageJob) run(fuzzer *Fuzzer) {
 }
 
 func (job *triageJob) handleCall(call int, info *triageCall) {
-	if info.newStableSignal.Empty() {
+	if info.newStableSignal.Empty() && info.newFuncPointerCover.Empty() {
 		return
 	}
 
@@ -244,6 +244,7 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 			})
 		}
 	}
+	job.fuzzer.Cover.addFuncPointerCover(info.newFuncPointerCover)
 	job.info.Logf("added new input for #%d [%s] to the corpus with program:\n%s", call, callName, p.Serialize())
 	input := corpus.NewInput{
 		Prog:             p,
