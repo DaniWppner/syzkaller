@@ -8,9 +8,18 @@ import (
 	"github.com/google/syzkaller/pkg/flatrpc"
 )
 
-type FuncPointerCover map[flatrpc.FuncPointerStore]struct{}
+// This copies signal.Signal so it will have the same linter problem
+type FuncPointerCover map[flatrpc.FuncPointerStore]struct{} // nolint: recvcheck
 type FuncPointerCoverRaw []*flatrpc.FuncPointerStore
 type FuncPointerCoverFlat []flatrpc.FuncPointerStore
+
+func (fpcov FuncPointerCover) Len() int {
+	return len(fpcov)
+}
+
+func (fpcov FuncPointerCover) Empty() bool {
+	return len(fpcov) == 0
+}
 
 func StorePreview(raw FuncPointerCoverRaw) string {
 	if len(raw) > 0 {
@@ -27,4 +36,32 @@ func StorePreview(raw FuncPointerCoverRaw) string {
 		return sb.String()
 	}
 	return ""
+}
+
+func (fpcov FuncPointerCover) DiffRaw(raw FuncPointerCoverRaw) FuncPointerCover {
+	var res FuncPointerCover
+	for _, store := range raw {
+		if _, ok := fpcov[*store]; ok {
+			continue
+		}
+		if res == nil {
+			res = make(FuncPointerCover)
+		}
+		res[*store] = struct{}{}
+	}
+	return res
+}
+
+func (fpcov *FuncPointerCover) Merge(new FuncPointerCover) {
+	if new.Empty() {
+		return
+	}
+	fpc := *fpcov
+	if fpc == nil {
+		fpc = make(FuncPointerCover, len(new))
+		*fpcov = fpc
+	}
+	for store := range new {
+		fpc[store] = struct{}{}
+	}
 }

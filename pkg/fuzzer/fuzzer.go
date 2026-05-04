@@ -232,11 +232,12 @@ func (fuzzer *Fuzzer) triageProgCall(p *prog.Prog, info *flatrpc.CallInfo, call 
 		return
 	}
 	prio := signalPrio(p, info, call)
+	newFuncPointerCover := fuzzer.Cover.getNewFuncPointerCover(info.FuncStores)
 	newMaxSignal := fuzzer.Cover.addRawMaxSignal(info.Signal, prio)
 	fuzzer.Logf(3, "[prog-%p] stored function pointers in call #%d [%s]: %s",
 		p, call, p.CallName(call), cover.StorePreview(info.FuncStores))
 
-	if newMaxSignal.Empty() {
+	if newMaxSignal.Empty() && newFuncPointerCover.Empty() {
 		return
 	}
 	if !fuzzer.Config.NewInputFilter(p.CallName(call)) {
@@ -247,9 +248,10 @@ func (fuzzer *Fuzzer) triageProgCall(p *prog.Prog, info *flatrpc.CallInfo, call 
 		*triage = make(map[int]*triageCall)
 	}
 	(*triage)[call] = &triageCall{
-		errno:     info.Error,
-		newSignal: newMaxSignal,
-		signals:   [deflakeNeedRuns]signal.Signal{signal.FromRaw(info.Signal, prio)},
+		errno:               info.Error,
+		newSignal:           newMaxSignal,
+		newFuncPointerCover: newFuncPointerCover,
+		signals:             [deflakeNeedRuns]signal.Signal{signal.FromRaw(info.Signal, prio)},
 	}
 }
 

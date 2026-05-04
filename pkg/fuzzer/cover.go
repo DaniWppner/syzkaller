@@ -13,23 +13,24 @@ import (
 
 // Cover keeps track of the signal known to the fuzzer.
 type Cover struct {
-	mu                       sync.RWMutex
-	maxSignal                signal.Signal          // max signal ever observed (including flakes)
-	newSignal                signal.Signal          // newly identified max signal
-	maxFuncPointerStateCover cover.FuncPointerCover // max function pointer state coverage observed
-	newFuncPointerStateCover cover.FuncPointerCover // newly identified pointer state coverage (clarify the need of these two)
+	signalMu            sync.RWMutex
+	funcPointerMu       sync.RWMutex
+	maxSignal           signal.Signal          // max signal ever observed (including flakes)
+	newSignal           signal.Signal          // newly identified max signal
+	maxFuncPointerCover cover.FuncPointerCover // max function pointer state coverage observed
+	newFuncPointerCover cover.FuncPointerCover // newly identified pointer state coverage (clarify the need of these two)
 }
 
 func newCover() *Cover {
 	cover := new(Cover)
 	stat.New("max signal", "Maximum fuzzing signal (including flakes)",
-		stat.Graph("signal"), stat.LenOf(&cover.maxSignal, &cover.mu))
+		stat.Graph("signal"), stat.LenOf(&cover.maxSignal, &cover.signalMu))
 	return cover
 }
 
 func (cover *Cover) addRawMaxSignal(signal []uint64, prio uint8) signal.Signal {
-	cover.mu.Lock()
-	defer cover.mu.Unlock()
+	cover.signalMu.Lock()
+	defer cover.signalMu.Unlock()
 	diff := cover.maxSignal.DiffRaw(signal, prio)
 	if diff.Empty() {
 		return diff
@@ -39,15 +40,22 @@ func (cover *Cover) addRawMaxSignal(signal []uint64, prio uint8) signal.Signal {
 	return diff
 }
 
+func (cover *Cover) getNewFuncPointerCover(newRaw cover.FuncPointerCoverRaw) cover.FuncPointerCover {
+	cover.funcPointerMu.Lock()
+	defer cover.funcPointerMu.Unlock()
+	diff := cover.maxFuncPointerCover.DiffRaw(newRaw)
+	return diff
+}
+
 func (cover *Cover) CopyMaxSignal() signal.Signal {
-	cover.mu.RLock()
-	defer cover.mu.RUnlock()
+	cover.signalMu.RLock()
+	defer cover.signalMu.RUnlock()
 	return cover.maxSignal.Copy()
 }
 
 func (cover *Cover) GrabSignalDelta() signal.Signal {
-	cover.mu.Lock()
-	defer cover.mu.Unlock()
+	cover.signalMu.Lock()
+	defer cover.signalMu.Unlock()
 	plus := cover.newSignal
 	cover.newSignal = nil
 	return plus
