@@ -115,21 +115,19 @@ func (item Item) StringCall() string {
 }
 
 type NewInput struct {
-	Prog                *prog.Prog
-	Call                int
-	Signal              signal.Signal
-	Cover               []uint64
-	RawCover            []uint64
-	FuncPointerCover    cover.FuncPointerCoverFlat
-	RawFuncPointerCover cover.FuncPointerCoverFlat
+	Prog             *prog.Prog
+	Call             int
+	Signal           signal.Signal
+	Cover            []uint64
+	RawCover         []uint64
+	FuncPointerCover cover.FuncPointerCover
 }
 
 type NewItemEvent struct {
-	Sig                 string
-	Exists              bool
-	ProgData            []byte
-	NewCover            []uint64
-	NewFuncPointerCover cover.FuncPointerCoverFlat
+	Sig      string
+	Exists   bool
+	ProgData []byte
+	NewCover []uint64
 }
 
 func (corpus *Corpus) Save(inp NewInput) {
@@ -151,16 +149,19 @@ func (corpus *Corpus) Save(inp NewInput) {
 		var newCover cover.Cover
 		newCover.Merge(old.Cover)
 		newCover.Merge(inp.Cover)
+		newFuncPointerCover := old.FuncPointerCover.Copy()
+		newFuncPointerCover.Merge(inp.FuncPointerCover)
 		newItem := &Item{
-			Sig:       sig,
-			Prog:      old.Prog,
-			Call:      old.Call,
-			HasAny:    old.HasAny,
-			Timestamp: old.Timestamp,
-			Signal:    newSignal,
-			Cover:     newCover.Serialize(),
-			Updates:   slices.Clone(old.Updates),
-			areas:     maps.Clone(old.areas),
+			Sig:              sig,
+			Prog:             old.Prog,
+			Call:             old.Call,
+			HasAny:           old.HasAny,
+			Timestamp:        old.Timestamp,
+			Signal:           newSignal,
+			Cover:            newCover.Serialize(),
+			FuncPointerCover: newFuncPointerCover,
+			Updates:          slices.Clone(old.Updates),
+			areas:            maps.Clone(old.areas),
 		}
 		const maxUpdates = 32
 		if len(newItem.Updates) < maxUpdates {
@@ -170,14 +171,15 @@ func (corpus *Corpus) Save(inp NewInput) {
 		corpus.applyFocusAreas(newItem, inp.Cover)
 	} else {
 		item := &Item{
-			Sig:       sig,
-			Call:      inp.Call,
-			Prog:      inp.Prog,
-			HasAny:    inp.Prog.ContainsAny(),
-			Signal:    inp.Signal,
-			Timestamp: time.Now(),
-			Cover:     inp.Cover,
-			Updates:   []ItemUpdate{update},
+			Sig:              sig,
+			Call:             inp.Call,
+			Prog:             inp.Prog,
+			HasAny:           inp.Prog.ContainsAny(),
+			Signal:           inp.Signal,
+			Timestamp:        time.Now(),
+			Cover:            inp.Cover,
+			FuncPointerCover: inp.FuncPointerCover,
+			Updates:          []ItemUpdate{update},
 		}
 		corpus.progsMap[sig] = item
 		corpus.applyFocusAreas(item, inp.Cover)
@@ -185,6 +187,7 @@ func (corpus *Corpus) Save(inp NewInput) {
 	}
 	corpus.signal.Merge(inp.Signal)
 	newCover := corpus.cover.MergeDiff(inp.Cover)
+	corpus.funcPointStateCover.Merge(inp.FuncPointerCover)
 	if corpus.updates != nil {
 		select {
 		case <-corpus.ctx.Done():

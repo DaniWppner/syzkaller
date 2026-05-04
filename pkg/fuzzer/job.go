@@ -246,11 +246,12 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 	}
 	job.info.Logf("added new input for #%d [%s] to the corpus with program:\n%s", call, callName, p.Serialize())
 	input := corpus.NewInput{
-		Prog:     p,
-		Call:     call,
-		Signal:   info.stableSignal,
-		Cover:    info.cover.Serialize(),
-		RawCover: info.rawCover,
+		Prog:             p,
+		Call:             call,
+		Signal:           info.stableSignal,
+		Cover:            info.cover.Serialize(),
+		RawCover:         info.rawCover,
+		FuncPointerCover: info.newFuncPointerCover,
 	}
 	job.fuzzer.Config.Corpus.Save(input)
 }

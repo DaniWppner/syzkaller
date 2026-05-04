@@ -21,6 +21,14 @@ func (fpcov FuncPointerCover) Empty() bool {
 	return len(fpcov) == 0
 }
 
+func (fpcov FuncPointerCover) Copy() FuncPointerCover {
+	res := make(FuncPointerCover, len(fpcov))
+	for store := range fpcov {
+		res[store] = struct{}{}
+	}
+	return res
+}
+
 func StorePreview(raw FuncPointerCoverRaw) string {
 	if len(raw) > 0 {
 		var sb strings.Builder
