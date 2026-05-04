@@ -46,6 +46,17 @@ func StorePreview(raw FuncPointerCoverRaw) string {
 	return ""
 }
 
+func FPCoverFromRaw(raw FuncPointerCoverRaw) FuncPointerCover {
+	if len(raw) == 0 {
+		return nil
+	}
+	fpcov := make(FuncPointerCover, len(raw))
+	for _, entry := range raw {
+		fpcov[*entry] = struct{}{}
+	}
+	return fpcov
+}
+
 func (fpcov FuncPointerCover) DiffRaw(raw FuncPointerCoverRaw) FuncPointerCover {
 	var res FuncPointerCover
 	for _, store := range raw {
@@ -56,6 +67,28 @@ func (fpcov FuncPointerCover) DiffRaw(raw FuncPointerCoverRaw) FuncPointerCover 
 			res = make(FuncPointerCover)
 		}
 		res[*store] = struct{}{}
+	}
+	return res
+}
+
+func (fpcov FuncPointerCover) IntersectsWith(other FuncPointerCover) bool {
+	for store := range fpcov {
+		if _, ok := other[store]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (fpcov FuncPointerCover) Intersection(other FuncPointerCover) FuncPointerCover {
+	if other.Empty() {
+		return nil
+	}
+	res := make(FuncPointerCover, len(fpcov))
+	for store := range fpcov {
+		if _, ok := other[store]; ok {
+			res[store] = struct{}{}
+		}
 	}
 	return res
 }

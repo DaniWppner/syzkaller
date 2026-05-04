@@ -110,6 +110,7 @@ type triageCall struct {
 	signals                   [deflakeNeedRuns]signal.Signal
 	stableSignal              signal.Signal
 	newStableSignal           signal.Signal
+	funcPointerCovers         [deflakeNeedRuns]cover.FuncPointerCover
 	stableFuncPointerCover    cover.FuncPointerCover
 	newStableFuncPointerCover cover.FuncPointerCover
 	cover                     cover.Cover
@@ -185,7 +186,7 @@ func (job *triageJob) run(fuzzer *Fuzzer) {
 }
 
 func (job *triageJob) handleCall(call int, info *triageCall) {
-	if info.newStableSignal.Empty() && info.newFuncPointerCover.Empty() {
+	if info.newStableSignal.Empty() && info.newStableFuncPointerCover.Empty() {
 		return
 	}
 
@@ -244,7 +245,7 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 			})
 		}
 	}
-	job.fuzzer.Cover.addFuncPointerCover(info.newFuncPointerCover)
+	job.fuzzer.Cover.addFuncPointerCover(info.newStableFuncPointerCover)
 	job.info.Logf("added new input for #%d [%s] to the corpus with program:\n%s", call, callName, p.Serialize())
 	input := corpus.NewInput{
 		Prog:             p,
@@ -252,7 +253,7 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 		Signal:           info.stableSignal,
 		Cover:            info.cover.Serialize(),
 		RawCover:         info.rawCover,
-		FuncPointerCover: info.newFuncPointerCover,
+		FuncPointerCover: info.stableFuncPointerCover,
 	}
 	job.fuzzer.Config.Corpus.Save(input)
 }
@@ -268,17 +269,23 @@ func (job *triageJob) deflake(exec func(*queue.Request, ProgFlags) *queue.Result
 		needRuns = deflakeNeedRuns
 	}
 	prevTotalNewSignal := 0
+	prevTotalNewFPCover := 0
 	for run := 1; ; run++ {
 		totalNewSignal := 0
+		totalNewFPCover := 0
 		indices := make([]int, 0, len(job.calls))
 		for call, info := range job.calls {
 			indices = append(indices, call)
 			totalNewSignal += len(info.newSignal)
+			totalNewFPCover += info.newFuncPointerCover.Len()
 		}
-		if job.stopDeflake(run, needRuns, prevTotalNewSignal == totalNewSignal) {
+		if job.stopDeflake(run, needRuns,
+			prevTotalNewSignal == totalNewSignal,
+			prevTotalNewFPCover == totalNewFPCover) {
 			break
 		}
 		prevTotalNewSignal = totalNewSignal
+		prevTotalNewFPCover = totalNewFPCover
 		result := exec(&queue.Request{
 			Prog:            job.p,
 			ExecOpts:        setFlags(flatrpc.ExecFlagCollectCover | flatrpc.ExecFlagCollectSignal),
@@ -320,9 +327,17 @@ func (job *triageJob) deflake(exec func(*queue.Request, ProgFlags) *queue.Result
 			info.newSignal.Merge(newMaxSignal)
 			info.cover.Merge(res.Cover)
 			thisSignal := signal.FromRaw(res.Signal, prio)
+			// Repeat most of the existing signal logic, but with FuncPointerCover
+			newFuncPointerCover := job.fuzzer.Cover.getNewFuncPointerCover(res.FuncStores)
+			info.newFuncPointerCover.Merge(newFuncPointerCover)
+			thisFuncPointerCover := cover.FPCoverFromRaw(res.FuncStores)
 			for j := needRuns - 1; j > 0; j-- {
 				intersect := info.signals[j-1].Intersection(thisSignal)
 				info.signals[j].Merge(intersect)
+				// Similar as with signal, store in position run the cumulative intersection
+				// of functionPointerCovers 0 to run
+				fPCoverIntersect := info.funcPointerCovers[j-1].Intersection(thisFuncPointerCover)
+				info.funcPointerCovers[j].Merge(fPCoverIntersect)
 			}
 			info.signals[0].Merge(thisSignal)
 		}
@@ -335,6 +350,8 @@ func (job *triageJob) deflake(exec func(*queue.Request, ProgFlags) *queue.Result
 	for call, info := range job.calls {
 		info.stableSignal = info.signals[needRuns-1]
 		info.newStableSignal = info.newSignal.Intersection(info.stableSignal)
+		info.stableFuncPointerCover = info.funcPointerCovers[needRuns-1]
+		info.newStableFuncPointerCover = info.newFuncPointerCover.Intersection(info.stableFuncPointerCover)
 		job.info.Logf("call #%d [%s]: |stable signal|=%d, |new stable signal|=%d%s",
 			call, job.p.CallName(call), info.stableSignal.Len(), info.newStableSignal.Len(),
 			signalPreview(info.newStableSignal))
@@ -350,14 +367,19 @@ func (job *triageJob) deflake(exec func(*queue.Request, ProgFlags) *queue.Result
 	return false
 }
 
-func (job *triageJob) stopDeflake(run, needRuns int, noNewSignal bool) bool {
+func (job *triageJob) stopDeflake(run, needRuns int, noNewSignal bool, noNewFPCover bool) bool {
 	if job.fuzzer.Config.Snapshot {
 		return run >= needRuns+1
 	}
 	haveSignal := true
+	haveFPCover := true
+	// all existing logic for signal is blindly followed by newFPCover
 	for _, call := range job.calls {
 		if !call.newSignal.IntersectsWith(call.signals[needRuns-1]) {
 			haveSignal = false
+		}
+		if !call.newFuncPointerCover.IntersectsWith(call.funcPointerCovers[needRuns-1]) {
+			haveFPCover = false
 		}
 	}
 	if job.flags&ProgFromCorpus == 0 {
@@ -369,7 +391,8 @@ func (job *triageJob) stopDeflake(run, needRuns int, noNewSignal bool) bool {
 		noChance := true
 		for _, call := range job.calls {
 			if left := deflakeMaxRuns - run; left >= needRuns ||
-				call.newSignal.IntersectsWith(call.signals[needRuns-left-1]) {
+				call.newSignal.IntersectsWith(call.signals[needRuns-left-1]) ||
+				call.newFuncPointerCover.IntersectsWith(call.funcPointerCovers[needRuns-left-1]) {
 				noChance = false
 			}
 		}
@@ -377,7 +400,8 @@ func (job *triageJob) stopDeflake(run, needRuns int, noNewSignal bool) bool {
 			return true
 		}
 	} else if run >= deflakeTotalCorpusRuns ||
-		noNewSignal && (run >= deflakeMaxCorpusRuns || run >= deflakeMinCorpusRuns && haveSignal) {
+		noNewSignal && (run >= deflakeMaxCorpusRuns || run >= deflakeMinCorpusRuns && haveSignal) ||
+		noNewFPCover && (run >= deflakeMaxCorpusRuns || run >= deflakeMinCorpusRuns && haveFPCover) {
 		// For programs from the corpus we use a different condition b/c we want to extract
 		// as much flaky signal from them as possible. They have large coverage and run
 		// in the beginning, gathering flaky signal on them allows to grow max signal quickly
