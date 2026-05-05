@@ -41,7 +41,7 @@ func (cover *Cover) addRawMaxSignal(signal []uint64, prio uint8) signal.Signal {
 
 func (cover *Cover) getNewFuncPointerCover(newRaw cover.FuncPointerCoverRaw) cover.FuncPointerCover {
 	cover.funcPointerMu.RLock()
-	defer cover.funcPointerMu.Unlock()
+	defer cover.funcPointerMu.RUnlock()
 	diff := cover.maxFuncPointerCover.DiffRaw(newRaw)
 	return diff
 }
