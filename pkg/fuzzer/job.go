@@ -189,14 +189,54 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 	if info.newStableSignal.Empty() && info.newStableFuncPointerCover.Empty() {
 		return
 	}
-
 	p := job.p
-	if job.flags&ProgMinimized == 0 {
-		p, call = job.minimize(call, info)
-		if p == nil {
-			return
-		}
+	// skip minimization
+	if job.flags&ProgMinimized != 0 {
+		job.doHandleCall(p, call, info)
+		return
 	}
+	// else: do minimization
+	// coverType = 0 . Minimize keeping signal
+	pSignal, callSignal := job.minimize(call, info, 0)
+	// coverType = 1 . Minimize keeping FuncPointerCover
+	pFPCov, callFPCov := job.minimize(call, info, 1)
+
+	// If both are nil, we couldn't minimize either
+	if pSignal == nil && pFPCov == nil {
+		return
+	}
+
+	// If both are not nil, try to keep only one if they are equivalent
+	canUnify := pFPCov != nil && pSignal != nil &&
+		bytes.Equal(pSignal.Serialize(), pFPCov.Serialize()) &&
+		callFPCov == callSignal
+
+	if canUnify {
+		// pick any
+		job.doHandleCall(pSignal, callSignal, info)
+	}
+
+	if !canUnify && pSignal != nil {
+		// we cannot guarantee stableFuncPointerCover anymore, since minimizing signal
+		// might have deleted calls necessary for the registered FuncPointerCover
+		signalInfo := new(triageCall)
+		*signalInfo = *info
+		signalInfo.stableFuncPointerCover = nil
+		signalInfo.newStableFuncPointerCover = nil
+		job.doHandleCall(pSignal, callSignal, signalInfo)
+	}
+
+	if !canUnify && pFPCov != nil {
+		// see above
+		fPCovInfo := new(triageCall)
+		*fPCovInfo = *info
+		fPCovInfo.stableSignal = nil
+		fPCovInfo.newStableSignal = nil
+		job.doHandleCall(pFPCov, callFPCov, fPCovInfo)
+	}
+}
+
+func (job *triageJob) doHandleCall(p *prog.Prog, call int, info *triageCall) {
 	callName := p.CallName(call)
 
 	filteredRaw := filteredCoverage(info.cover.Serialize(), job.fuzzer.Config.DebugFilters)
@@ -414,7 +454,15 @@ func (job *triageJob) stopDeflake(run, needRuns int, noNewSignal bool, noNewFPCo
 	return false
 }
 
-func (job *triageJob) minimize(call int, info *triageCall) (*prog.Prog, int) {
+// minimize now works trying to preserve either signal.Signal or cover.FuncPointerCover.
+// Parameter coverType controls which.
+//
+//	coverType = 0 --> Signal
+//	coverType = 1 --> FuncPointerCover
+func (job *triageJob) minimize(call int, info *triageCall, coverType int) (*prog.Prog, int) {
+	if !(coverType == 0 || coverType == 1) {
+		panic("triageJob.minimize coverType should be either 0 (Signal) or 1 (FuncPointerCover)")
+	}
 	job.info.Logf("call #%d [%s]: minimize started", call, job.p.CallName(call))
 	minimizeAttempts := 3
 	if job.fuzzer.Config.Snapshot {
@@ -430,6 +478,7 @@ func (job *triageJob) minimize(call int, info *triageCall) (*prog.Prog, int) {
 			return false
 		}
 		var mergedSignal signal.Signal
+		var mergedFPointerCover cover.FuncPointerCover
 		for range minimizeAttempts {
 			result := job.execute(&queue.Request{
 				Prog:            p1,
@@ -445,16 +494,29 @@ func (job *triageJob) minimize(call int, info *triageCall) (*prog.Prog, int) {
 				// The call was not executed or failed.
 				continue
 			}
-			thisSignal := getSignalAndCover(p1, result.Info, call1)
+			thisSignal, thisFPointerCover := getSignalAndCover(p1, result.Info, call1)
 			if mergedSignal.Len() == 0 {
 				mergedSignal = thisSignal
 			} else {
 				mergedSignal.Merge(thisSignal)
 			}
-			if info.newStableSignal.Intersection(mergedSignal).Len() == info.newStableSignal.Len() {
-				job.info.Logf("call #%d [%s] minimization step success (|calls| = %d)",
-					call, job.p.CallName(call), len(p1.Calls))
-				return true
+			// Why the need to ask for Len == 0 ?
+			mergedFPointerCover.Merge(thisFPointerCover)
+
+			// Both mergedSignal and mergedFPointerCover will get calculated.
+			// We just care about one of them for deciding if the minimization step was successful.
+			if coverType == 0 {
+				if info.newStableSignal.Intersection(mergedSignal).Len() == info.newStableSignal.Len() {
+					job.info.Logf("call #%d [%s] minimization step (signal) success (|calls| = %d)",
+						call, job.p.CallName(call), len(p1.Calls))
+					return true
+				}
+			} else {
+				if info.newStableFuncPointerCover.Intersection(mergedFPointerCover).Len() == info.newStableFuncPointerCover.Len() {
+					job.info.Logf("call #%d [%s] minimization step (funPointeCover) success (|calls| = %d)",
+						call, job.p.CallName(call), len(p1.Calls))
+					return true
+				}
 			}
 		}
 		job.info.Logf("call #%d [%s] minimization step failure", call, job.p.CallName(call))
@@ -481,15 +543,15 @@ func reexecutionSuccess(info *flatrpc.ProgInfo, oldErrno int32, call int) bool {
 	return info.Extra != nil && len(info.Extra.Signal) != 0
 }
 
-func getSignalAndCover(p *prog.Prog, info *flatrpc.ProgInfo, call int) signal.Signal {
+func getSignalAndCover(p *prog.Prog, info *flatrpc.ProgInfo, call int) (signal.Signal, cover.FuncPointerCover) {
 	inf := info.Extra
 	if call != -1 {
 		inf = info.Calls[call]
 	}
 	if inf == nil {
-		return nil
+		return nil, nil
 	}
-	return signal.FromRaw(inf.Signal, signalPrio(p, inf, call))
+	return signal.FromRaw(inf.Signal, signalPrio(p, inf, call)), cover.FPCoverFromRaw(inf.FuncStores)
 }
 
 func signalPreview(s signal.Signal) string {
