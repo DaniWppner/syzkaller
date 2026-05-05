@@ -234,16 +234,19 @@ func (fuzzer *Fuzzer) triageProgCall(p *prog.Prog, info *flatrpc.CallInfo, call 
 	prio := signalPrio(p, info, call)
 	newFuncPointerCover := fuzzer.Cover.getNewFuncPointerCover(info.FuncStores)
 	newMaxSignal := fuzzer.Cover.addRawMaxSignal(info.Signal, prio)
-	fuzzer.Logf(3, "[prog-%p] stored function pointers in call #%d [%s]: %s",
-		p, call, p.CallName(call), cover.StorePreview(info.FuncStores))
-
 	if newMaxSignal.Empty() && newFuncPointerCover.Empty() {
 		return
 	}
 	if !fuzzer.Config.NewInputFilter(p.CallName(call)) {
 		return
 	}
-	fuzzer.Logf(3, "found new signal in call #%d [%s] in %s", call, p.CallName(call), p)
+	if !newMaxSignal.Empty() {
+		fuzzer.Logf(3, "[prog-%p] found new signal in call #%d [%s] in %s", p, call, p.CallName(call), p)
+	}
+	if !newFuncPointerCover.Empty() {
+		fuzzer.Logf(3, "[prog-%p] found new stored function pointers in call #%d [%s]: %s",
+			p, call, p.CallName(call), cover.StorePreview(info.FuncStores))
+	}
 	if *triage == nil {
 		*triage = make(map[int]*triageCall)
 	}
@@ -252,6 +255,7 @@ func (fuzzer *Fuzzer) triageProgCall(p *prog.Prog, info *flatrpc.CallInfo, call 
 		newSignal:           newMaxSignal,
 		newFuncPointerCover: newFuncPointerCover,
 		signals:             [deflakeNeedRuns]signal.Signal{signal.FromRaw(info.Signal, prio)},
+		funcPointerCovers:   [deflakeNeedRuns]cover.FuncPointerCover{cover.FPCoverFromRaw(info.FuncStores)},
 	}
 }
 
