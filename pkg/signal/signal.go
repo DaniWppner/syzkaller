@@ -49,6 +49,22 @@ func RawPreview(raw []uint64) string {
 	return ""
 }
 
+func (s Signal) SignalPreview() string {
+	if s.Len() > 0 && s.Len() <= 3 {
+		var sb strings.Builder
+		sb.WriteString(" (")
+		for i, x := range s.ToRaw() {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			fmt.Fprintf(&sb, "0x%x", x)
+		}
+		sb.WriteByte(')')
+		return sb.String()
+	}
+	return ""
+}
+
 func FromRaw(raw []uint64, prio uint8) Signal {
 	if len(raw) == 0 {
 		return nil

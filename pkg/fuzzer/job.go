@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"fmt"
 	"math/rand"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -160,7 +159,10 @@ func (job *triageJob) run(fuzzer *Fuzzer) {
 	job.info.Logf("\n%s", job.p.Serialize())
 	for call, info := range job.calls {
 		job.info.Logf("call #%d [%s]: |new signal|=%d%s",
-			call, job.p.CallName(call), info.newSignal.Len(), signalPreview(info.newSignal))
+			call, job.p.CallName(call), info.newSignal.Len(), info.newSignal.SignalPreview())
+
+		job.info.Logf("call #%d [%s]: |new stored function pointers|=%d%s",
+			call, job.p.CallName(call), info.newFuncPointerCover.Len(), info.newFuncPointerCover.Preview())
 
 		filteredRawSignal := filteredCoverage(info.newSignal.ToRaw(), job.fuzzer.Config.DebugFilters)
 		if len(filteredRawSignal) > 0 {
@@ -213,6 +215,7 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 
 	if canUnify {
 		// pick any
+		job.info.Logf("minimization yielded same prog for signal and stored function pointers")
 		job.doHandleCall(pSignal, callSignal, info)
 	}
 
@@ -394,10 +397,13 @@ func (job *triageJob) deflake(exec func(*queue.Request, ProgFlags) *queue.Result
 		info.newStableFuncPointerCover = info.newFuncPointerCover.Intersection(info.stableFuncPointerCover)
 		job.info.Logf("call #%d [%s]: |stable signal|=%d, |new stable signal|=%d%s",
 			call, job.p.CallName(call), info.stableSignal.Len(), info.newStableSignal.Len(),
-			signalPreview(info.newStableSignal))
+			info.newStableSignal.SignalPreview())
 
 		newStableFilteredSignal := filteredCoverage(info.newStableSignal.ToRaw(), job.fuzzer.Config.DebugFilters)
 		stableFilteredSignal := filteredCoverage(info.stableSignal.ToRaw(), job.fuzzer.Config.DebugFilters)
+		job.info.Logf("call #%d [%s]: |stable stored function pointers|=%d, |new stable stored function pointers|=%d%s",
+			call, job.p.CallName(call), info.stableFuncPointerCover.Len(), info.newStableFuncPointerCover.Len(),
+			info.newStableFuncPointerCover.Preview())
 
 		if len(stableFilteredSignal) > 0 {
 			job.info.Logf("call #%d [%s]: |stable filtered signal|=%d, |new stable filtered signal|=%d%s",
@@ -513,7 +519,7 @@ func (job *triageJob) minimize(call int, info *triageCall, coverType int) (*prog
 				}
 			} else {
 				if info.newStableFuncPointerCover.Intersection(mergedFPointerCover).Len() == info.newStableFuncPointerCover.Len() {
-					job.info.Logf("call #%d [%s] minimization step (funPointeCover) success (|calls| = %d)",
+					job.info.Logf("call #%d [%s] minimization step (funPointerCover) success (|calls| = %d)",
 						call, job.p.CallName(call), len(p1.Calls))
 					return true
 				}
@@ -552,22 +558,6 @@ func getSignalAndCover(p *prog.Prog, info *flatrpc.ProgInfo, call int) (signal.S
 		return nil, nil
 	}
 	return signal.FromRaw(inf.Signal, signalPrio(p, inf, call)), cover.FPCoverFromRaw(inf.FuncStores)
-}
-
-func signalPreview(s signal.Signal) string {
-	if s.Len() > 0 && s.Len() <= 3 {
-		var sb strings.Builder
-		sb.WriteString(" (")
-		for i, x := range s.ToRaw() {
-			if i > 0 {
-				sb.WriteString(", ")
-			}
-			fmt.Fprintf(&sb, "0x%x", x)
-		}
-		sb.WriteByte(')')
-		return sb.String()
-	}
-	return ""
 }
 
 func (job *triageJob) getInfo() *JobInfo {
