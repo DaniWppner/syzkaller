@@ -194,6 +194,7 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 	p := job.p
 	// skip minimization
 	if job.flags&ProgMinimized != 0 {
+		job.info.Logf("skip minimize")
 		job.doHandleCall(p, call, info)
 		return
 	}
@@ -226,6 +227,7 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 		*signalInfo = *info
 		signalInfo.stableFuncPointerCover = nil
 		signalInfo.newStableFuncPointerCover = nil
+		job.info.Logf("minimization yielded prog for signal different from stored function pointers")
 		job.doHandleCall(pSignal, callSignal, signalInfo)
 	}
 
@@ -235,6 +237,7 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 		*fPCovInfo = *info
 		fPCovInfo.stableSignal = nil
 		fPCovInfo.newStableSignal = nil
+		job.info.Logf("minimization yielded prog for stored function pointers different from signal")
 		job.doHandleCall(pFPCov, callFPCov, fPCovInfo)
 	}
 }
