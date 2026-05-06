@@ -9,7 +9,6 @@ import (
 	"reflect"
 	"slices"
 
-	"github.com/google/syzkaller/pkg/hash"
 	"github.com/google/syzkaller/pkg/stat"
 )
 
@@ -61,7 +60,7 @@ func Minimize(p0 *Prog, callIndex0 int, mode MinimizeMode, pred0 func(*Prog, int
 		what.Add(1)
 		p.sanitizeFix()
 		p.debugValidate()
-		id := hash.String(p.Serialize())
+		id := p.GetUuid()
 		if _, ok := dedup[id]; !ok {
 			dedup[id] = pred0(p, callIndex)
 		}

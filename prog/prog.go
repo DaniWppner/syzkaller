@@ -8,6 +8,8 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+
+	"github.com/google/syzkaller/pkg/hash"
 )
 
 type Prog struct {
@@ -20,6 +22,10 @@ type Prog struct {
 }
 
 const ExtraCallName = ".extra"
+
+func (p *Prog) GetUuid() string {
+	return hash.String(p.Serialize())
+}
 
 func (p *Prog) CallName(call int) string {
 	if call >= len(p.Calls) || call < -1 {
