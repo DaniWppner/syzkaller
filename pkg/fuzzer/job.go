@@ -216,7 +216,7 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 
 	if canUnify {
 		// pick any
-		job.info.Logf("minimization yielded same prog for signal and stored function pointers")
+		job.info.Logf("call #%d [%s] minimization yielded same prog for signal and stored function pointers", call, p.CallName(call))
 		job.doHandleCall(pSignal, callSignal, info)
 	}
 
@@ -227,7 +227,8 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 		*signalInfo = *info
 		signalInfo.stableFuncPointerCover = nil
 		signalInfo.newStableFuncPointerCover = nil
-		job.info.Logf("minimization yielded prog for signal different from stored function pointers")
+		job.info.Logf("call #%d [%s] minimization yielded prog for signal different from stored function pointers. New prog (call #%d):\n%s",
+			call, p.CallName(call), callSignal, pSignal.Serialize())
 		job.doHandleCall(pSignal, callSignal, signalInfo)
 	}
 
@@ -237,7 +238,8 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 		*fPCovInfo = *info
 		fPCovInfo.stableSignal = nil
 		fPCovInfo.newStableSignal = nil
-		job.info.Logf("minimization yielded prog for stored function pointers different from signal")
+		job.info.Logf("call #%d [%s] minimization yielded prog for stored function pointers different from signal. New prog (call #%d):\n%s",
+			call, p.CallName(call), callFPCov, pFPCov.Serialize())
 		job.doHandleCall(pFPCov, callFPCov, fPCovInfo)
 	}
 }
