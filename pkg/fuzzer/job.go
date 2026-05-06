@@ -474,6 +474,14 @@ func (job *triageJob) minimize(call int, info *triageCall, coverType int) (*prog
 	if !(coverType == 0 || coverType == 1) {
 		panic("triageJob.minimize coverType should be either 0 (Signal) or 1 (FuncPointerCover)")
 	}
+	if coverType == 0 && info.newStableSignal.Empty() {
+		job.info.Logf("call #%d [%s]: skip minimize of empty new stable signal", call, job.p.CallName(call))
+		return nil, 0
+	}
+	if coverType == 1 && info.newStableFuncPointerCover.Empty() {
+		job.info.Logf("call #%d [%s]: skip minimize of empty new stable stored function pointers", call, job.p.CallName(call))
+		return nil, 0
+	}
 	job.info.Logf("call #%d [%s]: minimize started", call, job.p.CallName(call))
 	minimizeAttempts := 3
 	if job.fuzzer.Config.Snapshot {
