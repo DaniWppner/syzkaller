@@ -8,10 +8,15 @@ import (
 	"github.com/google/syzkaller/pkg/flatrpc"
 )
 
+// We'd like to ignore the value of StoreAddress for now
+type FuncPointerPCEntry struct {
+	PC         uint64
+	StoreValue uint64
+}
+
 // This copies signal.Signal so it will have the same linter problem
-type FuncPointerCover map[flatrpc.FuncPointerStore]struct{} // nolint: recvcheck
+type FuncPointerCover map[FuncPointerPCEntry]struct{} // nolint: recvcheck
 type FuncPointerCoverRaw []*flatrpc.FuncPointerStore
-type FuncPointerCoverFlat []flatrpc.FuncPointerStore
 
 func (fpcov FuncPointerCover) Len() int {
 	return len(fpcov)
@@ -55,8 +60,8 @@ func (fpcov FuncPointerCover) Preview() string {
 			if i > 0 {
 				sb.WriteString(", ")
 			}
-			fmt.Fprintf(&sb, "{\"PC\": \"0x%x\", \"StoreAddr\": \"0x%x\", \"StoredValue\": \"0x%x\"}",
-				store.Pc, store.StoreAddr, store.StoreValue)
+			fmt.Fprintf(&sb, "{\"PC\": \"0x%x\", \"StoredValue\": \"0x%x\"}",
+				store.PC, store.StoreValue)
 			i++
 		}
 		sb.WriteByte(']')
@@ -71,21 +76,24 @@ func FPCoverFromRaw(raw FuncPointerCoverRaw) FuncPointerCover {
 	}
 	fpcov := make(FuncPointerCover, len(raw))
 	for _, entry := range raw {
-		fpcov[*entry] = struct{}{}
+		fpcov[FuncPointerPCEntry{
+			PC:         entry.Pc,
+			StoreValue: entry.StoreValue}] = struct{}{}
 	}
 	return fpcov
 }
 
 func (fpcov FuncPointerCover) DiffRaw(raw FuncPointerCoverRaw) FuncPointerCover {
 	var res FuncPointerCover
-	for _, store := range raw {
-		if _, ok := fpcov[*store]; ok {
+	for _, entry := range raw {
+		store := FuncPointerPCEntry{PC: entry.Pc, StoreValue: entry.StoreValue}
+		if _, ok := fpcov[store]; ok {
 			continue
 		}
 		if res == nil {
 			res = make(FuncPointerCover)
 		}
-		res[*store] = struct{}{}
+		res[store] = struct{}{}
 	}
 	return res
 }
