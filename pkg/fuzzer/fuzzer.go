@@ -241,11 +241,11 @@ func (fuzzer *Fuzzer) triageProgCall(p *prog.Prog, info *flatrpc.CallInfo, call 
 		return
 	}
 	if !newMaxSignal.Empty() {
-		fuzzer.Logf(3, "[prog-%p] found new signal in call #%d [%s] in %s", p, call, p.CallName(call), p)
+		fuzzer.Logf(3, "[prog-%s] found new signal in call #%d [%s] in %s", p.GetUuid(), call, p.CallName(call), p)
 	}
 	if !newFuncPointerCover.Empty() {
-		fuzzer.Logf(3, "[prog-%p] found new stored function pointers in call #%d [%s] in %s",
-			p, call, p.CallName(call), p)
+		fuzzer.Logf(3, "[prog-%s] found new stored function pointers in call #%d [%s] in %s",
+			p.GetUuid(), call, p.CallName(call), p)
 	}
 	if *triage == nil {
 		*triage = make(map[int]*triageCall)
