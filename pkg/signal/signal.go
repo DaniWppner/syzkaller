@@ -10,12 +10,12 @@ import (
 )
 
 type (
-	elemType uint64
-	prioType int8
+	ElemType uint64
+	PrioType int8
 )
 
 // Signal was hard to refactor when we enabled recvcheck.
-type Signal map[elemType]prioType // nolint: recvcheck
+type Signal map[ElemType]PrioType // nolint: recvcheck
 
 func (s Signal) Len() int {
 	return len(s)
@@ -71,7 +71,7 @@ func FromRaw(raw []uint64, prio uint8) Signal {
 	}
 	s := make(Signal, len(raw))
 	for _, e := range raw {
-		s[elemType(e)] = prioType(prio)
+		s[ElemType(e)] = PrioType(prio)
 	}
 	return s
 }
@@ -79,13 +79,13 @@ func FromRaw(raw []uint64, prio uint8) Signal {
 func (s Signal) DiffRaw(raw []uint64, prio uint8) Signal {
 	var res Signal
 	for _, e := range raw {
-		if p, ok := s[elemType(e)]; ok && p >= prioType(prio) {
+		if p, ok := s[ElemType(e)]; ok && p >= PrioType(prio) {
 			continue
 		}
 		if res == nil {
 			res = make(Signal)
 		}
-		res[elemType(e)] = prioType(prio)
+		res[ElemType(e)] = PrioType(prio)
 	}
 	return res
 }
@@ -136,34 +136,4 @@ func (s Signal) ToRaw() []uint64 {
 	return raw
 }
 
-type Context struct {
-	Signal  Signal
-	Context any
-}
 
-func Minimize(corpus []Context) []any {
-	type ContextPrio struct {
-		prio prioType
-		idx  int
-	}
-	covered := make(map[elemType]ContextPrio)
-	for i, inp := range corpus {
-		for e, p := range inp.Signal {
-			if prev, ok := covered[e]; !ok || p > prev.prio {
-				covered[e] = ContextPrio{
-					prio: p,
-					idx:  i,
-				}
-			}
-		}
-	}
-	indices := make(map[int]struct{}, len(corpus))
-	for _, cp := range covered {
-		indices[cp.idx] = struct{}{}
-	}
-	result := make([]any, 0, len(indices))
-	for idx := range indices {
-		result = append(result, corpus[idx].Context)
-	}
-	return result
-}
