@@ -293,7 +293,6 @@ func (job *triageJob) doHandleCall(p *prog.Prog, call int, info *triageCall) {
 			})
 		}
 	}
-	job.fuzzer.Cover.addFuncPointerCover(info.newStableFuncPointerCover)
 	job.info.Logf("added new input for #%d [%s] to the corpus with program:\n%s", call, callName, p.Serialize())
 	if !info.newStableFuncPointerCover.Empty() {
 		job.info.Logf("total cover for call #%d [%s]:\n%s", call, callName, signal.RawPreview(info.cover.Serialize()))
@@ -379,7 +378,7 @@ func (job *triageJob) deflake(exec func(*queue.Request, ProgFlags) *queue.Result
 			info.cover.Merge(res.Cover)
 			thisSignal := signal.FromRaw(res.Signal, prio)
 			// Repeat most of the existing signal logic, but with FuncPointerCover
-			newFuncPointerCover := job.fuzzer.Cover.getNewFuncPointerCover(res.FuncStores)
+			newFuncPointerCover := job.fuzzer.Cover.addRawFuncPointerCover(res.FuncStores)
 			info.newFuncPointerCover.Merge(newFuncPointerCover)
 			thisFuncPointerCover := cover.FPCoverFromRaw(res.FuncStores)
 			for j := needRuns - 1; j > 0; j-- {

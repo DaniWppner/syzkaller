@@ -232,7 +232,7 @@ func (fuzzer *Fuzzer) triageProgCall(p *prog.Prog, info *flatrpc.CallInfo, call 
 		return
 	}
 	prio := signalPrio(p, info, call)
-	newFuncPointerCover := fuzzer.Cover.getNewFuncPointerCover(info.FuncStores)
+	newFuncPointerCover := fuzzer.Cover.addRawFuncPointerCover(info.FuncStores)
 	newMaxSignal := fuzzer.Cover.addRawMaxSignal(info.Signal, prio)
 	if newMaxSignal.Empty() && newFuncPointerCover.Empty() {
 		return

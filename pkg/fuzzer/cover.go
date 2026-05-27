@@ -17,7 +17,7 @@ type Cover struct {
 	funcPointerMu       sync.RWMutex
 	maxSignal           signal.Signal          // max signal ever observed (including flakes)
 	newSignal           signal.Signal          // newly identified max signal
-	maxFuncPointerCover cover.FuncPointerCover // max function pointer state coverage observed
+	maxFuncPointerCover cover.FuncPointerCover // max function pointer state coverage observed (including flakes)
 }
 
 func newCover() *Cover {
@@ -39,18 +39,12 @@ func (cover *Cover) addRawMaxSignal(signal []uint64, prio uint8) signal.Signal {
 	return diff
 }
 
-func (cover *Cover) getNewFuncPointerCover(newRaw cover.FuncPointerCoverRaw) cover.FuncPointerCover {
-	cover.funcPointerMu.RLock()
-	defer cover.funcPointerMu.RUnlock()
-	diff := cover.maxFuncPointerCover.DiffRaw(newRaw)
-	return diff
-}
-
-func (cover *Cover) addFuncPointerCover(new cover.FuncPointerCover) cover.FuncPointerCover {
+func (cover *Cover) addRawFuncPointerCover(newRaw cover.FuncPointerCoverRaw) cover.FuncPointerCover {
 	cover.funcPointerMu.Lock()
 	defer cover.funcPointerMu.Unlock()
-	cover.maxFuncPointerCover.Merge(new)
-	return cover.maxFuncPointerCover
+	diff := cover.maxFuncPointerCover.DiffRaw(newRaw)
+	cover.maxFuncPointerCover.Merge(diff)
+	return diff
 }
 
 func (cover *Cover) CopyMaxSignal() signal.Signal {
