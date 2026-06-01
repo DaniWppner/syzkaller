@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/syzkaller/pkg/cover"
 	"github.com/google/syzkaller/pkg/cover/backend"
 	"github.com/google/syzkaller/pkg/csource"
 	"github.com/google/syzkaller/pkg/db"
@@ -312,8 +313,9 @@ func (ctx *Context) printCallResults(info *flatrpc.ProgInfo) {
 		if inf.Flags&flatrpc.CallFlagFaultInjected != 0 {
 			flags += " faulted"
 		}
-		log.Logf(1, "CALL %v: signal %v, coverage %v errno %v%v",
-			i, len(inf.Signal), len(inf.Cover), inf.Error, flags)
+		fpcov := cover.FPCoverFromRaw(inf.FuncStores)
+		log.Logf(0, "CALL %v: signal %v, coverage %v, stored function pointers %v errno %v%v",
+			i, len(inf.Signal), len(inf.Cover), fpcov.Len(), inf.Error, flags)
 	}
 }
 
@@ -334,7 +336,7 @@ func (ctx *Context) printHints(p *prog.Prog, info *flatrpc.ProgInfo) {
 		p.MutateWithHints(i, comps, func(p *prog.Prog) bool {
 			ncandidates++
 			if ctx.output {
-				log.Logf(1, "PROGRAM:\n%s", p.Serialize())
+				log.Logf(0, "PROGRAM:\n%s", p.Serialize())
 			}
 			return true
 		})
@@ -343,29 +345,45 @@ func (ctx *Context) printHints(p *prog.Prog, info *flatrpc.ProgInfo) {
 }
 
 func (ctx *Context) dumpCallCoverage(coverFile string, info *flatrpc.CallInfo) {
-	if info == nil || len(info.Cover) == 0 {
+	if info == nil || (len(info.Cover) == 0 && len(info.FuncStores) == 0) {
 		return
 	}
 	sysTarget := targets.Get(ctx.target.OS, ctx.target.Arch)
-	buf := new(bytes.Buffer)
-	for _, pc := range info.Cover {
-		prev := backend.PreviousInstructionPC(sysTarget, "", pc)
-		fmt.Fprintf(buf, "0x%x\n", prev)
+	if len(info.Cover) > 0 {
+		buf := new(bytes.Buffer)
+		for _, pc := range info.Cover {
+			prev := backend.PreviousInstructionPC(sysTarget, "", pc)
+			fmt.Fprintf(buf, "0x%x\n", prev)
+		}
+		err := osutil.WriteFile(coverFile, buf.Bytes())
+		if err != nil {
+			log.Fatalf("failed to write coverage file: %v", err)
+		}
 	}
-	err := osutil.WriteFile(coverFile, buf.Bytes())
-	if err != nil {
-		log.Fatalf("failed to write coverage file: %v", err)
+	if len(info.FuncStores) > 0 {
+		buf := new(bytes.Buffer)
+		fpcov := cover.FPCoverFromRaw(info.FuncStores)
+		for store := range fpcov {
+			prev := backend.PreviousInstructionPC(sysTarget, "", store.PC)
+			fmt.Fprintf(buf, "0x%x 0x%x\n", prev, store.StoreValue)
+		}
+		err := osutil.WriteFile(coverFile+".fp", buf.Bytes())
+		if err != nil {
+			log.Fatalf("failed to write function pointer coverage file: %v", err)
+		}
 	}
 }
 
 func (ctx *Context) dumpCoverage(info *flatrpc.ProgInfo) {
 	coverFile := fmt.Sprintf("%s_prog%v", ctx.coverFile, ctx.resultIndex.Add(1))
 	for i, inf := range info.Calls {
-		log.Logf(0, "call #%v: signal %v, coverage %v", i, len(inf.Signal), len(inf.Cover))
+		fpcov := cover.FPCoverFromRaw(inf.FuncStores)
+		log.Logf(0, "call #%v: signal %v, coverage %v, stored function pointers %v", i, len(inf.Signal), len(inf.Cover), fpcov.Len())
 		ctx.dumpCallCoverage(fmt.Sprintf("%v.%v", coverFile, i), inf)
 	}
 	if info.Extra != nil {
-		log.Logf(0, "extra: signal %v, coverage %v", len(info.Extra.Signal), len(info.Extra.Cover))
+		fpcov := cover.FPCoverFromRaw(info.Extra.FuncStores)
+		log.Logf(0, "extra: signal %v, coverage %v, stored function pointers %v", len(info.Extra.Signal), len(info.Extra.Cover), fpcov.Len())
 		ctx.dumpCallCoverage(fmt.Sprintf("%v.extra", coverFile), info.Extra)
 	}
 }
