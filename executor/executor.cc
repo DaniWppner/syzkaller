@@ -366,6 +366,9 @@ struct cover_t {
 	uint32 data_size;
 	// data_end is simply data + data_size.
 	char* data_end;
+	// __tmp_copy_data is a buffer that parse_kcov_buffer needs to use
+	// it gets preallocated together with data.
+	char* __tmp_copy_data;
 	// Currently collecting comparisons.
 	bool collect_comps;
 	// Note: On everything but darwin the first value in data is the count of
@@ -1425,9 +1428,11 @@ void parse_kcov_buffer(cover_t* cov)
 	// This is because cov->data_size is the amount of readable bytes.
 	uint32 data_size_words = (cov->data_size) / sizeof(cover_data_t);
 
-	// We're going to fill tmp_data with pc entries front-to-back,
+	// Here __tmp_copy_data is the same preallocated buffer as the last time
+	// this thread parsed the kcov output of a syscall. We're going to take it
+	// dirty as it is and fill tmp_data with pc entries front-to-back,
 	// and back-to-front with store_func_pointer entries.
-	cover_data_t* tmp_data = (cover_data_t*)malloc(cov->data_size);
+	cover_data_t* tmp_data = (cover_data_t*)(cov->__tmp_copy_data);
 	uint32 tmp_data_end_index = data_size_words - 1;
 
 	// Since we're starting from cov->data + cov->data_offset,
@@ -1486,15 +1491,13 @@ void parse_kcov_buffer(cover_t* cov)
 		data_idx += KCOV_ENTRY_WORD_SIZE_FUN_POINTER;
 	}
 
-	// We need to cast back to char* in order to be able to store in cov->data.
+	// We need to cast back to char* in order to be able to store in cov->pc_data or store_func_data.
 	// Fear not as write_signal, etc. will know what format to expect in the byte array.
 	cov->pc_size = pc_count;
 	cov->pc_data = (char*)cover_data;
 
 	cov->store_func_size = store_func_count;
 	cov->store_func_data = (char*)(cover_data + store_func_start);
-
-	free(tmp_data);
 }
 
 void write_output(int index, cover_t* cov, rpc::CallFlag flags, uint32 error, bool all_signal)

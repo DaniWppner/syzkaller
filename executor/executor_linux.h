@@ -168,6 +168,7 @@ static void cover_mmap(cover_t* cov)
 	cov->data_end = cov->data + cov->data_size;
 	cov->data_offset = is_kernel_64_bit ? sizeof(uint64_t) : sizeof(uint32_t);
 	cov->pc_offset = 0;
+	cov->__tmp_copy_data = (char*)malloc(cov->data_size);
 }
 
 static void cover_munmap(cover_t* cov)
@@ -177,6 +178,10 @@ static void cover_munmap(cover_t* cov)
 	if (munmap(cov->mmap_alloc_ptr, cov->mmap_alloc_size))
 		fail("cover_munmap failed");
 	cov->mmap_alloc_ptr = NULL;
+	if (cov->__tmp_copy_data != NULL){
+		free(cov->__tmp_copy_data);
+		cov->__tmp_copy_data = NULL;
+	}
 }
 
 static void cover_enable(cover_t* cov, bool collect_comps, bool extra)
@@ -336,6 +341,8 @@ static const char* setup_delay_kcov()
 		munmap(cov.mmap_alloc_ptr, cov.mmap_alloc_size);
 	}
 	munmap(first, cov.mmap_alloc_size);
+	free(cov.__tmp_copy_data);
+	cov.__tmp_copy_data = NULL;
 	cover_close(&cov);
 	return error;
 }
