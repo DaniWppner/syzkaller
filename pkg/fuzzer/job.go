@@ -175,9 +175,13 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 
 	p := job.p
 	if job.flags&ProgMinimized == 0 {
-		p, call = job.minimize(call, info)
+		var minimizedSignal *signal.Signal
+		p, call, minimizedSignal = job.minimize(call, info)
 		if p == nil {
 			return
+		}
+		if minimizedSignal != nil {
+			info.stableSignal = info.stableSignal.Intersection(*minimizedSignal)
 		}
 	}
 	callName := p.CallName(call)
@@ -347,7 +351,7 @@ func (job *triageJob) stopDeflake(run, needRuns int, noNewSignal bool) bool {
 	return false
 }
 
-func (job *triageJob) minimize(call int, info *triageCall) (*prog.Prog, int) {
+func (job *triageJob) minimize(call int, info *triageCall) (*prog.Prog, int, *signal.Signal) {
 	job.info.Logf("[call #%d] minimize started", call)
 	minimizeAttempts := 3
 	if job.fuzzer.Config.Snapshot {
@@ -355,6 +359,7 @@ func (job *triageJob) minimize(call int, info *triageCall) (*prog.Prog, int) {
 	}
 	stop := false
 	mode := prog.MinimizeCorpus
+	var lastMergedSignal *signal.Signal
 	if job.fuzzer.Config.PatchTest {
 		mode = prog.MinimizeCallsOnly
 	}
@@ -387,6 +392,7 @@ func (job *triageJob) minimize(call int, info *triageCall) (*prog.Prog, int) {
 			if info.newStableSignal.Intersection(mergedSignal).Len() == info.newStableSignal.Len() {
 				job.info.Logf("[call #%d] minimization step success (|calls| = %d)",
 					call, len(p1.Calls))
+				lastMergedSignal = &mergedSignal
 				return true
 			}
 		}
@@ -394,9 +400,9 @@ func (job *triageJob) minimize(call int, info *triageCall) (*prog.Prog, int) {
 		return false
 	})
 	if stop {
-		return nil, 0
+		return nil, 0, nil
 	}
-	return p, call
+	return p, call, lastMergedSignal
 }
 
 func reexecutionSuccess(info *flatrpc.ProgInfo, oldErrno int32, call int) bool {
