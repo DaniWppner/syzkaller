@@ -387,6 +387,9 @@ func (job *triageJob) minimize(call int, info *triageCall) (*prog.Prog, int) {
 			if info.newStableSignal.Intersection(mergedSignal).Len() == info.newStableSignal.Len() {
 				job.info.Logf("[call #%d] minimization step success (|calls| = %d)",
 					call, len(p1.Calls))
+				keptStableSignal := info.stableSignal.Intersection(mergedSignal)
+				lostStableSignal := info.stableSignal.Len() - keptStableSignal.Len()
+				job.info.Logf("[call #%d] lost stableSignal size during minimization step: %d", call, lostStableSignal)
 				return true
 			}
 		}
