@@ -200,9 +200,9 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 	}
 	// else: do minimization
 	// coverType = 0 . Minimize keeping signal
-	pSignal, callSignal := job.minimize(call, info, 0)
+	pSignal, callSignal := job.minimize(call, info)
 	// coverType = 1 . Minimize keeping FuncPointerCover
-	pFPCov, callFPCov := job.minimize(call, info, 1)
+	pFPCov, callFPCov := job.minimize(call, info)
 
 	// If both are nil, we couldn't minimize either
 	if pSignal == nil && pFPCov == nil {
@@ -467,22 +467,36 @@ func (job *triageJob) stopDeflake(run, needRuns int, noNewSignal bool, noNewFPCo
 	return false
 }
 
-// minimize now works trying to preserve either signal.Signal or cover.FuncPointerCover.
-// Parameter coverType controls which.
+// minimize tries to preserve both newStableSignal and newStableFuncPointerCover.
+// Returns an array of minimized progs and call indexes.
+// position 0 --> Signal.
+// position 1 --> FuncPointerCover.
 //
-//	coverType = 0 --> Signal
-//	coverType = 1 --> FuncPointerCover
-func (job *triageJob) minimize(call int, info *triageCall, coverType int) (*prog.Prog, int) {
-	if !(coverType == 0 || coverType == 1) {
-		panic("triageJob.minimize coverType should be either 0 (Signal) or 1 (FuncPointerCover)")
-	}
-	if coverType == 0 && info.newStableSignal.Empty() {
+//	Returns (nil, 0) if test execution crashed on the last minimization step for that criteria.
+//	Returns (nil, 0) if stableCoverage is empty for that criteria.
+//	Returns (p, call) with the last pair that preserved the stableCoverage (the original pair if no minimization step succeeded).
+func (job *triageJob) minimize(call int, info *triageCall) ([2]*prog.Prog, [2]int) {
+	// resProg, resCall will be mantained to point to the last minimized program that was OK
+	resProg := [2]*prog.Prog{job.p, job.p}
+	resCall := [2]int{call, call}
+	doForSignal := true
+	doForFuncPointer := true
+	signalResultIdx := 0
+	funcPointerResultIdx := 1
+	if info.newStableSignal.Empty() {
 		job.info.Logf("call #%d [%s]: skip minimize of empty new stable signal", call, job.p.CallName(call))
-		return nil, 0
+		resProg[signalResultIdx] = nil
+		resCall[signalResultIdx] = 0
+		doForSignal = false
 	}
-	if coverType == 1 && info.newStableFuncPointerCover.Empty() {
+	if info.newStableFuncPointerCover.Empty() {
 		job.info.Logf("call #%d [%s]: skip minimize of empty new stable stored function pointers", call, job.p.CallName(call))
-		return nil, 0
+		resProg[funcPointerResultIdx] = nil
+		resCall[funcPointerResultIdx] = 0
+		doForFuncPointer = false
+	}
+	if !doForSignal && !doForFuncPointer {
+		return resProg, resCall
 	}
 	job.info.Logf("call #%d [%s]: minimize started", call, job.p.CallName(call))
 	minimizeAttempts := 3
@@ -494,10 +508,46 @@ func (job *triageJob) minimize(call int, info *triageCall, coverType int) (*prog
 	if job.fuzzer.Config.PatchTest {
 		mode = prog.MinimizeCallsOnly
 	}
-	p, call := prog.Minimize(job.p, call, mode, func(p1 *prog.Prog, call1 int) bool {
+	funcPointerSuccessLambda := func(mergedFPointerCover *cover.FuncPointerCover, p1 *prog.Prog, call1 int, thisFPointerCover *cover.FuncPointerCover) bool {
+		mergedFPointerCover.Merge(*thisFPointerCover)
+		if info.newStableFuncPointerCover.Intersection(*mergedFPointerCover).Len() == info.newStableFuncPointerCover.Len() {
+			job.info.Logf("call #%d [%s]: minimization step (funPointerCover) success (|calls| = %d)",
+				call, job.p.CallName(call), len(p1.Calls))
+			resProg[funcPointerResultIdx] = p1
+			resCall[funcPointerResultIdx] = call1
+			return true
+		}
+		return false
+	}
+	signalSuccessLambda := func(mergedSignal *signal.Signal, p1 *prog.Prog, call1 int, thisSignal *signal.Signal) bool {
+		if mergedSignal.Len() == 0 {
+			mergedSignal = thisSignal
+		} else {
+			mergedSignal.Merge(*thisSignal)
+		}
+		if info.newStableSignal.Intersection(*mergedSignal).Len() == info.newStableSignal.Len() {
+			job.info.Logf("call #%d [%s]: minimization step (signal) success (|calls| = %d)",
+				call, job.p.CallName(call), len(p1.Calls))
+			resProg[signalResultIdx] = p1
+			resCall[signalResultIdx] = call1
+			return true
+		}
+		return false
+	}
+	// prog.Minimize returns minimized p, call when our lambda function stops returning true.
+	// We ignore this and instead save to resProg and resCall as part of the lambda ourselves.
+	// This REQUIRES that prog.Minimize returns in p, call the last pair that was true for the lambda.
+	prog.Minimize(job.p, call, mode, func(p1 *prog.Prog, call1 int) bool {
 		if stop {
 			return false
 		}
+		if !doForFuncPointer && !doForSignal {
+			return false
+		}
+		// for each criteria, if we still need to check it, set it as not successful
+		// otherwise this is a way of skipping checking for that criteria
+		funcPointerStepSuccess := !doForFuncPointer
+		signalStepSuccess := !doForSignal
 		var mergedSignal signal.Signal
 		var mergedFPointerCover cover.FuncPointerCover
 		for range minimizeAttempts {
@@ -516,37 +566,37 @@ func (job *triageJob) minimize(call int, info *triageCall, coverType int) (*prog
 				continue
 			}
 			thisSignal, thisFPointerCover := getSignalAndCover(p1, result.Info, call1)
-			if mergedSignal.Len() == 0 {
-				mergedSignal = thisSignal
-			} else {
-				mergedSignal.Merge(thisSignal)
-			}
-			// Why the need to ask for Len == 0 ?
-			mergedFPointerCover.Merge(thisFPointerCover)
-
-			// Both mergedSignal and mergedFPointerCover will get calculated.
-			// We just care about one of them for deciding if the minimization step was successful.
-			if coverType == 0 {
-				if info.newStableSignal.Intersection(mergedSignal).Len() == info.newStableSignal.Len() {
-					job.info.Logf("call #%d [%s]: minimization step (signal) success (|calls| = %d)",
-						call, job.p.CallName(call), len(p1.Calls))
-					return true
-				}
-			} else {
-				if info.newStableFuncPointerCover.Intersection(mergedFPointerCover).Len() == info.newStableFuncPointerCover.Len() {
-					job.info.Logf("call #%d [%s]: minimization step (funPointerCover) success (|calls| = %d)",
-						call, job.p.CallName(call), len(p1.Calls))
-					return true
-				}
+			funcPointerStepSuccess := funcPointerStepSuccess || funcPointerSuccessLambda(&mergedFPointerCover, p1, call1, &thisFPointerCover)
+			signalStepSuccess := signalStepSuccess || signalSuccessLambda(&mergedSignal, p1, call1, &thisSignal)
+			if funcPointerStepSuccess && signalStepSuccess {
+				return true
 			}
 		}
-		job.info.Logf("call #%d [%s]: minimization step failure", call, job.p.CallName(call))
-		return false
+		// The step failed for at least one of the ongoing criteria.
+		// We need to set that criteria's minimization as complete.
+		if doForFuncPointer && !funcPointerStepSuccess {
+			job.info.Logf("call #%d [%s]: minimization step (funcPointerCover) failure", call, job.p.CallName(call))
+			doForFuncPointer = false
+		}
+		if doForSignal && !signalStepSuccess {
+			job.info.Logf("call #%d [%s]: minimization step (signal) failure", call, job.p.CallName(call))
+			doForSignal = false
+		}
+		return doForFuncPointer || doForSignal
 	})
 	if stop {
-		return nil, 0
+		// Set the criteria that we're still minimizing to nil.
+		// For the other one (if it exists) we "succesfully" minimized it and return it.
+		if doForFuncPointer {
+			resProg[funcPointerResultIdx] = nil
+			resCall[funcPointerResultIdx] = 0
+		}
+		if doForSignal {
+			resProg[signalResultIdx] = nil
+			resCall[signalResultIdx] = 0
+		}
 	}
-	return p, call
+	return resProg, resCall
 }
 
 func reexecutionSuccess(info *flatrpc.ProgInfo, oldErrno int32, call int) bool {
