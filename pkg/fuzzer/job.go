@@ -213,13 +213,15 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 		return
 	}
 
-	if !minimizationSplitted {
+	// we had to minimize both criteria and we got the same result for both
+	if !minimizationSplitted && pSignal != nil && pFPCov != nil {
 		// pick any
 		job.info.Logf("call #%d [%s]: minimization yielded same prog for signal and stored function pointers", call, p.CallName(call))
 		job.doHandleCall(pSignal, callSignal, info)
 	}
 
-	if minimizationSplitted && pSignal != nil {
+	// minimization either splitted or we were only minimizing signal in the first place
+	if pSignal != nil {
 		// we cannot guarantee stableFuncPointerCover anymore, since minimizing signal
 		// might have deleted calls necessary for the registered FuncPointerCover
 		signalInfo := new(triageCall)
@@ -231,7 +233,8 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 		job.doHandleCall(pSignal, callSignal, signalInfo)
 	}
 
-	if minimizationSplitted && pFPCov != nil {
+	// analogous case for FuncPointerCover
+	if pFPCov != nil {
 		// see above
 		fPCovInfo := new(triageCall)
 		*fPCovInfo = *info
@@ -244,6 +247,9 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 }
 
 func (job *triageJob) doHandleCall(p *prog.Prog, call int, info *triageCall) {
+	if p == nil {
+		panic(fmt.Sprintf("%s\ndoHandleCall called on nil program. call #%d, [prog-%s]", string(job.info.Bytes()), call, job.info.ProgId))
+	}
 	callName := p.CallName(call)
 
 	filteredRaw := filteredCoverage(info.cover.Serialize(), job.fuzzer.Config.DebugFilters)
