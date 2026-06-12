@@ -200,28 +200,26 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 		return
 	}
 	// else: do minimization
-	// coverType = 0 . Minimize keeping signal
-	pSignal, callSignal := job.minimize(call, info)
-	// coverType = 1 . Minimize keeping FuncPointerCover
-	pFPCov, callFPCov := job.minimize(call, info)
+	minimizedProgs, callIdxs, minimizationSplitted := job.minimize(call, info)
+	// idx 0 --> Minimize keeping signal
+	pSignal := minimizedProgs[0]
+	callSignal := callIdxs[0]
+	// idx 1 --> Minimize keeping FuncPointerCover
+	pFPCov := minimizedProgs[1]
+	callFPCov := callIdxs[1]
 
 	// If both are nil, we couldn't minimize either
 	if pSignal == nil && pFPCov == nil {
 		return
 	}
 
-	// If both are not nil, try to keep only one if they are equivalent
-	canUnify := pFPCov != nil && pSignal != nil &&
-		bytes.Equal(pSignal.Serialize(), pFPCov.Serialize()) &&
-		callFPCov == callSignal
-
-	if canUnify {
+	if !minimizationSplitted {
 		// pick any
 		job.info.Logf("call #%d [%s]: minimization yielded same prog for signal and stored function pointers", call, p.CallName(call))
 		job.doHandleCall(pSignal, callSignal, info)
 	}
 
-	if !canUnify && pSignal != nil {
+	if minimizationSplitted && pSignal != nil {
 		// we cannot guarantee stableFuncPointerCover anymore, since minimizing signal
 		// might have deleted calls necessary for the registered FuncPointerCover
 		signalInfo := new(triageCall)
@@ -233,7 +231,7 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 		job.doHandleCall(pSignal, callSignal, signalInfo)
 	}
 
-	if !canUnify && pFPCov != nil {
+	if minimizationSplitted && pFPCov != nil {
 		// see above
 		fPCovInfo := new(triageCall)
 		*fPCovInfo = *info
@@ -469,20 +467,21 @@ func (job *triageJob) stopDeflake(run, needRuns int, noNewSignal bool, noNewFPCo
 }
 
 // minimize tries to preserve both newStableSignal and newStableFuncPointerCover.
-// Returns an array of minimized progs and call indexes.
+// Returns a boolean value indicating if the result was unified and an array of minimized progs and call indexes.
 // position 0 --> Signal.
 // position 1 --> FuncPointerCover.
 //
 //	Returns (nil, 0) if test execution crashed on the last minimization step for that criteria.
 //	Returns (nil, 0) if stableCoverage is empty for that criteria.
 //	Returns (p, call) with the last pair that preserved the stableCoverage (the original pair if no minimization step succeeded).
-func (job *triageJob) minimize(call int, info *triageCall) ([2]*prog.Prog, [2]int) {
+func (job *triageJob) minimize(call int, info *triageCall) ([2]*prog.Prog, [2]int, bool) {
 	var skipFuncPointer bool
 	var skipSignal bool
 	var lastProgSignal *prog.Prog
 	var lastProgFuncPointer *prog.Prog
 	var lastCallSignal int
 	var lastCallFuncPointer int
+	didSplit := false
 	if info.newStableSignal.Empty() {
 		job.info.Logf("call #%d [%s]: skip minimize of empty new stable signal", call, job.p.CallName(call))
 		skipSignal = true
@@ -492,7 +491,7 @@ func (job *triageJob) minimize(call int, info *triageCall) ([2]*prog.Prog, [2]in
 		skipFuncPointer = true
 	}
 	if skipFuncPointer && skipSignal {
-		return [2]*prog.Prog{nil, nil}, [2]int{0, 0}
+		return [2]*prog.Prog{nil, nil}, [2]int{0, 0}, false
 	}
 	job.info.Logf("call #%d [%s]: minimize started", call, job.p.CallName(call))
 	minimizeAttempts := 3
@@ -503,7 +502,7 @@ func (job *triageJob) minimize(call int, info *triageCall) ([2]*prog.Prog, [2]in
 	funcPointerSuccessLambda := func(mergedFPointerCover *cover.FuncPointerCover, p1 *prog.Prog, call1 int, thisFPointerCover *cover.FuncPointerCover) bool {
 		mergedFPointerCover.Merge(*thisFPointerCover)
 		if info.newStableFuncPointerCover.Intersection(*mergedFPointerCover).Len() == info.newStableFuncPointerCover.Len() {
-			job.info.Logf("call #%d [%s]: minimization step (funPointerCover) success (|calls| = %d)",
+			job.info.Logf("call #%d [%s]: minimization step (funcPointerCover) success (|calls| = %d)",
 				call, job.p.CallName(call), len(p1.Calls))
 			lastCallFuncPointer = call1
 			lastProgFuncPointer = p1
@@ -597,6 +596,8 @@ func (job *triageJob) minimize(call int, info *triageCall) ([2]*prog.Prog, [2]in
 				// We can do so by knowing this process is wrapped into a goroutine and exiting with runtime.Goexit.
 				var wg sync.WaitGroup
 				wg.Add(2)
+				job.info.Logf("call #%d [%s]: minimization step splitted", call, job.p.CallName(call))
+				didSplit = true
 				go func() {
 					//signal
 					defer wg.Done()
@@ -641,7 +642,7 @@ func (job *triageJob) minimize(call int, info *triageCall) ([2]*prog.Prog, [2]in
 		minimizeFactory(!skipSignal, !skipFuncPointer, job.p, call)
 	}()
 	wgOuter.Wait()
-	return [2]*prog.Prog{lastProgSignal, lastProgFuncPointer}, [2]int{lastCallSignal, lastCallFuncPointer}
+	return [2]*prog.Prog{lastProgSignal, lastProgFuncPointer}, [2]int{lastCallSignal, lastCallFuncPointer}, didSplit
 }
 
 func reexecutionSuccess(info *flatrpc.ProgInfo, oldErrno int32, call int) bool {
