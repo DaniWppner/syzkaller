@@ -221,7 +221,7 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 	}
 
 	// minimization either splitted or we were only minimizing signal in the first place
-	if pSignal != nil {
+	if (minimizationSplitted || pFPCov == nil) && pSignal != nil {
 		// we cannot guarantee stableFuncPointerCover anymore, since minimizing signal
 		// might have deleted calls necessary for the registered FuncPointerCover
 		signalInfo := new(triageCall)
@@ -234,7 +234,7 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 	}
 
 	// analogous case for FuncPointerCover
-	if pFPCov != nil {
+	if (minimizationSplitted || pSignal == nil) && pFPCov != nil {
 		// see above
 		fPCovInfo := new(triageCall)
 		*fPCovInfo = *info
