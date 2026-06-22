@@ -341,7 +341,7 @@ func (fuzzer *Fuzzer) startJob(stat *stat.Val, newJob job) {
 
 		if job_obj, ok := newJob.(jobIntrospector); ok {
 			job_logbytes := job_obj.getInfo().Bytes()
-			fuzzer.Logf(5, string(job_logbytes))
+			fuzzer.Logf(5, "%s", job_logbytes)
 		}
 	}()
 }
