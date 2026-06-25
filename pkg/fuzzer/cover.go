@@ -5,6 +5,7 @@ package fuzzer
 
 import (
 	"sync"
+	"time"
 
 	"github.com/google/syzkaller/pkg/cover"
 	"github.com/google/syzkaller/pkg/signal"
@@ -39,12 +40,13 @@ func (cover *Cover) addRawMaxSignal(signal []uint64, prio uint8) signal.Signal {
 	return diff
 }
 
-func (cover *Cover) addRawFuncPointerCover(newRaw cover.FuncPointerCoverRaw) cover.FuncPointerCover {
+func (cover *Cover) addRawFuncPointerCover(newRaw cover.FuncPointerCoverRaw) (cover.FuncPointerCover, time.Duration) {
+	start := time.Now()
 	cover.funcPointerMu.Lock()
 	defer cover.funcPointerMu.Unlock()
-	diff := cover.maxFuncPointerCover.DiffRaw(newRaw)
+	diff, _ := cover.maxFuncPointerCover.DiffRaw(newRaw)
 	cover.maxFuncPointerCover.Merge(diff)
-	return diff
+	return diff, time.Since(start)
 }
 
 func (cover *Cover) CopyMaxSignal() signal.Signal {

@@ -4,6 +4,7 @@ package cover
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/syzkaller/pkg/flatrpc"
 )
@@ -26,12 +27,13 @@ func (fpcov FuncPointerCover) Empty() bool {
 	return len(fpcov) == 0
 }
 
-func (fpcov FuncPointerCover) Copy() FuncPointerCover {
+func (fpcov FuncPointerCover) Copy() (FuncPointerCover, time.Duration) {
+	start := time.Now()
 	res := make(FuncPointerCover, len(fpcov))
 	for store := range fpcov {
 		res[store] = struct{}{}
 	}
-	return res
+	return res, time.Since(start)
 }
 
 func (fpcov FuncPointerCover) Preview() string {
@@ -53,9 +55,10 @@ func (fpcov FuncPointerCover) Preview() string {
 	return ""
 }
 
-func FPCoverFromRaw(raw FuncPointerCoverRaw) FuncPointerCover {
+func FPCoverFromRaw(raw FuncPointerCoverRaw) (FuncPointerCover, time.Duration) {
+	start := time.Now()
 	if len(raw) == 0 {
-		return nil
+		return nil, time.Since(start)
 	}
 	fpcov := make(FuncPointerCover, len(raw))
 	for _, entry := range raw {
@@ -63,10 +66,11 @@ func FPCoverFromRaw(raw FuncPointerCoverRaw) FuncPointerCover {
 			PC:         entry.Pc,
 			StoreValue: entry.StoreValue}] = struct{}{}
 	}
-	return fpcov
+	return fpcov, time.Since(start)
 }
 
-func (fpcov FuncPointerCover) DiffRaw(raw FuncPointerCoverRaw) FuncPointerCover {
+func (fpcov FuncPointerCover) DiffRaw(raw FuncPointerCoverRaw) (FuncPointerCover, time.Duration) {
+	start := time.Now()
 	var res FuncPointerCover
 	for _, entry := range raw {
 		store := FuncPointerPCEntry{PC: entry.Pc, StoreValue: entry.StoreValue}
@@ -78,21 +82,23 @@ func (fpcov FuncPointerCover) DiffRaw(raw FuncPointerCoverRaw) FuncPointerCover 
 		}
 		res[store] = struct{}{}
 	}
-	return res
+	return res, time.Since(start)
 }
 
-func (fpcov FuncPointerCover) IntersectsWith(other FuncPointerCover) bool {
+func (fpcov FuncPointerCover) IntersectsWith(other FuncPointerCover) (bool, time.Duration) {
+	start := time.Now()
 	for store := range fpcov {
 		if _, ok := other[store]; ok {
-			return true
+			return true, time.Since(start)
 		}
 	}
-	return false
+	return false, time.Since(start)
 }
 
-func (fpcov FuncPointerCover) Intersection(other FuncPointerCover) FuncPointerCover {
+func (fpcov FuncPointerCover) Intersection(other FuncPointerCover) (FuncPointerCover, time.Duration) {
+	start := time.Now()
 	if other.Empty() {
-		return nil
+		return nil, time.Since(start)
 	}
 	res := make(FuncPointerCover, len(fpcov))
 	for store := range fpcov {
@@ -100,12 +106,13 @@ func (fpcov FuncPointerCover) Intersection(other FuncPointerCover) FuncPointerCo
 			res[store] = struct{}{}
 		}
 	}
-	return res
+	return res, time.Since(start)
 }
 
-func (fpcov *FuncPointerCover) Merge(new FuncPointerCover) {
+func (fpcov *FuncPointerCover) Merge(new FuncPointerCover) time.Duration {
+	start := time.Now()
 	if new.Empty() {
-		return
+		return time.Since(start)
 	}
 	fpc := *fpcov
 	if fpc == nil {
@@ -115,4 +122,5 @@ func (fpcov *FuncPointerCover) Merge(new FuncPointerCover) {
 	for store := range new {
 		fpc[store] = struct{}{}
 	}
+	return time.Since(start)
 }

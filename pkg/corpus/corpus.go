@@ -149,7 +149,9 @@ func (corpus *Corpus) Save(inp NewInput) {
 		var newCover cover.Cover
 		newCover.Merge(old.Cover)
 		newCover.Merge(inp.Cover)
-		newFuncPointerCover := old.FuncPointerCover.Copy()
+		// FIXME: We are ignoring the time cost of these FuncPointerCover
+		// operations, whish should be logged. But we are assuming they'll be insignificant.
+		newFuncPointerCover, _ := old.FuncPointerCover.Copy()
 		newFuncPointerCover.Merge(inp.FuncPointerCover)
 		newItem := &Item{
 			Sig:              sig,

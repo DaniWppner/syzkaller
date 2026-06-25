@@ -227,12 +227,18 @@ type Config struct {
 	DebugFilters   map[uint64]struct{}
 }
 
+func (fuzzer *Fuzzer) logFuncPointerCoverOperationTime(p string, duration time.Duration) {
+	fuzzer.Logf(5, "[prog-%s] function pointer calculation %d seconds", p, duration.Seconds())
+}
+
 func (fuzzer *Fuzzer) triageProgCall(p *prog.Prog, info *flatrpc.CallInfo, call int, triage *map[int]*triageCall) {
 	if info == nil {
 		return
 	}
 	prio := signalPrio(p, info, call)
-	newFuncPointerCover := fuzzer.Cover.addRawFuncPointerCover(info.FuncStores)
+	newFuncPointerCover, rwfpc_duration := fuzzer.Cover.addRawFuncPointerCover(info.FuncStores)
+	fuzzer.logFuncPointerCoverOperationTime(p.GetUuid(), rwfpc_duration)
+
 	newMaxSignal := fuzzer.Cover.addRawMaxSignal(info.Signal, prio)
 	if newMaxSignal.Empty() && newFuncPointerCover.Empty() {
 		return
@@ -250,12 +256,14 @@ func (fuzzer *Fuzzer) triageProgCall(p *prog.Prog, info *flatrpc.CallInfo, call 
 	if *triage == nil {
 		*triage = make(map[int]*triageCall)
 	}
+	initialFPCover, fromRawDuration := cover.FPCoverFromRaw(info.FuncStores)
+	fuzzer.logFuncPointerCoverOperationTime(p.GetUuid(), fromRawDuration)
 	(*triage)[call] = &triageCall{
 		errno:               info.Error,
 		newSignal:           newMaxSignal,
 		newFuncPointerCover: newFuncPointerCover,
 		signals:             [deflakeNeedRuns]signal.Signal{signal.FromRaw(info.Signal, prio)},
-		funcPointerCovers:   [deflakeNeedRuns]cover.FuncPointerCover{cover.FPCoverFromRaw(info.FuncStores)},
+		funcPointerCovers:   [deflakeNeedRuns]cover.FuncPointerCover{initialFPCover},
 	}
 }
 
@@ -336,12 +344,23 @@ func (fuzzer *Fuzzer) startJob(stat *stat.Val, newJob job) {
 				fuzzer.mu.Unlock()
 			}()
 		}
-
+		jobStart := time.Now()
 		newJob.run(fuzzer)
-
+		jobDuration := time.Since(jobStart)
 		if job_obj, ok := newJob.(jobIntrospector); ok {
-			job_logbytes := job_obj.getInfo().Bytes()
-			fuzzer.Logf(5, "%s", job_logbytes)
+			jobInfo := job_obj.getInfo()
+			jobInfo.Logf("total job duration: %d seconds", jobDuration.Seconds())
+			if jobInfo.ExecRequestTotal.Load() > 0 {
+				jobInfo.Logf("%d total test case executions", jobInfo.ExecRequestTotal.Load())
+				jobInfo.Logf("%d new test case executions because of function pointer coverage", jobInfo.ExecRequestBecauseOfFPCov.Load())
+			}
+			if jobInfo.ExecTime.Load() > 0 {
+				jobInfo.Logf("test executions job duration: %d seconds", jobInfo.ExecTime.Load())
+			}
+			if jobInfo.FPCovCalculationsTime.Load() > 0 {
+				fuzzer.logFuncPointerCoverOperationTime(jobInfo.ProgId, time.Duration(jobInfo.FPCovCalculationsTime.Load()))
+			}
+			fuzzer.Logf(5, "%s", jobInfo.Bytes())
 		}
 	}()
 }

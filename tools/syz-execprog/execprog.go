@@ -313,7 +313,8 @@ func (ctx *Context) printCallResults(info *flatrpc.ProgInfo) {
 		if inf.Flags&flatrpc.CallFlagFaultInjected != 0 {
 			flags += " faulted"
 		}
-		fpcov := cover.FPCoverFromRaw(inf.FuncStores)
+		// Ignore the time cost of these operations; we're not fuzzing
+		fpcov, _ := cover.FPCoverFromRaw(inf.FuncStores)
 		log.Logf(0, "CALL %v: signal %v, coverage %v, stored function pointers %v errno %v%v",
 			i, len(inf.Signal), len(inf.Cover), fpcov.Len(), inf.Error, flags)
 	}
@@ -362,7 +363,8 @@ func (ctx *Context) dumpCallCoverage(coverFile string, info *flatrpc.CallInfo) {
 	}
 	if len(info.FuncStores) > 0 {
 		buf := new(bytes.Buffer)
-		fpcov := cover.FPCoverFromRaw(info.FuncStores)
+		// Ignore the time cost of these operations; we're not fuzzing
+		fpcov, _ := cover.FPCoverFromRaw(info.FuncStores)
 		for store := range fpcov {
 			prev := backend.PreviousInstructionPC(sysTarget, "", store.PC)
 			fmt.Fprintf(buf, "0x%x 0x%x\n", prev, store.StoreValue)
@@ -377,12 +379,14 @@ func (ctx *Context) dumpCallCoverage(coverFile string, info *flatrpc.CallInfo) {
 func (ctx *Context) dumpCoverage(info *flatrpc.ProgInfo) {
 	coverFile := fmt.Sprintf("%s_prog%v", ctx.coverFile, ctx.resultIndex.Add(1))
 	for i, inf := range info.Calls {
-		fpcov := cover.FPCoverFromRaw(inf.FuncStores)
+		// Ignore the time cost of these operations; we're not fuzzing
+		fpcov, _ := cover.FPCoverFromRaw(inf.FuncStores)
 		log.Logf(0, "call #%v: signal %v, coverage %v, stored function pointers %v", i, len(inf.Signal), len(inf.Cover), fpcov.Len())
 		ctx.dumpCallCoverage(fmt.Sprintf("%v.%v", coverFile, i), inf)
 	}
 	if info.Extra != nil {
-		fpcov := cover.FPCoverFromRaw(info.Extra.FuncStores)
+		// Ignore the time cost of these operations; we're not fuzzing
+		fpcov, _ := cover.FPCoverFromRaw(info.Extra.FuncStores)
 		log.Logf(0, "extra: signal %v, coverage %v, stored function pointers %v", len(info.Extra.Signal), len(info.Extra.Cover), fpcov.Len())
 		ctx.dumpCallCoverage(fmt.Sprintf("%v.extra", coverFile), info.Extra)
 	}
