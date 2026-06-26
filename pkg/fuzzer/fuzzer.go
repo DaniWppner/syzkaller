@@ -83,6 +83,7 @@ func (fuzzer *Fuzzer) RecommendedCalls() int {
 type execQueues struct {
 	triageCandidateQueue *queue.DynamicOrderer
 	candidateQueue       *queue.PlainQueue
+	fPCovSmashQueue      *queue.PlainQueue
 	triageQueue          *queue.DynamicOrderer
 	smashQueue           *queue.PlainQueue
 	source               queue.Source
@@ -92,6 +93,7 @@ func newExecQueues(fuzzer *Fuzzer) execQueues {
 	ret := execQueues{
 		triageCandidateQueue: queue.DynamicOrder(),
 		candidateQueue:       queue.Plain(),
+		fPCovSmashQueue:      queue.Plain(),
 		triageQueue:          queue.DynamicOrder(),
 		smashQueue:           queue.Plain(),
 	}
@@ -107,6 +109,7 @@ func newExecQueues(fuzzer *Fuzzer) execQueues {
 	ret.source = queue.Order(
 		ret.triageCandidateQueue,
 		ret.candidateQueue,
+		ret.fPCovSmashQueue,
 		ret.triageQueue,
 		queue.Alternate(ret.smashQueue, skipQueue),
 		queue.Callback(fuzzer.genFuzz),
@@ -168,9 +171,10 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 				queue:    queue.Append(),
 				calls:    triage,
 				info: &JobInfo{
-					Name:   req.Prog.String(),
-					Type:   "triage",
-					ProgId: req.Prog.GetUuid(),
+					Name:            req.Prog.String(),
+					Type:            "triage",
+					ProgId:          req.Prog.GetUuid(),
+					FromFPCovOrigin: req.FromFPCovOrigin,
 				},
 			}
 			for id := range triage {

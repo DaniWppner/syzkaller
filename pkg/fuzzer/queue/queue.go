@@ -51,6 +51,9 @@ type Request struct {
 	// It allows wrappers to intercept Done() requests.
 	callback DoneCallback
 
+	// Whether this request was generated thanks to considering Function Pointer Coverage
+	FromFPCovOrigin bool
+
 	onceCrashed  bool
 	delayedSince uint64
 

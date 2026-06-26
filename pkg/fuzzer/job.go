@@ -34,13 +34,14 @@ type JobInfo struct {
 	Type     string
 	Execs    atomic.Int32
 	ExecTime atomic.Int64
+	ProgId   string
 	// debug counter of the amount of times a testcase execution was triggered
 	// due to functionPointerCoverage and in general.
 	// This is slightly duplicate with job.info.Execs
 	ExecRequestBecauseOfFPCov atomic.Int32
 	ExecRequestTotal          atomic.Int32
 	FPCovCalculationsTime     atomic.Int64
-	ProgId                    string
+	FromFPCovOrigin           bool
 
 	syncBuffer
 }
@@ -206,7 +207,7 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 	// skip minimization
 	if job.flags&ProgMinimized != 0 {
 		job.info.Logf("call #%d [%s]: skip minimize", call, p.CallName(call))
-		job.doHandleCall(p, call, info)
+		job.doHandleCall(p, call, info, false)
 		return
 	}
 	// else: do minimization
@@ -227,7 +228,7 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 	if !minimizationSplitted && pSignal != nil && pFPCov != nil {
 		// pick any
 		job.info.Logf("call #%d [%s]: minimization yielded same prog for signal and stored function pointers", call, p.CallName(call))
-		job.doHandleCall(pSignal, callSignal, info)
+		job.doHandleCall(pSignal, callSignal, info, false)
 	}
 
 	// minimization either splitted or we were only minimizing signal in the first place
@@ -240,7 +241,7 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 		signalInfo.newStableFuncPointerCover = nil
 		job.info.Logf("call #%d [%s]: minimization yielded prog for signal different from stored function pointers. New prog (call #%d):\n%s",
 			call, p.CallName(call), callSignal, pSignal.Serialize())
-		job.doHandleCall(pSignal, callSignal, signalInfo)
+		job.doHandleCall(pSignal, callSignal, signalInfo, false)
 	}
 
 	// analogous case for FuncPointerCover
@@ -252,11 +253,14 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 		fPCovInfo.newStableSignal = nil
 		job.info.Logf("call #%d [%s]: minimization yielded prog for stored function pointers different from signal. New prog (call #%d):\n%s",
 			call, p.CallName(call), callFPCov, pFPCov.Serialize())
-		job.doHandleCall(pFPCov, callFPCov, fPCovInfo)
+		job.doHandleCall(pFPCov, callFPCov, fPCovInfo, true)
 	}
 }
 
-func (job *triageJob) doHandleCall(p *prog.Prog, call int, info *triageCall) {
+func (job *triageJob) doHandleCall(p *prog.Prog, call int, info *triageCall, fPCovOrigin bool) {
+	// Callers of doHandleCall are telling us whether we should force fPCovOrigin.
+	// But we'll also allow chidlren jobs to inherit the fPCovOrigin tag from this triage process.
+	fPCovOrigin = fPCovOrigin || job.info.FromFPCovOrigin
 	if p == nil {
 		panic(fmt.Sprintf("%s\ndoHandleCall called on nil program. call #%d, [prog-%s]", string(job.info.Bytes()), call, job.info.ProgId))
 	}
@@ -270,40 +274,47 @@ func (job *triageJob) doHandleCall(p *prog.Prog, call int, info *triageCall) {
 	if !job.fuzzer.Config.NewInputFilter(callName) {
 		return
 	}
+	smashJobQueue := job.fuzzer.smashQueue
+	if fPCovOrigin {
+		smashJobQueue = job.fuzzer.fPCovSmashQueue
+	}
 	if job.flags&ProgSmashed == 0 {
 		job.fuzzer.startJob(job.fuzzer.statJobsSmash, &smashJob{
-			exec: job.fuzzer.smashQueue,
+			exec: smashJobQueue,
 			p:    p.Clone(),
 			info: &JobInfo{
-				Name:   p.String(),
-				Type:   "smash",
-				Calls:  []string{p.CallName(call)},
-				ProgId: job.info.ProgId,
+				Name:            p.String(),
+				Type:            "smash",
+				Calls:           []string{p.CallName(call)},
+				ProgId:          job.info.ProgId,
+				FromFPCovOrigin: fPCovOrigin,
 			},
 		})
 		if job.fuzzer.Config.Comparisons && call >= 0 {
 			job.fuzzer.startJob(job.fuzzer.statJobsHints, &hintsJob{
-				exec: job.fuzzer.smashQueue,
+				exec: smashJobQueue,
 				p:    p.Clone(),
 				call: call,
 				info: &JobInfo{
-					Name:   p.String(),
-					Type:   "hints",
-					Calls:  []string{p.CallName(call)},
-					ProgId: job.info.ProgId,
+					Name:            p.String(),
+					Type:            "hints",
+					Calls:           []string{p.CallName(call)},
+					ProgId:          job.info.ProgId,
+					FromFPCovOrigin: fPCovOrigin,
 				},
 			})
 		}
 		if job.fuzzer.Config.FaultInjection && call >= 0 {
 			job.fuzzer.startJob(job.fuzzer.statJobsFaultInjection, &faultInjectionJob{
-				exec: job.fuzzer.smashQueue,
+				exec: smashJobQueue,
 				p:    p.Clone(),
 				call: call,
 				info: &JobInfo{
-					Name:   p.String(),
-					Type:   "fault-injection",
-					Calls:  []string{p.CallName(call)},
-					ProgId: job.info.ProgId,
+					Name:            p.String(),
+					Type:            "fault-injection",
+					Calls:           []string{p.CallName(call)},
+					ProgId:          job.info.ProgId,
+					FromFPCovOrigin: fPCovOrigin,
 				},
 			})
 		}
@@ -743,14 +754,19 @@ func (job *smashJob) run(fuzzer *Fuzzer) {
 			fuzzer.Config.NoMutateCalls,
 			fuzzer.Config.Corpus.Programs())
 		result := fuzzer.execute(job.exec, &queue.Request{
-			Prog:     p,
-			ExecOpts: setFlags(flatrpc.ExecFlagCollectSignal),
-			Stat:     fuzzer.statExecSmash,
+			Prog:            p,
+			ExecOpts:        setFlags(flatrpc.ExecFlagCollectSignal),
+			Stat:            fuzzer.statExecSmash,
+			FromFPCovOrigin: job.info.FromFPCovOrigin,
 		})
 		if result.Stop() {
 			return
 		}
 		job.info.Execs.Add(1)
+		job.info.ExecRequestTotal.Add(1)
+		if job.info.FromFPCovOrigin {
+			job.info.ExecRequestBecauseOfFPCov.Add(1)
+		}
 	}
 }
 
@@ -881,8 +897,10 @@ type syncBuffer struct {
 func (ji *JobInfo) Logf(logFmt string, args ...any) {
 	ji.mu.Lock()
 	defer ji.mu.Unlock()
-
 	fmt.Fprintf(&ji.buf, "%s [%s-%s] [prog-%s]: ", time.Now().Format(time.DateTime), ji.Type, ji.ID(), ji.ProgId)
+	if ji.FromFPCovOrigin {
+		fmt.Fprintf(&ji.buf, "[fpcov-orig] ")
+	}
 	fmt.Fprintf(&ji.buf, logFmt, args...)
 	ji.buf.WriteByte('\n')
 }
