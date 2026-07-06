@@ -232,7 +232,8 @@ type Config struct {
 }
 
 func (fuzzer *Fuzzer) logFuncPointerCoverOperationTime(p string, duration time.Duration) {
-	fuzzer.Logf(5, "[prog-%s] function pointer calculation %f seconds", p, duration.Seconds())
+	//fuzzer.Logf(5, "[prog-%s] function pointer calculation %f seconds", p, duration.Seconds())
+	return
 }
 
 func (fuzzer *Fuzzer) triageProgCall(p *prog.Prog, info *flatrpc.CallInfo, call int, triage *map[int]*triageCall) {
