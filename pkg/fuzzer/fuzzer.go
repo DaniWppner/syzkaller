@@ -109,7 +109,7 @@ func newExecQueues(fuzzer *Fuzzer) execQueues {
 	ret.source = queue.Order(
 		ret.triageCandidateQueue,
 		ret.candidateQueue,
-		ret.fPCovSmashQueue,
+		queue.Alternate(ret.fPCovSmashQueue, skipQueue),
 		ret.triageQueue,
 		queue.Alternate(ret.smashQueue, skipQueue),
 		queue.Callback(fuzzer.genFuzz),
