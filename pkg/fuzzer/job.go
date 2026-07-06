@@ -5,6 +5,7 @@ package fuzzer
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"runtime"
@@ -29,19 +30,24 @@ type jobIntrospector interface {
 }
 
 type JobInfo struct {
-	Name     string
-	Calls    []string
-	Type     string
-	Execs    atomic.Int32
-	ExecTime atomic.Int64
-	ProgId   string
+	Name   string
+	Calls  []string
+	Type   string
+	Execs  atomic.Int32
+	ProgId string
 	// debug counter of the amount of times a testcase execution was triggered
 	// due to functionPointerCoverage and in general.
 	// This is slightly duplicate with job.info.Execs
 	ExecRequestBecauseOfFPCov atomic.Int32
 	ExecRequestTotal          atomic.Int32
-	FPCovCalculationsTime     atomic.Int64
-	FromFPCovOrigin           bool
+
+	ExecTimeTotal          atomic.Int64
+	ExecTimeBecauseOfFPCov atomic.Int64
+	ExecsTimeLapses        syncTimePairArray
+	ExecsTimeLapsesFPCov   syncTimePairArray
+
+	FPCovCalculationsTime atomic.Int64
+	FromFPCovOrigin       bool
 
 	syncBuffer
 }
@@ -159,9 +165,23 @@ const (
 func (job *triageJob) execute(req *queue.Request, flags ProgFlags) *queue.Result {
 	defer job.info.Execs.Add(1)
 	req.Important = true // All triage executions are important.
+	// Make sure to spread the fromFPCovOrigin taint into the requests
+	if job.info.FromFPCovOrigin {
+		req.FromFPCovOrigin = true
+	}
+
 	execStart := time.Now()
 	execResult := job.fuzzer.executeWithFlags(job.queue, req, flags)
-	job.info.ExecTime.Add(int64(time.Since(execStart)))
+	execEnd := time.Now()
+	execTime := execEnd.Sub(execStart)
+
+	job.info.ExecTimeTotal.Add(int64(execTime))
+	job.info.ExecsTimeLapses.AppendAtomic(execStart, execEnd)
+	if req.FromFPCovOrigin {
+		job.info.ExecTimeBecauseOfFPCov.Add(int64(execTime))
+		job.info.ExecsTimeLapsesFPCov.AppendAtomic(execStart, execEnd)
+	}
+
 	return execResult
 }
 
@@ -606,16 +626,18 @@ func (job *triageJob) minimize(call int, info *triageCall) ([2]*prog.Prog, [2]in
 			var successFuncPointer bool
 
 			for range minimizeAttempts {
-				if doFuncPointer && !doSignal {
-					job.info.ExecRequestBecauseOfFPCov.Add(1)
-				}
-				job.info.ExecRequestTotal.Add(1)
-				result := job.execute(&queue.Request{
+				nextRequest := queue.Request{
 					Prog:            p1,
 					ExecOpts:        setFlags(flatrpc.ExecFlagCollectSignal),
 					ReturnAllSignal: []int{call1},
 					Stat:            job.fuzzer.statExecMinimize,
-				}, 0)
+				}
+				if doFuncPointer && !doSignal {
+					job.info.ExecRequestBecauseOfFPCov.Add(1)
+					nextRequest.FromFPCovOrigin = true
+				}
+				job.info.ExecRequestTotal.Add(1)
+				result := job.execute(&nextRequest, 0)
 				if result.Stop() {
 					stop = true
 					return false
@@ -887,6 +909,32 @@ func (job *hintsJob) run(fuzzer *Fuzzer) {
 
 func (job *hintsJob) getInfo() *JobInfo {
 	return job.info
+}
+
+type syncTimePairArray struct {
+	mu  sync.RWMutex
+	arr [][2]time.Time
+}
+
+func (stpa *syncTimePairArray) AppendAtomic(start time.Time, end time.Time) {
+	stpa.mu.Lock()
+	defer stpa.mu.Unlock()
+	stpa.arr = append(stpa.arr, [2]time.Time{start, end})
+}
+
+func (stpa *syncTimePairArray) AsJson() ([]byte, error) {
+	stpa.mu.RLock()
+	defer stpa.mu.RUnlock()
+	// array where each position has 2 maps from string to string
+	mapFormatted := []map[string]string{}
+	for _, startEnd := range stpa.arr {
+		entry := map[string]string{}
+		entry["TimeStart"] = startEnd[0].Format(time.DateTime)
+		entry["TimeEnd"] = startEnd[1].Format(time.DateTime)
+		entry["DurationSeconds"] = fmt.Sprintf("%f", startEnd[1].Sub(startEnd[0]).Seconds())
+		mapFormatted = append(mapFormatted, entry)
+	}
+	return json.Marshal(mapFormatted)
 }
 
 type syncBuffer struct {

@@ -352,24 +352,45 @@ func (fuzzer *Fuzzer) startJob(stat *stat.Val, newJob job) {
 		jobStart := time.Now()
 		newJob.run(fuzzer)
 		jobDuration := time.Since(jobStart)
-		if job_obj, ok := newJob.(jobIntrospector); ok {
-			jobInfo := job_obj.getInfo()
-			jobInfo.Logf("total job duration: %f seconds", jobDuration.Seconds())
-			if jobInfo.ExecRequestTotal.Load() > 0 {
-				jobInfo.Logf("%d total test case executions", jobInfo.ExecRequestTotal.Load())
-				jobInfo.Logf("%d new test case executions because of function pointer coverage", jobInfo.ExecRequestBecauseOfFPCov.Load())
-			}
-			if jobInfo.ExecTime.Load() > 0 {
-				_execTime := time.Duration(jobInfo.ExecTime.Load())
-				jobInfo.Logf("test executions job duration: %f seconds", _execTime.Seconds())
-			}
-			if jobInfo.FPCovCalculationsTime.Load() > 0 {
-				_fPCovCalculationsTime := time.Duration(jobInfo.FPCovCalculationsTime.Load())
-				fuzzer.logFuncPointerCoverOperationTime(jobInfo.ProgId, _fPCovCalculationsTime)
-			}
-			fuzzer.Logf(5, "%s", jobInfo.Bytes())
+		if jobObj, ok := newJob.(jobIntrospector); ok {
+			fuzzer.logJobResults(jobObj.getInfo(), jobDuration)
 		}
 	}()
+}
+
+func (fuzzer *Fuzzer) logJobResults(jobInfo *JobInfo, jobDuration time.Duration) {
+	jobInfo.Logf("total job duration: %f seconds", jobDuration.Seconds())
+
+	if jobInfo.ExecRequestTotal.Load() > 0 {
+		jobInfo.Logf("%d total test case executions", jobInfo.ExecRequestTotal.Load())
+		jobInfo.Logf("%d new test case executions because of function pointer coverage", jobInfo.ExecRequestBecauseOfFPCov.Load())
+	}
+	if jobInfo.ExecTimeTotal.Load() > 0 {
+		_execTime := time.Duration(jobInfo.ExecTimeTotal.Load())
+		_execTimeFPCov := time.Duration(jobInfo.ExecTimeBecauseOfFPCov.Load())
+		jobInfo.Logf("test executions (total) job duration: %f seconds", _execTime.Seconds())
+		jobInfo.Logf("test executions (function pointer coverage) job duration: %f seconds", _execTimeFPCov.Seconds())
+	}
+
+	if len(jobInfo.ExecsTimeLapses.arr) > 0 {
+		jsonData, err := jobInfo.ExecsTimeLapses.AsJson()
+		if err != nil {
+			panic(fmt.Sprintf("failed to format time lapses as json %v", jobInfo.ExecsTimeLapses.arr))
+		}
+		jsonDataFPCov, err := jobInfo.ExecsTimeLapsesFPCov.AsJson()
+		if err != nil {
+			panic(fmt.Sprintf("failed to format time lapses as json %v", jobInfo.ExecsTimeLapsesFPCov.arr))
+		}
+		jobInfo.Logf("test executions (total) individual durations: %s", jsonData)
+		jobInfo.Logf("test executions (function pointer coverage) individual durations: %s", jsonDataFPCov)
+	}
+
+	if jobInfo.FPCovCalculationsTime.Load() > 0 {
+		_fPCovCalculationsTime := time.Duration(jobInfo.FPCovCalculationsTime.Load())
+		fuzzer.logFuncPointerCoverOperationTime(jobInfo.ProgId, _fPCovCalculationsTime)
+	}
+	fuzzer.Logf(5, "%s", jobInfo.Bytes())
+
 }
 
 func (fuzzer *Fuzzer) Next() *queue.Request {
