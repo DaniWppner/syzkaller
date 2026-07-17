@@ -1,6 +1,7 @@
 // Copyright 2025 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package codesearcher provides tools for indexing and searching source code.
 package codesearcher
 
 import (
@@ -15,15 +16,6 @@ import (
 )
 
 var (
-	ToolDirIndex = aflow.NewFuncTool("codesearch-dir-index", dirIndex, `
-Tool provides list of source files and subdirectories in the given directory in the source tree.
-`)
-
-	ToolReadFile = aflow.NewFuncTool("read-file", readFile, `
-Tool provides full contents of a single source file as is. Avoid using this tool if there are better
-and more specialized tools for the job, because source files may be large and contain lots
-of unrelated information.
-`)
 	ToolFileIndex = aflow.NewFuncTool("codesearch-file-index", fileIndex, `
 Tool provides list of entities defined in the given source file.
 Entity can be function, struct, or global variable.
@@ -73,7 +65,7 @@ You can strictly trust the response to be complete and accurate.
 		ToolDefinitionSource, ToolFindReferences, ToolStructLayout}
 )
 
-// This action needs to run before any agents that use codesearch tools.
+// PrepareIndex is an action that needs to run before any agents that use codesearch tools.
 var PrepareIndex = aflow.NewFuncAction("codesearch-prepare", prepare)
 
 type prepareArgs struct {
@@ -85,24 +77,6 @@ type prepareArgs struct {
 
 type prepareResult struct {
 	Index index
-}
-
-// nolint: lll
-type dirIndexArgs struct {
-	Dir string `jsonschema:"Relative directory in the source tree. Use an empty string for the root of the tree, or paths like 'net/ipv4/' for subdirs."`
-}
-
-type dirIndexResult struct {
-	Subdirs []string `jsonschema:"List of direct subdirectories."`
-	Files   []string `jsonschema:"List of source files."`
-}
-
-type readFileArgs struct {
-	File string `jsonschema:"Source file path."`
-}
-
-type readFileResult struct {
-	Contents string `jsonschema:"File contents."`
 }
 
 type fileIndexArgs struct {
@@ -131,9 +105,8 @@ type defCommentResult struct {
 
 // nolint: lll
 type defSourceArgs struct {
-	ContextFile  string `jsonschema:"Source file path that references the entity. It helps to restrict scope of the search, if there are different definitions with the same name in different source files."`
-	Name         string `jsonschema:"Name of the entity of interest."`
-	IncludeLines bool   `jsonschema:"Whether to include line numbers in the output or not. Line numbers may distract you, so ask for them only if you need to match lines elsewhere with the source code."`
+	ContextFile string `jsonschema:"Source file path that references the entity. It helps to restrict scope of the search, if there are different definitions with the same name in different source files."`
+	Name        string `jsonschema:"Name of the entity of interest."`
 }
 
 // nolint: lll
@@ -178,21 +151,6 @@ func prepare(ctx *aflow.Context, args prepareArgs) (prepareResult, error) {
 	return prepareResult{index{csIndex}}, err
 }
 
-func dirIndex(ctx *aflow.Context, state prepareResult, args dirIndexArgs) (dirIndexResult, error) {
-	subdirs, files, err := state.Index.DirIndex(args.Dir)
-	return dirIndexResult{
-		Subdirs: subdirs,
-		Files:   files,
-	}, err
-}
-
-func readFile(ctx *aflow.Context, state prepareResult, args readFileArgs) (readFileResult, error) {
-	contents, err := state.Index.ReadFile(args.File)
-	return readFileResult{
-		Contents: contents,
-	}, err
-}
-
 func fileIndex(ctx *aflow.Context, state prepareResult, args fileIndexArgs) (fileIndexResult, error) {
 	entities, err := state.Index.FileIndex(args.SourceFile)
 	res := fileIndexResult{}
@@ -205,6 +163,7 @@ func fileIndex(ctx *aflow.Context, state prepareResult, args fileIndexArgs) (fil
 	return res, err
 }
 
+// nolint:dupl
 func definitionComment(ctx *aflow.Context, state prepareResult, args defCommentArgs) (defCommentResult, error) {
 	info, err := state.Index.DefinitionComment(args.ContextFile, args.Name)
 	if err != nil {
@@ -216,8 +175,9 @@ func definitionComment(ctx *aflow.Context, state prepareResult, args defCommentA
 	}, nil
 }
 
+// nolint:dupl
 func definitionSource(ctx *aflow.Context, state prepareResult, args defSourceArgs) (defSourceResult, error) {
-	info, err := state.Index.DefinitionSource(args.ContextFile, args.Name, args.IncludeLines)
+	info, err := state.Index.DefinitionSource(args.ContextFile, args.Name)
 	if err != nil {
 		return defSourceResult{}, err
 	}

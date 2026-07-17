@@ -6,8 +6,10 @@ package vcs
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/mail"
 	"os"
 	"os/exec"
@@ -18,6 +20,7 @@ import (
 	"time"
 
 	"github.com/google/syzkaller/pkg/debugtracer"
+	"github.com/google/syzkaller/pkg/email"
 	"github.com/google/syzkaller/pkg/hash"
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
@@ -58,9 +61,15 @@ func filterEnv() []string {
 		return strings.HasPrefix(e, "GIT_DIR") ||
 			strings.HasPrefix(e, "GIT_WORK_TREE") ||
 			strings.HasPrefix(e, "GIT_INDEX_FILE") ||
-			strings.HasPrefix(e, "GIT_OBJECT_DIRECTORY")
+			strings.HasPrefix(e, "GIT_OBJECT_DIRECTORY") ||
+			strings.HasPrefix(e, "GIT_CONFIG_")
 	})
-
+	// Prevent submodules from overriding core.hooksPath.
+	env = append(env,
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=core.hooksPath",
+		"GIT_CONFIG_VALUE_0=/dev/null",
+	)
 	return env
 }
 
@@ -154,7 +163,26 @@ func (git *gitRepo) CheckoutCommit(repo, commit string) (*Commit, error) {
 	return git.SwitchCommit(commit)
 }
 
+func (git *gitRepo) FetchTags(repo string) error {
+	if err := git.repair(); err != nil {
+		return err
+	}
+	repoHash := hash.String([]byte(repo))
+	// Ignore error as we can double add the same remote and that will fail.
+	git.Run("remote", "add", repoHash, repo)
+	_, err := git.Run("fetch", "--force", "--tags", repoHash)
+	return err
+}
+
 func (git *gitRepo) fetchRemote(repo, commit string) error {
+	if commit != "" && gitFullHashRe.MatchString(commit) {
+		// If the commit is already present locally, we don't need to fetch it.
+		// This also makes us resilient to cases where the remote has force-pushed
+		// and the commit is no longer reachable there (but we still have it).
+		if ok, _ := git.CommitExists(commit); ok {
+			return nil
+		}
+	}
 	repoHash := hash.String([]byte(repo))
 	// Ignore error as we can double add the same remote and that will fail.
 	git.Run("remote", "add", repoHash, repo)
@@ -238,7 +266,7 @@ func (git *gitRepo) initRepo(reason error) error {
 }
 
 func (git *gitRepo) Contains(commit string) (bool, error) {
-	return git.containedIn(HEAD, commit)
+	return git.ContainedIn(HEAD, commit)
 }
 
 const gitDateFormat = "Mon Jan 2 15:04:05 2006 -0700"
@@ -269,13 +297,7 @@ func gitParseCommit(output, user, domain []byte, ignoreCC map[string]bool) (*Com
 					startPos := userPos + len(user)
 					endPos := userPos + len(user) + domainPos + 1
 					tag := string(line[startPos:endPos])
-					present := false
-					for _, tag1 := range tags {
-						if tag1 == tag {
-							present = true
-							break
-						}
-					}
+					present := slices.Contains(tags, tag)
 					if !present {
 						tags = append(tags, tag)
 					}
@@ -319,8 +341,8 @@ func gitParseCommit(output, user, domain []byte, ignoreCC map[string]bool) (*Com
 	return com, nil
 }
 
-func (git *gitRepo) GetCommitByTitle(title string) (*Commit, error) {
-	commits, _, err := git.GetCommitsByTitles([]string{title})
+func (git *gitRepo) GetCommitByTitle(title string, since time.Time) (*Commit, error) {
+	commits, _, err := git.GetCommitsByTitles([]string{title}, since)
 	if err != nil || len(commits) == 0 {
 		return nil, err
 	}
@@ -331,7 +353,7 @@ const (
 	fetchCommitsMaxAgeInYears = 5
 )
 
-func (git *gitRepo) GetCommitsByTitles(titles []string) ([]*Commit, []string, error) {
+func (git *gitRepo) GetCommitsByTitles(titles []string, since time.Time) ([]*Commit, []string, error) {
 	var greps []string
 	m := make(map[string]string)
 	for _, title := range titles {
@@ -339,8 +361,11 @@ func (git *gitRepo) GetCommitsByTitles(titles []string) ([]*Commit, []string, er
 		greps = append(greps, canonical)
 		m[canonical] = title
 	}
-	since := time.Now().Add(-time.Hour * 24 * 365 * fetchCommitsMaxAgeInYears).Format("01-02-2006")
-	commits, err := git.fetchCommits(since, HEAD, "", "", greps, true)
+	if since.IsZero() {
+		since = time.Now().AddDate(-fetchCommitsMaxAgeInYears, 0, 0)
+	}
+	sinceStr := since.Format("01-02-2006")
+	commits, err := git.fetchCommits(sinceStr, HEAD, "", "", greps, true)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -376,7 +401,7 @@ func (git *gitRepo) LatestCommits(afterCommit string, afterDate time.Time) ([]Co
 		return nil, nil
 	}
 	var ret []CommitShort
-	for _, line := range strings.Split(string(output), "\n") {
+	for line := range strings.SplitSeq(string(output), "\n") {
 		hash, date, _ := strings.Cut(line, ":")
 		commitDate, err := time.Parse(gitDateFormat, date)
 		if err != nil {
@@ -387,31 +412,14 @@ func (git *gitRepo) LatestCommits(afterCommit string, afterDate time.Time) ([]Co
 	return ret, nil
 }
 
-func (git *gitRepo) ExtractFixTagsFromCommits(baseCommit, email string) ([]*Commit, error) {
-	user, domain, err := splitEmail(email)
+func (git *gitRepo) ExtractFixTagsFromCommits(baseCommit, emailStr string) ([]*Commit, error) {
+	user, domain, err := email.Split(emailStr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse email %q: %w", email, err)
+		return nil, fmt.Errorf("failed to parse email %q: %w", emailStr, err)
 	}
 	grep := user + "+.*" + domain
-	since := time.Now().Add(-time.Hour * 24 * 365 * fetchCommitsMaxAgeInYears).Format("01-02-2006")
+	since := time.Now().AddDate(-fetchCommitsMaxAgeInYears, 0, 0).Format("01-02-2006")
 	return git.fetchCommits(since, baseCommit, user, domain, []string{grep}, false)
-}
-
-func splitEmail(email string) (user, domain string, err error) {
-	addr, err := mail.ParseAddress(email)
-	if err != nil {
-		return "", "", err
-	}
-	at := strings.IndexByte(addr.Address, '@')
-	if at == -1 {
-		return "", "", fmt.Errorf("no @ in email address")
-	}
-	user = addr.Address[:at]
-	domain = addr.Address[at:]
-	if plus := strings.IndexByte(user, '+'); plus != -1 {
-		user = user[:plus]
-	}
-	return
 }
 
 func (git *gitRepo) Bisect(bad, good string, dt debugtracer.DebugTracer, pred func() (BisectResult,
@@ -521,7 +529,7 @@ func (git *gitRepo) previousReleaseTags(commit string, self, onlyTop, includeRC 
 	tags1 := gitParseReleaseTags(output, includeRC)
 	tags = append(tags, tags1...)
 	if len(tags) == 0 {
-		return nil, fmt.Errorf("no release tags found for commit %v", commit)
+		return nil, fmt.Errorf("no release tags found for commit %v\n%s", commit, output)
 	}
 	return tags, nil
 }
@@ -548,7 +556,7 @@ func (git *gitRepo) MergeBases(firstCommit, secondCommit string) ([]*Commit, err
 		return nil, err
 	}
 	ret := []*Commit{}
-	for _, hash := range strings.Fields(string(output)) {
+	for hash := range strings.FieldsSeq(string(output)) {
 		commit, err := git.Commit(hash)
 		if err != nil {
 			return nil, err
@@ -576,6 +584,11 @@ func (git Git) CommitExists(commit string) (bool, error) {
 
 func (git *gitRepo) CommitExists(commit string) (bool, error) {
 	return git.Git.CommitExists(commit)
+}
+
+func (git *gitRepo) cherryPick(commit string) error {
+	_, err := git.Run("cherry-pick", "--no-commit", commit)
+	return err
 }
 
 func (git *gitRepo) PushCommit(repo, commit string) error {
@@ -633,6 +646,7 @@ func (git Git) Run(args ...string) ([]byte, error) {
 }
 
 func (git Git) command(args ...string) (*exec.Cmd, error) {
+	args = slices.Concat([]string{"-c", "core.hooksPath=/dev/null"}, args)
 	cmd := osutil.Command("git", args...)
 	cmd.Dir = git.Dir
 	cmd.Env = git.Env
@@ -684,15 +698,15 @@ func (git Git) Commit(hash string) (*Commit, error) {
 	if err != nil {
 		return nil, err
 	}
-	pos := bytes.Index(output, []byte(patchSeparator))
-	if pos == -1 {
+	before, after, ok := bytes.Cut(output, []byte(patchSeparator))
+	if !ok {
 		return nil, fmt.Errorf("git log output does not contain patch separator")
 	}
-	commit, err := gitParseCommit(output[:pos], nil, nil, git.ignoreCC)
+	commit, err := gitParseCommit(before, nil, nil, git.ignoreCC)
 	if err != nil {
 		return nil, err
 	}
-	commit.Patch = output[pos+len(patchSeparator):]
+	commit.Patch = after
 	for len(commit.Patch) != 0 && commit.Patch[0] == '\n' {
 		commit.Patch = commit.Patch[1:]
 	}
@@ -709,7 +723,9 @@ func (git Git) fetchCommits(since, base, user, domain string, greps []string, fi
 		args = append(args, "--grep", grep)
 	}
 	args = append(args, base)
-	cmd := exec.Command("git", args...)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cmd := osutil.CommandContext(ctx, "git", args...)
 	cmd.Dir = git.Dir
 	cmd.Env = filterEnv()
 	if git.Sandbox {
@@ -725,7 +741,6 @@ func (git Git) fetchCommits(since, base, user, domain string, greps []string, fi
 		return nil, err
 	}
 	defer cmd.Wait()
-	defer cmd.Process.Kill()
 	var (
 		s           = bufio.NewScanner(stdout)
 		buf         = new(bytes.Buffer)
@@ -873,11 +888,7 @@ func (git Git) BaseForDiff(diff []byte, tracer debugtracer.DebugTracer) ([]*Base
 			tracer.Logf("hashes don't match for %q", noMatch)
 			continue
 		}
-		var branchList []string
-		for branch := range branches {
-			branchList = append(branchList, branch)
-		}
-		slices.Sort(branchList)
+		branchList := slices.Sorted(maps.Keys(branches))
 		info, err := git.Commit(commit)
 		if err != nil {
 			return nil, fmt.Errorf("failed to extract commit info: %w", err)
@@ -899,7 +910,7 @@ func (git Git) minimizeBaseCommits(list []*BaseCommit) ([]*BaseCommit, error) {
 			lastCommit[key] = item
 			continue
 		}
-		isNewer, err := git.containedIn(item.Hash, prev.Hash)
+		isNewer, err := git.ContainedIn(item.Hash, prev.Hash)
 		if err != nil {
 			return nil, fmt.Errorf("topological sort step failed: %w", err)
 		}
@@ -979,7 +990,7 @@ func (git Git) verifyHash(hash string) (bool, error) {
 	return true, nil
 }
 
-func (git Git) containedIn(parent, commit string) (bool, error) {
+func (git Git) ContainedIn(parent, commit string) (bool, error) {
 	_, err := git.Run("merge-base", "--is-ancestor", commit, parent)
 	return err == nil, nil
 }

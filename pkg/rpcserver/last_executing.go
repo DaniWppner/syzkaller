@@ -53,7 +53,7 @@ func (last *LastExecuting) Note(id, proc int, progData []byte, now time.Duration
 	}
 }
 
-// Note a hanged program.
+// Hanged notes a hung program.
 func (last *LastExecuting) Hanged(id, proc int, progData []byte, now time.Duration) {
 	last.hanged = append(last.hanged, ExecRecord{
 		ID: id,
@@ -65,24 +65,24 @@ func (last *LastExecuting) Hanged(id, proc int, progData []byte, now time.Durati
 	})
 }
 
-// Returns a sorted set of last executing programs.
+// Collect returns a sorted set of last executing programs.
 // The records are sorted by time in ascending order.
 // ExecRecord.Time is the difference in start executing time between this
 // program and the program that started executing last.
 func (last *LastExecuting) Collect() []ExecRecord {
-	procs := append(last.procs, last.hanged...)
+	procs := slices.Concat(last.procs, last.hanged)
 	last.procs = nil // The type must not be used after this.
 	last.hanged = nil
 	slices.SortFunc(procs, func(a, b ExecRecord) int {
 		return cmp.Compare(a.Time, b.Time)
 	})
 	max := procs[len(procs)-1].Time
-	for i := len(procs) - 1; i >= 0; i-- {
-		if procs[i].Time == 0 {
+	for i, proc := range slices.Backward(procs) {
+		if proc.Time == 0 {
 			procs = procs[i+1:]
 			break
 		}
-		procs[i].Time = max - procs[i].Time
+		procs[i].Time = max - proc.Time
 	}
 	return procs
 }

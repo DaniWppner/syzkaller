@@ -1,22 +1,30 @@
 // Copyright 2025 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package patching provides workflows for automated kernel patch generation and verification.
 package patching
 
 import (
 	"encoding/json"
+	"fmt"
 
 	"github.com/google/syzkaller/pkg/aflow"
+	"github.com/google/syzkaller/pkg/aflow/action/actionsyzlang"
 	"github.com/google/syzkaller/pkg/aflow/action/crash"
 	"github.com/google/syzkaller/pkg/aflow/action/kernel"
 	"github.com/google/syzkaller/pkg/aflow/ai"
+	"github.com/google/syzkaller/pkg/aflow/flow/common"
 	"github.com/google/syzkaller/pkg/aflow/tool/codeeditor"
-	"github.com/google/syzkaller/pkg/aflow/tool/codeexpert"
 	"github.com/google/syzkaller/pkg/aflow/tool/codesearcher"
-	"github.com/google/syzkaller/pkg/aflow/tool/grepper"
+	"github.com/google/syzkaller/pkg/aflow/tool/patchdiff"
+	"github.com/google/syzkaller/pkg/email"
+	"github.com/google/syzkaller/pkg/vcs"
 )
 
 type Inputs struct {
+	AgentName    string
+	TargetOS     string
+	TargetArch   string
 	ReproOpts    string
 	ReproSyz     string
 	ReproC       string
@@ -28,80 +36,87 @@ type Inputs struct {
 	Type      string
 	VM        json.RawMessage
 
-	// Use this fixed based kernel commit (for testing/local running).
-	FixedBaseCommit string
-	FixedRepository string
-}
-
-func createPatchingFlow(name string, summaryWindow int) *aflow.Flow {
-	commonTools := aflow.Tools(codesearcher.Tools, grepper.Tool, codeexpert.Tool)
-	return &aflow.Flow{
-		Name: name,
-		Root: aflow.Pipeline(
-			baseCommitPicker,
-			syzlangToC,
-			kernel.Checkout,
-			kernel.Build,
-			// Ensure we can reproduce the crash (and the build boots).
-			crash.Reproduce,
-			codesearcher.PrepareIndex,
-			&aflow.LLMAgent{
-				Name:          "debugger",
-				Model:         aflow.BestExpensiveModel,
-				Reply:         "BugExplanation",
-				TaskType:      aflow.FormalReasoningTask,
-				Instruction:   debuggingInstruction,
-				Prompt:        debuggingPrompt,
-				Tools:         commonTools,
-				SummaryWindow: summaryWindow,
-			},
-			kernel.CheckoutScratch,
-			&aflow.DoWhile{
-				Do: aflow.Pipeline(
-					&aflow.LLMAgent{
-						Name:          "patch-generator",
-						Model:         aflow.BestExpensiveModel,
-						Reply:         "PatchExplanation",
-						TaskType:      aflow.FormalReasoningTask,
-						Instruction:   patchInstruction,
-						Prompt:        patchPrompt,
-						Tools:         aflow.Tools(commonTools, codeeditor.Tool),
-						SummaryWindow: summaryWindow,
-					},
-					crash.TestPatch, // -> PatchDiff or TestError
-				),
-				While:         "TestError",
-				MaxIterations: 10,
-			},
-			getMaintainers,
-			getRecentCommits,
-			&aflow.LLMAgent{
-				Name:          "description-generator",
-				Model:         aflow.BestExpensiveModel,
-				Reply:         "PatchDescriptionRaw",
-				TaskType:      aflow.FormalReasoningTask,
-				Instruction:   descriptionInstruction,
-				Prompt:        descriptionPrompt,
-				Tools:         commonTools,
-				SummaryWindow: summaryWindow,
-			},
-			formatPatchDescription,
-		),
-	}
+	// Parameters used to pick the base commit for the patch.
+	// The workflow first fetches BaseRepository/BaseBranch,
+	// and then uses BaseCommit to pick the exact commit.
+	// BaseCommit can be either:
+	//  - exact commit hash (for testing/local running)
+	//  - "HEAD": use the current branch HEAD
+	//  - "RC": use the latest release/release candidate tag in the branch
+	BaseRepository string
+	BaseBranch     string
+	BaseCommit     string
+	StraceBin      string
 }
 
 func init() {
 	aflow.Register[Inputs, ai.PatchingOutputs](
 		ai.WorkflowPatching,
 		"generate a kernel patch fixing a provided bug reproducer",
-		createPatchingFlow("", 0),
-		createPatchingFlow("summary", 10),
-	)
+		&aflow.Flow{
+			Consts: map[string]any{
+				"NeedStrace": false,
+				// For convenience of the patch-iteration workflow.
+				"ReviewedBy": []string{},
+				"AckedBy":    []string{},
+				"TestedBy":   []string{},
+				"ReportedBy": []string{},
+			},
+			Root: aflow.Pipeline(
+				baseCommitPicker,
+				actionsyzlang.CreateSimplifiedCRepro,
+				kernel.Checkout,
+				kernel.Build,
+				// Ensure we can reproduce the crash (and the build boots).
+				crash.Reproduce,
+				codesearcher.PrepareIndex,
+				&aflow.LLMAgent{
+					Name:        "debugger",
+					Model:       aflow.BestExpensiveModel,
+					Reply:       "BugExplanation",
+					TaskType:    aflow.FormalReasoningTask,
+					Instruction: debuggingInstruction,
+					Prompt:      debuggingPrompt,
+					Tools:       common.CodeAccessTools,
+				},
+				&aflow.LLMAgent{
+					Name:        "history-explorer",
+					Model:       aflow.BestExpensiveModel,
+					Reply:       "HistoricalContext",
+					TaskType:    aflow.FormalReasoningTask,
+					Instruction: historyExplorerInstruction,
+					Prompt:      historyExplorerPrompt,
+					Tools:       common.CodeAccessTools,
+				},
+				kernel.CheckoutScratch,
+				patchGenerationLoop(nil, patchInstruction, patchPrompt),
+				&aflow.LLMAgent{
+					Name:        "fixes-finder",
+					Model:       aflow.BestExpensiveModel,
+					Outputs:     aflow.ValidatedLLMOutputs[fixesFinderArgs](validateFixesHashes),
+					TaskType:    aflow.FormalReasoningTask,
+					Instruction: fixesInstruction,
+					Prompt:      fixesPrompt,
+					Tools:       common.CodeAccessTools,
+				},
+				formatFixes,
+				getMaintainers,
+				getRecentCommits,
+				&aflow.LLMAgent{
+					Name:  "description-generator",
+					Model: aflow.BestExpensiveModel,
+					ValidatedReply: aflow.LLMReply("PatchDescription",
+						func(ctx *aflow.Context, state struct{}, reply string) (string, error) {
+							return email.WordWrap(reply, patchDescriptionLineLength), nil
+						}),
+					TaskType:    aflow.FormalReasoningTask,
+					Instruction: descriptionInstruction,
+					Prompt:      descriptionPrompt,
+					Tools:       common.CodeAccessTools,
+				},
+			),
+		})
 }
-
-// TODO: mention not doing assumptions about the source code, and instead querying code using tools.
-// TODO: mention to extensively use provided tools to confirm everything.
-// TODO: use cause bisection info, if available.
 
 const debuggingInstruction = `
 You are an experienced Linux kernel developer tasked with debugging a kernel crash root cause.
@@ -116,26 +131,68 @@ they happen on the KASAN shadow memory around address dfff800000000000 or dffffc
 Don't be confused by that. Look for the like at the top of the report that tells
 the access address and size.
 {{end}}
-`
+` + common.InstructionDontMakeAssumptionsAboutSourceCode
 
 const debuggingPrompt = `
 The crash is:
 
 {{.ReproducedCrashReport}}
 
-The following C code is a draft of the vulnerable syscall sequence. Keep in mind that 
+The following C code is a draft of the vulnerable syscall sequence. Keep in mind that
 it may lack the precise threading, sandboxing, and some arguments of a working reproducer:
 
 {{.SimplifiedCRepro}}
+` + commonFaultInjectionPrompt
+
+const historyExplorerInstruction = `
+You are an experienced Linux kernel developer researching prior art for fixing a kernel bug.
+You are given a bug explanation. This explanation details the root cause of the bug resulting
+from debugging, but does not provide the final fix strategy. Your goal is to explore how
+similar bugs were fixed in the past in the same subsystem or files.
+
+CRITICAL: Do NOT attempt to debug the issue further or write a patch for it yourself.
+Your ONLY objective is to research and provide the necessary historical context.
+
+Use the {{.toolGitLog}} tool with the Since parameter set to "3 years" to focus on recent history.
+Search for commits that address issues with similar root causes (e.g. similar missing locks,
+incorrect refcounting, or similar error path bugs) in the affected files.
+
+Your final reply must summarize your findings: what idioms, locking rules, or common patterns
+should be followed when writing a fix for this bug based on how previous similar bugs were addressed.
+If you find no relevant past fixes, clearly state that.
+` + common.InstructionDontMakeAssumptionsAboutSourceCode
+
+const historyExplorerPrompt = `
+The crash is:
+
+{{.ReproducedCrashReport}}
+
+The explanation of the root cause of the bug is:
+
+{{.BugExplanation}}
+`
+
+// This part is shared between patching and patch-iteration.
+const commonFaultInjectionPrompt = `
+
+{{if .ReproducedFaultInjection}}
+The reproducer uses fault injection to force allocation failure at a specific point.
+These injected failures often exercise rarely used error-handling paths,
+so the bug is frequently in that error handling.
+The following fault injection report(s) show what was injected:
+
+{{.ReproducedFaultInjection}}
+{{end}}
 `
 
 const patchInstruction = `
 You are an experienced Linux kernel developer tasked with creating a fix for a kernel bug.
-You will be given a crash report, and an initial explanation of the root cause done by another
-kernel expert.
+You will be given a crash report, an initial explanation of the root cause done by another
+kernel expert, and a summary of how similar bugs were fixed in the past.
 
-Use the codeedit tool to do code edits.
+Use the {{.toolCodeeditor}} tool to do code edits.
 Note: you will not see your changes when looking at the code using codesearch tools.
+Use the {{.toolPatchDiff}} tool to review the modifications you applied.
 
 Your final reply should contain explanation of what you did in the patch and why
 (details not present in the initial explanation of the bug).
@@ -150,6 +207,10 @@ Frequently the same coding mistake is done in several locations in the source co
 Check if your fix should be extended/applied to similar cases around to fix other similar bugs.
 But don't go too wide, don't try to fix problems kernel-wide, fix similar issues
 in the same file only.
+` + commonPatchInstruction
+
+// This part is shared between patching and patch-iteration.
+const commonPatchInstruction = `
 
 If you are changing post-conditions of a function, consider all callers of the functions,
 and if they need to be updated to handle new post-conditions. For example, if you make
@@ -158,8 +219,9 @@ need to be updated to handle NULL return value.
 
 {{if titleIsWarning .ReproducedBugTitle}}
 If you will end up removing the WARN_ON macro because the condition can legitimately happen,
-add a pr_err call that logs that the unlikely condition has happened. The pr_err message
-must not include "WARNING" string.
+add a pr_err/dev_err/... (whatever is the macro for printing runtime errors used in the file)
+call that logs that the unlikely condition has happened. The pr_err/dev_err/... message
+must not include "WARNING" nor "BUG" strings.
 {{end}}
 `
 
@@ -171,6 +233,12 @@ The crash that corresponds to the bug is:
 The explanation of the root cause of the bug is:
 
 {{.BugExplanation}}
+
+{{if .HistoricalContext}}
+Historical context on how similar bugs were fixed in the past:
+
+{{.HistoricalContext}}
+{{end}}
 
 {{if .TestError}}
 
@@ -194,7 +262,7 @@ If the error points to a fundamental issue with the approach in the patch,
 then create a new patch from scratch.
 Note: in both cases the source tree does not contain the patch yet
 (so if you want to create a new fixed patch, you need to recreate it
-in its entirety from scratch using the codeeditor tool).
+in its entirety from scratch using the {{.toolCodeeditor}} tool).
 {{else}}
 If the strategy looks reasonable to you, proceed with patch generation.
 {{end}}
@@ -205,15 +273,55 @@ const descriptionInstruction = `
 You are an experienced Linux kernel developer tasked with writing a commit description for
 a kernel bug fixing commit. The description should start with a one-line summary,
 and then include description of the bug being fixed, and how it's fixed by the provided patch.
+The one-line summary should describe the change being made, rather than mention the tool that
+detected the bug.
+
+The description must not contain lines starting with '#' because they will dropped by git as comments.
+The description must not contain lines starting with '--' or '---' (including inline code diffs)
+because they may confuse git/patch utilities.
 
 Your final reply should contain only the text of the commit description.
-Phrase the one-line summary so that it is not longer than 72 characters.
+` + commonPatchDescriptionInstruction
+
+// This part is shared between patching and patch-iteration.
+const commonPatchDescriptionInstruction = `
+
+The one-line summary must be not longer than 72 characters.
+
+IMPORTANT: Do not wrap lines manually (e.g., at 80 characters); we will reformat the text
+automatically, so keep paragraphs as single lines without newlines.
+
+Generally try to phrase the description without mentioning syzkaller
+(avoid phrases like "the bug was triggered by syzkaller" or "the bug was triggered by fuzzer", etc).
+How the bug was triggered is generally an irrelevant detail.
+Any bug triggered by a fuzzer can also be triggered by a malicious user, or a buggy program.
+
+If the crash is reported by a sanitizer (e.g., KASAN, KMSAN, lockdep), include the relevant
+parts of the sanitizer output to illustrate the problem. Exclude less relevant sections,
+as the stack trace can be very long. Describe the execution path that leads to the manifestation
+of the kernel bug.
+
+{{if titleIsWarning .ReproducedBugTitle}}
+If the patch removes the WARN_ON macro, refer to the fact that WARN_ON
+must not be used for conditions that can legitimately happen, and that pr_err
+should be used instead if necessary.
+
+Don't assume that panic_on_warn is set, and that WARNINGs are fatal.
+While panic_on_warn may be set when the bug was reproduced, it's generally not set on production systems.
+{{end}}
 `
 
 const descriptionPrompt = `
 The crash that corresponds to the bug is:
 
 {{.ReproducedCrashReport}}
+
+{{if .OtherCrashReports}}
+Other crashes triggered:
+{{range .OtherCrashReports}}
+{{.}}
+{{end}}
+{{end}}
 
 The explanation of the root cause of the bug is:
 
@@ -232,10 +340,134 @@ Format the summary line consistently with these, look how prefixes
 are specified, letter capitalization, style, etc. 
 
 {{.RecentCommits}}
-
-{{if titleIsWarning .ReproducedBugTitle}}
-If the patch removes the WARN_ON macro, refer to the fact that WARN_ON
-must not be used for conditions that can legitimately happen, and that pr_err
-should be used instead if necessary.
-{{end}}
 `
+
+// Recommended description length according to
+// https://docs.kernel.org/process/submitting-patches.html
+const patchDescriptionLineLength = 75
+
+func patchGenerationLoop(beforeEach aflow.Action, instruction, prompt string, extraTools ...aflow.Tool) aflow.Action {
+	actions := []aflow.Action{}
+	if beforeEach != nil {
+		actions = append(actions, beforeEach)
+	}
+
+	return &aflow.DoWhile{
+		While:         "TestError",
+		MaxIterations: 10,
+		Do: aflow.Pipeline(append(actions,
+			&aflow.LLMAgent{
+				Name:        "patch-generator",
+				Model:       aflow.BestExpensiveModel,
+				Reply:       "PatchExplanation",
+				TaskType:    aflow.FormalReasoningTask,
+				Instruction: instruction,
+				Prompt:      prompt,
+				Tools:       aflow.Tools(common.CodeAccessTools, codeeditor.Tool, patchdiff.Tool, extraTools),
+			},
+			crash.TestPatch, // -> PatchDiff or TestError
+		)...),
+	}
+}
+
+const fixesInstruction = `
+You are an experienced Linux kernel developer tasked with identifying the commit
+that introduced the bug being fixed. Identifying the correct buggy commit is crucial
+for proper kernel maintenance (backporting to stable trees, etc.).
+
+Your investigation strategy:
+1. Examine the patch that fixes the bug. Use git tools (like git-log or git-blame)
+   to trace the history of the lines or functions modified by the patch.
+2. Analyze the stack trace in the crash report. Identify the key files and functions
+   involved in the crash and investigate their history to see when the problematic
+   logic was introduced.
+3. Compare the bug explanation with the commit history to find the point where
+   the described logic error first appeared.
+
+A bug is typically introduced when a piece of code is first written, or when
+a refactoring changed its logic in a way that introduced the bug.
+Trace the history of relevant symbols or find when specific code patterns were introduced/removed.
+
+You must provide exactly one bug-introducing commit hash.
+If you are unable to confidently determine the bug-introducing commit after investigation,
+return an empty string rather than guessing.
+`
+
+const fixesPrompt = `
+The crash is:
+
+{{.ReproducedCrashReport}}
+
+{{if .BugExplanation}}
+The explanation of the root cause is:
+
+{{.BugExplanation}}
+{{end}}
+
+The patch that fixes the bug is:
+
+{{.PatchDiff}}
+
+Search for the commit(s) that introduced this bug.
+`
+
+type fixesFinderState struct {
+	KernelCommit string
+}
+
+type fixesFinderArgs struct {
+	FixesHash string `jsonschema:"The commit hash that introduced the bug."`
+}
+
+func validateFixesHashes(ctx *aflow.Context, state fixesFinderState, args fixesFinderArgs) (fixesFinderArgs, error) {
+	if args.FixesHash == "" {
+		return args, nil
+	}
+	err := kernel.UseLinuxRepo(ctx, func(kernelRepoDir string, repo vcs.Repo) error {
+		commit, err := repo.Commit(args.FixesHash)
+		if err != nil {
+			return aflow.BadCallError("commit hash %q not found in the repository", args.FixesHash)
+		}
+		// LLM can provide a commit from a different branch.
+		// We want to ensure it is actually reachable from the current commit.
+		reachable, err := vcs.Git{Dir: kernelRepoDir}.ContainedIn(state.KernelCommit, commit.Hash)
+		if err != nil || !reachable {
+			return aflow.BadCallError("commit %q is not reachable from the current commit",
+				args.FixesHash)
+		}
+		args.FixesHash = commit.Hash
+		return nil
+	})
+	return args, err
+}
+
+type formatFixesResult struct {
+	Fixes ai.FixesTag
+}
+
+var formatFixes = aflow.NewFuncAction("format-fixes",
+	func(ctx *aflow.Context, args fixesFinderArgs) (formatFixesResult, error) {
+		if args.FixesHash == "" {
+			return formatFixesResult{}, nil
+		}
+		fix, err := queryFixesTag(ctx, args.FixesHash)
+		return formatFixesResult{Fixes: fix}, err
+	})
+
+func queryFixesTag(ctx *aflow.Context, hash string) (ai.FixesTag, error) {
+	var fix ai.FixesTag
+	err := kernel.UseLinuxRepo(ctx, func(kernelRepoDir string, repo vcs.Repo) error {
+		commit, err := repo.Commit(hash)
+		if err != nil {
+			return fmt.Errorf("failed to get commit %q: %w", hash, err)
+		}
+		fix = ai.FixesTag{
+			Hash:        commit.Hash,
+			Title:       commit.Title,
+			AuthorName:  commit.AuthorName,
+			AuthorEmail: commit.Author,
+		}
+		return nil
+	})
+	return fix, err
+}

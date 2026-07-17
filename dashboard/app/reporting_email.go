@@ -143,15 +143,13 @@ func handleCoverageReports(w http.ResponseWriter, r *http.Request) {
 			minDrop = nsConfig.Coverage.RegressionThreshold
 		}
 
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			if err := sendNsCoverageReport(ctx, nsName, emailTo, periods, minDrop); err != nil {
 				msg := fmt.Sprintf("error generating coverage report for ns '%s': %s", nsName, err.Error())
 				log.Errorf(ctx, "%s", msg)
 				return
 			}
-		}()
+		})
 	}
 	wg.Wait()
 }
@@ -571,15 +569,16 @@ func sendMailTemplate(ctx context.Context, params *mailSendParams) error {
 	log.Infof(ctx, "sending email %q to %q", params.title, to)
 	return sendMailText(ctx, params.cfg.getSubject(params.title), from, to, params.replyTo, body.String())
 }
+
 func generateEmailBugTitle(rep *dashapi.BugReport, emailConfig *EmailConfig) string {
 	title := ""
-	for i := len(rep.Subsystems) - 1; i >= 0; i-- {
+	for _, v := range slices.Backward(rep.Subsystems) {
 		question := ""
-		if rep.Subsystems[i].SetBy == "" {
+		if v.SetBy == "" {
 			// Include the question mark for automatically created tags.
 			question = "?"
 		}
-		title = fmt.Sprintf("[%s%s] %s", rep.Subsystems[i].Name, question, title)
+		title = fmt.Sprintf("[%s%s] %s", v.Name, question, title)
 	}
 	return title + rep.Title
 }
@@ -643,10 +642,8 @@ func matchInbox(ctx context.Context, msg *email.Email) *PerInboxConfig {
 	// address that matched InboxRe.
 	for _, item := range getConfig(ctx).MonitoredInboxes {
 		rg := regexp.MustCompile(item.InboxRe)
-		for _, cc := range msg.RawCc {
-			if rg.MatchString(cc) {
-				return item
-			}
+		if slices.ContainsFunc(msg.RawCc, rg.MatchString) {
+			return item
 		}
 	}
 	return nil
@@ -655,7 +652,7 @@ func matchInbox(ctx context.Context, msg *email.Email) *PerInboxConfig {
 func processInboxEmail(ctx context.Context, msg *email.Email, inbox *PerInboxConfig) error {
 	if len(msg.Commands) == 0 || len(msg.BugIDs) == 0 || msg.OwnEmail {
 		// Do not forward emails with no commands.
-		// Also, we don't care about the emails that don't include any BugIDs.
+		// Also, we don't care about the emails that are not addressed to syzbot.
 		return nil
 	}
 	if msg.MailingList != "" {
@@ -692,7 +689,7 @@ func processInboxEmail(ctx context.Context, msg *email.Email, inbox *PerInboxCon
 
 func processIncomingEmail(ctx context.Context, msg *email.Email) error {
 	// Ignore any incoming emails from syzbot itself.
-	if ownEmail(ctx) == msg.Author {
+	if msg.OwnEmail {
 		// But we still want to remember the id of our own message, so just neutralize the command.
 		msg.Commands = nil
 	}
@@ -708,9 +705,9 @@ func processIncomingEmail(ctx context.Context, msg *email.Email) error {
 	fromMailingList := msg.MailingList != ""
 	missingLists := missingMailingLists(ctx, msg, emailConfig)
 	log.Infof(ctx, "from/cc mailing list: %v (missing: %v)", fromMailingList, missingLists)
-	if fromMailingList && len(msg.BugIDs) > 0 && len(msg.Commands) > 0 {
+	if fromMailingList && msg.OwnEmailsCcd && len(msg.Commands) > 0 {
 		// Note that if syzbot was not directly mentioned in To or Cc, this is not really
-		// a duplicate message, so it must be processed. We detect it by looking at BugID.
+		// a duplicate message, so it must be processed.
 
 		// There's also a chance that the user mentioned syzbot directly, but without BugID.
 		// We don't need to worry about this case, as we won't recognize the bug anyway.
@@ -722,7 +719,7 @@ func processIncomingEmail(ctx context.Context, msg *email.Email) error {
 	if bugListInfo != nil {
 		const maxCommands = 10
 		if len(msg.Commands) > maxCommands {
-			return replyTo(ctx, msg, bugListInfo.id,
+			return replyError(ctx, msg, bugListInfo.id,
 				fmt.Sprintf("Too many commands (%d > %d)", len(msg.Commands), maxCommands))
 		}
 		for _, command := range msg.Commands {
@@ -734,7 +731,7 @@ func processIncomingEmail(ctx context.Context, msg *email.Email) error {
 	} else {
 		const maxCommands = 3
 		if len(msg.Commands) > maxCommands {
-			return replyTo(ctx, msg, bugInfo.bugReporting.ID,
+			return replyError(ctx, msg, bugInfo.bugReporting.ID,
 				fmt.Sprintf("Too many commands (%d > %d)", len(msg.Commands), maxCommands))
 		}
 		unCc := false
@@ -749,7 +746,8 @@ func processIncomingEmail(ctx context.Context, msg *email.Email) error {
 			replies = append(replies, handleBugCommand(ctx, bugInfo, msg, nil))
 		}
 		reply := groupEmailReplies(replies)
-		if reply == "" && len(msg.Commands) > 0 && len(missingLists) > 0 && !unCc {
+		if reply == "" && len(msg.Commands) > 0 && len(missingLists) > 0 &&
+			!unCc && msg.DirectlyAddressedTo(bugInfo.bugReporting.ID) {
 			return forwardEmail(ctx, msg, missingLists, nil, bugInfo.bugReporting.ID, bugInfo.bugReporting.ExtID)
 		}
 		if reply != "" {
@@ -816,6 +814,12 @@ func handleBugCommand(ctx context.Context, bugInfo *bugInfoResult, msg *email.Em
 		CC:     msg.Cc,
 	}
 	if command != nil {
+		// If syzbot isn't explicitly CC'd (e.g., the command was sent to a mailing list
+		// and the Bug ID is only in the quoted email body), ignore all commands EXCEPT `#syz test`.
+		// This prevents dashboard/app from hijacking discussions meant for other bots (like lore-relay).
+		if command.Command != email.CmdTest && !msg.DirectlyAddressedTo(bugInfo.bugReporting.ID) {
+			return ""
+		}
 		switch command.Command {
 		case email.CmdTest:
 			return handleTestCommand(ctx, bugInfo, msg, command)
@@ -830,6 +834,10 @@ func handleBugCommand(ctx context.Context, bugInfo *bugInfoResult, msg *email.Em
 			}
 			cmd.FixCommits = []string{command.Args}
 		case email.CmdUnFix:
+			if bugInfo.bug.Status == BugStatusFixed {
+				return "This bug is already marked as fixed. Syzbot does not support unfixing bugs " +
+					"that are already closed (i.e. the fixing commit has reached all tested trees)."
+			}
 			cmd.ResetFixCommits = true
 		case email.CmdDup:
 			if command.Args == "" {
@@ -918,9 +926,17 @@ func handleTestCommand(ctx context.Context, info *bugInfoResult,
 	}
 	reply := ""
 	err := handleTestRequest(ctx, &testReqArgs{
-		bug: info.bug, bugKey: info.bugKey, bugReporting: info.bugReporting,
-		user: msg.Author, extID: msg.MessageID, link: msg.Link,
-		patch: []byte(msg.Patch), repo: repo, branch: branch, jobCC: msg.Cc})
+		bug:          info.bug,
+		bugKey:       info.bugKey,
+		bugReporting: info.bugReporting,
+		user:         msg.Author,
+		extID:        msg.MessageID,
+		link:         msg.Link,
+		patch:        []byte(msg.Patch),
+		repo:         repo,
+		branch:       branch,
+		jobCC:        msg.Cc,
+	})
 	if err != nil {
 		var testDenied *TestRequestDeniedError
 		var badTest *BadTestRequestError
@@ -1200,35 +1216,7 @@ func loadBugInfo(ctx context.Context, msg *email.Email) *bugInfoResult {
 		bugID = msg.BugIDs[0]
 	}
 	if bugID == "" {
-		var matchingErr error
-		// Give it one more try -- maybe we can determine the bug from the subject + mailing list.
-		if msg.MailingList != "" {
-			var ret *bugInfoResult
-			ret, matchingErr = matchBugFromList(ctx, msg.MailingList, msg.Subject)
-			if matchingErr == nil {
-				return ret
-			}
-			log.Infof(ctx, "mailing list matching failed: %s", matchingErr)
-		}
-		if len(msg.Commands) == 0 {
-			// This happens when people CC syzbot on unrelated emails.
-			log.Infof(ctx, "no bug ID (%q)", msg.Subject)
-		} else {
-			log.Errorf(ctx, "no bug ID (%q)", msg.Subject)
-			from, err := email.AddAddrContext(ownEmail(ctx), "HASH")
-			if err != nil {
-				log.Errorf(ctx, "failed to format sender email address: %v", err)
-				from = "ERROR"
-			}
-			message := fmt.Sprintf(replyNoBugID, from)
-			if matchingErr == errAmbiguousTitle {
-				message = fmt.Sprintf(replyAmbiguousBugID, from)
-			}
-			if err := replyTo(ctx, msg, "", message); err != nil {
-				log.Errorf(ctx, "failed to send reply: %v", err)
-			}
-		}
-		return nil
+		return bugInfoWithoutBugID(ctx, msg)
 	}
 	bug, bugKey, err := findBugByReportingID(ctx, bugID)
 	if err != nil {
@@ -1238,7 +1226,7 @@ func loadBugInfo(ctx context.Context, msg *email.Email) *bugInfoResult {
 			log.Errorf(ctx, "failed to format sender email address: %v", err)
 			from = "ERROR"
 		}
-		if err := replyTo(ctx, msg, "", fmt.Sprintf(replyBadBugID, from)); err != nil {
+		if err := replyError(ctx, msg, "", fmt.Sprintf(replyBadBugID, from)); err != nil {
 			log.Errorf(ctx, "failed to send reply: %v", err)
 		}
 		return nil
@@ -1246,7 +1234,7 @@ func loadBugInfo(ctx context.Context, msg *email.Email) *bugInfoResult {
 	bugReporting, _ := bugReportingByID(bug, bugID)
 	if bugReporting == nil {
 		log.Errorf(ctx, "can't find bug reporting: %v", err)
-		if err := replyTo(ctx, msg, "", "Can't find the corresponding bug."); err != nil {
+		if err := replyError(ctx, msg, "", "Can't find the corresponding bug."); err != nil {
 			log.Errorf(ctx, "failed to send reply: %v", err)
 		}
 		return nil
@@ -1263,6 +1251,43 @@ func loadBugInfo(ctx context.Context, msg *email.Email) *bugInfoResult {
 		return nil
 	}
 	return &bugInfoResult{bug, bugKey, bugReporting, reporting}
+}
+
+func bugInfoWithoutBugID(ctx context.Context, msg *email.Email) *bugInfoResult {
+	var matchingErr error
+	// Give it one more try -- maybe we can determine the bug from the subject + mailing list.
+	if msg.MailingList != "" {
+		var ret *bugInfoResult
+		ret, matchingErr = matchBugFromList(ctx, msg.MailingList, msg.Subject)
+		if matchingErr == nil {
+			return ret
+		}
+		log.Infof(ctx, "mailing list matching failed: %s", matchingErr)
+	}
+	if len(msg.Commands) == 0 {
+		// This happens when people CC syzbot on unrelated emails.
+		log.Infof(ctx, "no bug ID (%q)", msg.Subject)
+	} else if msg.MailingList != "" && !msg.OwnEmailsCcd && matchingErr != errAmbiguousTitle {
+		// If we received a command via a mailing list but syzbot was not explicitly CC'd,
+		// and we couldn't identify the bug (and it's not a case of an ambiguous title),
+		// don't reply with an error. It might be meant for another syzbot instance.
+		log.Infof(ctx, "no bug ID for command (%q), ignoring", msg.Subject)
+	} else {
+		log.Errorf(ctx, "no bug ID (%q)", msg.Subject)
+		from, err := email.AddAddrContext(ownEmail(ctx), "HASH")
+		if err != nil {
+			log.Errorf(ctx, "failed to format sender email address: %v", err)
+			from = "ERROR"
+		}
+		message := fmt.Sprintf(replyNoBugID, from)
+		if matchingErr == errAmbiguousTitle {
+			message = fmt.Sprintf(replyAmbiguousBugID, from)
+		}
+		if err := replyError(ctx, msg, "", message); err != nil {
+			log.Errorf(ctx, "failed to send reply: %v", err)
+		}
+	}
+	return nil
 }
 
 func ownMailingLists(ctx context.Context) []string {
@@ -1357,8 +1382,10 @@ func matchBugFromList(ctx context.Context, sender, subject string) (*bugInfoResu
 			continue
 		}
 		candidates = append(candidates, &bugInfoResult{
-			bug: bug, bugKey: bugKeys[i],
-			bugReporting: bugReporting, reporting: reporting,
+			bug:          bug,
+			bugKey:       bugKeys[i],
+			bugReporting: bugReporting,
+			reporting:    reporting,
 		})
 	}
 	if len(candidates) > 1 {
@@ -1478,6 +1505,10 @@ func sendMailText(ctx context.Context, subject, from string, to []string, replyT
 }
 
 func replyTo(ctx context.Context, msg *email.Email, bugID, reply string) error {
+	if msg.OwnEmail {
+		log.Errorf(ctx, "not sending reply to own email")
+		return nil
+	}
 	from, err := email.AddAddrContext(fromAddr(ctx), bugID)
 	if err != nil {
 		log.Errorf(ctx, "failed to build the From address: %v", err)
@@ -1496,8 +1527,50 @@ func replyTo(ctx context.Context, msg *email.Email, bugID, reply string) error {
 	return sendEmail(ctx, replyMsg)
 }
 
+func replyError(ctx context.Context, msg *email.Email, bugID, reply string) error {
+	if len(msg.Commands) == 0 {
+		log.Infof(ctx, "not sending error reply to %q: no commands", msg.MessageID)
+		return nil
+	}
+	if msg.OwnEmail {
+		log.Infof(ctx, "not sending error reply to %q: own email", msg.MessageID)
+		return nil
+	}
+	return replyTo(ctx, msg, bugID, reply)
+}
+
+// MaxGlobalEmailsPerHour limits the total number of outgoing emails per hour across all bugs.
+// Exported to use in test.
+var MaxGlobalEmailsPerHour = 60
+
+func checkEmailRateLimit(ctx context.Context, msg *aemail.Message) error {
+	tx := func(txCtx context.Context) error {
+		state, err := loadReportingState(txCtx)
+		if err != nil {
+			return err
+		}
+		now := timeNow(txCtx)
+		currentHour := now.Truncate(time.Hour)
+		lastHour := state.Emails.Time.Truncate(time.Hour)
+		if !currentHour.Equal(lastHour) {
+			state.Emails.Count = 0
+		}
+		if state.Emails.Count >= MaxGlobalEmailsPerHour {
+			return fmt.Errorf("global email rate limit exceeded (%v >= %v)",
+				state.Emails.Count, MaxGlobalEmailsPerHour)
+		}
+		state.Emails.Count++
+		state.Emails.Time = now
+		return saveReportingState(txCtx, state)
+	}
+	return runInTransaction(ctx, tx, nil)
+}
+
 // Sends email, can be stubbed for testing.
 var sendEmail = func(ctx context.Context, msg *aemail.Message) error {
+	if err := checkEmailRateLimit(ctx, msg); err != nil {
+		return fmt.Errorf("email rate limit exceeded: %w", err)
+	}
 	if err := aemail.Send(ctx, msg); err != nil {
 		return fmt.Errorf("failed to send email: %w", err)
 	}

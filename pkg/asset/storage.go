@@ -129,8 +129,7 @@ func (storage *Storage) uploadFileStream(reader io.Reader, assetType dashapi.Ass
 		compressor = typeDescr.customCompressor
 	}
 	res, err := compressor(req, storage.backend.upload)
-	var existsErr *FileExistsError
-	if errors.As(err, &existsErr) {
+	if existsErr, ok := errors.AsType[*FileExistsError](err); ok {
 		storage.tracer.Logf("asset %s already exists", path)
 		if extra == nil || !extra.SkipIfExists {
 			return "", err
@@ -144,8 +143,7 @@ func (storage *Storage) uploadFileStream(reader io.Reader, assetType dashapi.Ass
 		if err != nil {
 			more := ""
 			closeErr := res.writer.Close()
-			var exiterr *exec.ExitError
-			if errors.As(closeErr, &exiterr) {
+			if exiterr, ok := errors.AsType[*exec.ExitError](closeErr); ok {
 				more = fmt.Sprintf(", process state '%s'", exiterr.ProcessState)
 			}
 			return "", fmt.Errorf("failed to redirect byte stream: copied %d bytes, error %w%s",
@@ -181,6 +179,7 @@ func (storage *Storage) UploadBuildAsset(reader io.Reader, fileName string, asse
 		DownloadURL: url,
 	}, nil
 }
+
 func (storage *Storage) ReportBuildAssets(build *dashapi.Build, assets ...dashapi.NewAsset) error {
 	// If the server denies the reques, we'll delete the orphaned file during deprecated files
 	// deletion later.
@@ -223,7 +222,7 @@ type DeprecateStats struct {
 	Deleted  int // How many were deleted during DeprecateAssets().
 }
 
-// Best way: convert download URLs to paths.
+// DeprecateAssets deprecates assets by converting download URLs to paths.
 // We don't want to risk killing all assets after a slight domain change.
 func (storage *Storage) DeprecateAssets() (DeprecateStats, error) {
 	var stats DeprecateStats

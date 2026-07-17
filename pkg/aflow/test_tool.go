@@ -4,17 +4,27 @@
 package aflow
 
 import (
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
+
+type TestToolOption func(*testToolContext)
+
+type testToolContext struct {
+	ctx           Context
+	errorIsPrefix bool
+}
 
 // TestTool runs the given tool on provided initState/initArgs and compares results/error
 // with the provided wantResults/wantError.
 // wantResults can be either the tool return struct, or a function that accepts the tool
 // return struct. In the latter case, the function is executed with the actual results,
 // and is supposed to do assertions on the value.
-func TestTool(t *testing.T, tool Tool, initState, initArgs, wantResults any, wantError string) {
+func TestTool(t *testing.T, tool Tool, initState, initArgs, wantResults any, wantError string, opts ...TestToolOption) {
+	t.Helper()
 	type tester interface {
 		testVerify(t *testing.T, ctx *verifyContext, state, args, results any) (
 			map[string]any, map[string]any, func(map[string]any))
@@ -24,18 +34,44 @@ func TestTool(t *testing.T, tool Tool, initState, initArgs, wantResults any, wan
 	require.NoError(t, vctx.finalize())
 	// Just ensure it does not crash.
 	_ = tool.declaration()
-	// We don't init all fields, init more, if necessary.
-	ctx := &Context{
-		state: state,
+	tctx := &testToolContext{
+		// We don't init all fields, init more, if necessary.
+		ctx: Context{state: state},
 	}
-	defer ctx.Close()
-	gotResults, err := tool.execute(ctx, args)
+	for _, opt := range opts {
+		opt(tctx)
+	}
+	defer tctx.ctx.Close()
+	gotResults, err := tool.execute(&tctx.ctx, args)
 	gotError := ""
 	if err != nil {
 		gotError = err.Error()
 	}
-	require.Equal(t, wantError, gotError)
+	if tctx.errorIsPrefix {
+		require.True(t, strings.HasPrefix(gotError, wantError),
+			"error %q does not have prefix %q", gotError, wantError)
+	} else {
+		require.Equal(t, wantError, gotError)
+	}
+	if wantError != "" {
+		var badCallErr *badCallError
+		if !errors.As(err, &badCallErr) {
+			t.Errorf("expected BadCallError, got %T: %v", err, err)
+		}
+	}
 	resultChecker(gotResults)
+}
+
+func TestErrorPrefix() TestToolOption {
+	return func(tctx *testToolContext) {
+		tctx.errorIsPrefix = true
+	}
+}
+
+func TestWorkdir(dir string) TestToolOption {
+	return func(tctx *testToolContext) {
+		tctx.ctx.Workdir = dir
+	}
 }
 
 func FuzzTool(t *testing.T, tool Tool, initState, initArgs any) (map[string]any, error) {

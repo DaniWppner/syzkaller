@@ -1,6 +1,8 @@
 // Copyright 2025 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package app provides application-level configuration loading, environment initialization,
+// and logging helpers.
 package app
 
 import (
@@ -23,11 +25,24 @@ type AppConfig struct {
 	ParallelWorkflows int `yaml:"parallelWorkflows"`
 	// What Lore archives are to be polled for new patch series.
 	LoreArchives []string `yaml:"loreArchives"`
+	// Explicit list to listen to for direct series.
+	DirectList string `yaml:"directList"`
 	// Parameters used for sending/generating emails.
 	EmailReporting *EmailConfig `yaml:"emailReporting"`
 	// Trees and Fuzzer configuration.
 	Trees       []*api.Tree             `yaml:"trees"`
 	FuzzTargets []*api.FuzzTriageTarget `yaml:"fuzz_targets"`
+	// AI configuration (e.g. LLM secrets).
+	AI *AIConfig `yaml:"aiConfig"`
+}
+
+type AIConfig struct {
+	// The name of the GCP Secret Manager secret containing the Gemini API key.
+	GeminiAPIKey string `yaml:"geminiAPIKey"`
+}
+
+func (c *AIConfig) Empty() bool {
+	return c == nil || c.GeminiAPIKey == ""
 }
 
 const (
@@ -79,8 +94,8 @@ type DashapiConfig struct {
 	ContextPrefix string `yaml:"contextPrefix"`
 }
 
+// Config returns the project configuration.
 // The project configuration is expected to be mounted at /config/config.yaml.
-
 func Config() (*AppConfig, error) {
 	configLoadedOnce.Do(func() {
 		config, configErr = loadConfig(configPath)
@@ -107,6 +122,7 @@ func loadConfig(path string) (*AppConfig, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse: %w", err)
 	}
+
 	err = obj.Validate()
 	if err != nil {
 		return nil, err

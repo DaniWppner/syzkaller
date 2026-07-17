@@ -17,6 +17,7 @@ import (
 	"github.com/google/syzkaller/sys/targets"
 	"github.com/google/syzkaller/vm/vmimpl"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type testPool struct {
@@ -103,6 +104,7 @@ type Test struct {
 	Body           func(outc chan vmimpl.Chunk, errc chan error)
 	BodyExecuting  func(outc chan vmimpl.Chunk, errc chan error, inject chan<- bool)
 	Report         *report.Report
+	ExpectedErr    error
 }
 
 var tests = []*Test{
@@ -204,9 +206,9 @@ var tests = []*Test{
 	{
 		Name: "fuzzer-is-preempted",
 		Body: func(outc chan vmimpl.Chunk, errc chan error) {
-			outc <- vmimpl.Chunk{Data: []byte("BUG: bad\n")}
-			outc <- vmimpl.Chunk{Data: []byte(executorPreemptedStr + "\n")}
+			outc <- vmimpl.Chunk{Data: []byte("BUG: bad\n" + executorPreemptedStr + "\n")}
 		},
+		ExpectedErr: vmimpl.ErrPreempted,
 	},
 	{
 		Name: "program-exits-but-kernel-crashes-afterwards",
@@ -350,6 +352,27 @@ func TestMonitorExecution(t *testing.T) {
 	}
 }
 
+func TestNilChannelBlock(t *testing.T) {
+	inst, reporter := makeLinuxAMD64Futex(t, "test")
+	testInst := inst.impl.(*testInstance)
+
+	go func() {
+		close(testInst.outc)
+		time.Sleep(10 * time.Millisecond)
+		testInst.errc <- nil
+	}()
+
+	start := time.Now()
+	_, _, err := inst.Run(context.Background(), reporter, "", withTestRunOptionsDefaults(), WithExitCondition(ExitNormal))
+	require.NoError(t, err)
+
+	duration := time.Since(start)
+	// vmimpl.WaitForOutputTimeout is artificially set to 3s in vm_test.go init().
+	// If the bug is present, duration will be >= 3 seconds. Testing for 2s to
+	// compensate potential timer inaccuracy.
+	require.Less(t, duration, 2*time.Second, "test took %v, meaning it is waiting for a nil outc channel", duration)
+}
+
 func makeLinuxAMD64Futex(t *testing.T, poolName string) (*Instance, *report.Reporter) {
 	cfg := &mgrconfig.Config{
 		Derived: mgrconfig.Derived{
@@ -410,7 +433,11 @@ func testMonitorExecution(t *testing.T, test *Test) {
 		WithEarlyFinishCb(func() { finishCalled++ }),
 		injectExecuting,
 	)
-	if err != nil {
+	if test.ExpectedErr != nil {
+		if err != test.ExpectedErr {
+			t.Fatalf("want err %v, got %v", test.ExpectedErr, err)
+		}
+	} else if err != nil {
 		t.Fatal(err)
 	}
 	<-done
@@ -465,7 +492,10 @@ func TestExtractMultipleErrors(t *testing.T) {
 		reporter:   reporter,
 		output:     []byte(validKASANReport + strings.Repeat(someLine, 10) + validKASANReport),
 	}
-	reps := mon.extractErrors("unknown error")
+	reps, err := mon.extractErrors("unknown error")
+	if err != nil {
+		t.Fatal(err)
+	}
 	assert.Len(t, reps, 2, "expected to see 2 reports, got %v", len(reps))
 	assert.Equal(t, reps[0].Title, reps[1].Title)
 	assert.False(t, reps[0].Corrupted)
@@ -473,6 +503,7 @@ func TestExtractMultipleErrors(t *testing.T) {
 }
 
 const someLine = "[   96.999999] some message \n"
+
 const validKASANReport = `
 [   96.262735] BUG: KASAN: double-free or invalid-free in selinux_tun_dev_free_security+0x15/0x20
 [   96.271481] 

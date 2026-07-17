@@ -220,7 +220,7 @@ func parseRequires(data []byte) map[string]bool {
 		if !strings.HasPrefix(line, prefix) {
 			continue
 		}
-		for _, req := range strings.Fields(line[len(prefix):]) {
+		for req := range strings.FieldsSeq(line[len(prefix):]) {
 			positive := true
 			if req[0] == '-' {
 				positive = false
@@ -252,7 +252,7 @@ func MatchRequirements(props, requires map[string]bool) bool {
 			continue
 		}
 		matched := true
-		for _, req1 := range strings.Split(req, ",") {
+		for req1 := range strings.SplitSeq(req, ",") {
 			if !props[req1] {
 				matched = false
 			}
@@ -325,6 +325,7 @@ func FilterCandidates(candidates []fuzzer.Candidate, syscalls map[*prog.Syscall]
 	return ret
 }
 
+// ReminimizeThreshold defines the system call count threshold above which programs are re-minimized.
 // Programs that do more than 15 system calls are to be treated with suspicion and re-minimized.
 const ReminimizeThreshold = 15
 
@@ -355,7 +356,7 @@ func (fc *FilteredCandidates) ReminimizeSubset() int {
 	return reset
 }
 
-// resmashSubset clears fuzzer.ProgSmashes for a subset of seeds.
+// ResmashSubset clears fuzzer.ProgSmashes for a subset of seeds.
 // We smash the program only once after we add it to the corpus, but it can be that
 // either it did not finish before the instance was restarted, or the fuzzing algorithms
 // have become smarter over time, or just that kernel code changed over time.

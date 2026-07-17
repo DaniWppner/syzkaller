@@ -39,10 +39,16 @@ func main() {
 	output := new(bytes.Buffer)
 	tracer := &debugtracer.GenericTracer{WithTime: true, TraceWriter: output}
 
+	cfg, err := app.Config()
+	if err != nil {
+		app.Fatalf("failed to load app config: %v", err)
+	}
+
 	triager := &seriesTriager{
 		DebugTracer: tracer,
 		client:      client,
 		ops:         repo,
+		config:      cfg,
 	}
 	verdict, err := triager.GetVerdict(ctx, *flagSession)
 	if err != nil {
@@ -51,6 +57,7 @@ func main() {
 	err = client.UploadTriageResult(ctx, *flagSession, &api.UploadTriageResultReq{
 		SkipReason: verdict.SkipReason,
 		Log:        output.Bytes(),
+		Trajectory: verdict.Trajectory,
 	})
 	if err != nil {
 		app.Fatalf("failed to upload triage results: %v", err)
@@ -66,8 +73,10 @@ func main() {
 
 type seriesTriager struct {
 	debugtracer.DebugTracer
-	client *api.Client
-	ops    *triage.GitTreeOps
+	client    *api.Client
+	ops       *triage.GitTreeOps
+	config    *app.AppConfig
+	aiVerdict *triage.AITriageResult
 }
 
 func (triager *seriesTriager) GetVerdict(ctx context.Context, sessionID string) (*api.TriageResult, error) {
@@ -92,9 +101,8 @@ func (triager *seriesTriager) GetVerdict(ctx context.Context, sessionID string) 
 	}
 	ret := &api.TriageResult{}
 	for _, campaign := range fuzzConfigs {
-		fuzzTask, err := triager.prepareFuzzingTask(ctx, series, treesResp.Trees, campaign)
-		var skipErr *SkipTriageError
-		if errors.As(err, &skipErr) {
+		fuzzTask, err := triager.prepareFuzzingTask(ctx, series, sessionInfo.Direct, treesResp.Trees, campaign)
+		if skipErr, ok := errors.AsType[*SkipTriageError](err); ok {
 			ret.SkipReason = skipErr.Reason.Error()
 			continue
 		} else if err != nil {
@@ -106,11 +114,14 @@ func (triager *seriesTriager) GetVerdict(ctx context.Context, sessionID string) 
 		// If we have prepared at least one fuzzing task, the series was not skipped.
 		ret.SkipReason = ""
 	}
+	if triager.aiVerdict != nil {
+		ret.Trajectory = triager.aiVerdict.Trajectory
+	}
 	return ret, nil
 }
 
-func (triager *seriesTriager) prepareFuzzingTask(ctx context.Context, series *api.Series, trees []*api.Tree,
-	target *triage.MergedFuzzConfig) (*api.TestTarget, error) {
+func (triager *seriesTriager) prepareFuzzingTask(ctx context.Context, series *api.Series, forceTriage bool,
+	trees []*api.Tree, target *triage.MergedFuzzConfig) (*api.TestTarget, error) {
 	var result *SelectResult
 	var err error
 	if series.BaseCommitHint != "" {
@@ -131,39 +142,74 @@ func (triager *seriesTriager) prepareFuzzingTask(ctx context.Context, series *ap
 			return nil, fmt.Errorf("selection from the list failed: %w", err)
 		}
 	}
-	if result != nil {
-		triager.Logf("continuing with %v in %v", result.Commit, result.Tree.Name)
-		base := api.BuildRequest{
-			TreeName:   result.Tree.Name,
-			TreeURL:    result.Tree.URL,
-			ConfigName: target.KernelConfig,
-			CommitHash: result.Commit,
-			Arch:       result.Arch,
-		}
-		testTarget := &api.TestTarget{
-			Base:    base,
-			Patched: base,
-			Track:   target.Track,
-			Fuzz:    target.FuzzConfig,
-		}
-		testTarget.Patched.SeriesID = series.ID
-		retestFindings, err := triager.client.ListPreviousFindings(ctx, &api.ListPreviousFindingsReq{
-			SeriesID: series.ID,
-			Arch:     result.Arch,
-			Config:   target.KernelConfig,
-		})
-		if err != nil {
-			// This is sad, but not critical.
-			app.Errorf("failed to query previous findings: %v", err)
-		} else if len(retestFindings) > 0 {
-			triager.Logf("scheduling retest for %d findings", len(retestFindings))
-			testTarget.Retest = &api.RetestTask{
-				Findings: retestFindings,
+	if result == nil {
+		return nil, SkipError("no base commit found")
+	}
+
+	triager.Logf("continuing with %v in %v", result.Commit, result.Tree.Name)
+
+	if err := triager.ops.ApplySeries(result.Commit, series.PatchBodies()); err != nil {
+		return nil, fmt.Errorf("failed to apply series to base commit: %w", err)
+	}
+
+	if triager.aiVerdict == nil {
+		triager.aiVerdict = &triage.AITriageResult{WorthFuzzing: true}
+		if !triager.config.AI.Empty() {
+			if err := triage.CommitPatchForAflow(triager.ops); err != nil {
+				return nil, fmt.Errorf("failed to commit patch for aflow: %w", err)
+			}
+			if aiResult, err := triage.EvaluatePatch(ctx, triager.config, series, triager.DebugTracer, "/workdir"); err != nil {
+				triager.Logf("AI evaluation failed: %v", err)
+			} else if aiResult != nil {
+				triager.aiVerdict = aiResult
 			}
 		}
-		return testTarget, nil
 	}
-	return nil, SkipError("no base commit found")
+
+	if forceTriage && !triager.aiVerdict.WorthFuzzing {
+		triager.Logf("AI determined the patch has no functional impact, but fuzzing is forced")
+		triager.aiVerdict.WorthFuzzing = true
+	}
+
+	if !triager.aiVerdict.WorthFuzzing {
+		return nil, SkipError("AI determined the patch has no functional impact")
+	}
+
+	base := api.BuildRequest{
+		TreeName:      result.Tree.Name,
+		TreeURL:       result.Tree.URL,
+		ConfigName:    target.KernelConfig,
+		CommitHash:    result.Commit,
+		Arch:          result.Arch,
+		EnableConfigs: triager.aiVerdict.EnableConfigs,
+	}
+	fuzzCfg := new(api.FuzzConfig)
+	if target.FuzzConfig != nil {
+		*fuzzCfg = *target.FuzzConfig
+	}
+	fuzzCfg.FocusSymbols = triager.aiVerdict.FocusSymbols
+	testTarget := &api.TestTarget{
+		Base:    base,
+		Patched: base,
+		Track:   target.Track,
+		Fuzz:    fuzzCfg,
+	}
+	testTarget.Patched.SeriesID = series.ID
+	retestFindings, err := triager.client.ListPreviousFindings(ctx, &api.ListPreviousFindingsReq{
+		SeriesID: series.ID,
+		Arch:     result.Arch,
+		Config:   target.KernelConfig,
+	})
+	if err != nil {
+		// This is sad, but not critical.
+		app.Errorf("failed to query previous findings: %v", err)
+	} else if len(retestFindings) > 0 {
+		triager.Logf("scheduling retest for %d findings", len(retestFindings))
+		testTarget.Retest = &api.RetestTask{
+			Findings: retestFindings,
+		}
+	}
+	return testTarget, nil
 }
 
 func (triager *seriesTriager) prepareJobTask(

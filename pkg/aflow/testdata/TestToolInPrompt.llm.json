@@ -1,0 +1,46 @@
+[
+	{
+		"Model": "model",
+		"Config": {
+			"systemInstruction": {
+				"parts": [
+					{
+						"text": "Use swiss-knife\nPrefer calling several tools at the same time to save round-trips.\n"
+					}
+				],
+				"role": "user"
+			},
+			"temperature": 0.3,
+			"tools": [
+				{
+					"functionDeclarations": [
+						{
+							"description": "description",
+							"name": "swiss-knife",
+							"parametersJsonSchema": {
+								"type": "object",
+								"additionalProperties": false
+							},
+							"responseJsonSchema": {
+								"type": "object",
+								"additionalProperties": false
+							}
+						}
+					]
+				}
+			],
+			"thinkingLevel": 3,
+			"includeThoughts": true
+		},
+		"Request": [
+			{
+				"parts": [
+					{
+						"text": "Please call swiss-knife now."
+					}
+				],
+				"role": "user"
+			}
+		]
+	}
+]

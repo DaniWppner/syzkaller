@@ -38,6 +38,15 @@ int another_func(int) {
 			`,
 		},
 		vcs.FileContent{
+			File: "longline.c",
+			Content: `
+int long_func(void)
+{
+	` + strings.Repeat("a", 300) + `;
+}
+			`,
+		},
+		vcs.FileContent{
 			File: "overflow.c",
 			Content: strings.Repeat(`
 int some_func(int) {
@@ -64,6 +73,16 @@ foo.c-6-	line;
 
 	aflow.TestTool(t, Tool,
 		state{KernelSrc: repo.Dir},
+		args{Expression: "aaaaa"},
+		func(got results) {
+			expectedLine := "longline.c:4:	" + strings.Repeat("a", 186) + "..."
+			assert.True(t, strings.Contains(got.Output, expectedLine),
+				"output does not contain expected truncated line: %q", got.Output)
+		},
+		"")
+
+	aflow.TestTool(t, Tool,
+		state{KernelSrc: repo.Dir},
 		args{Expression: "barfoo"},
 		func(got results) {
 			assert.True(t, strings.Contains(got.Output,
@@ -83,7 +102,19 @@ foo.c-6-	line;
 		state{KernelSrc: repo.Dir},
 		args{Expression: "bad expression ("},
 		results{},
-		`bad expression: fatal: command line, 'bad expression (': Unmatched ( or \(`)
+		`bad expression: fatal: -e option, 'bad expression (': Unmatched ( or \(`)
+
+	aflow.TestTool(t, Tool,
+		state{KernelSrc: repo.Dir},
+		args{Expression: "foobar", PathPrefix: "foo.c"},
+		results{Output: `foo.c=2=int some_func(void)
+--
+foo.c-4-	line;
+foo.c:5:	foobar;
+foo.c-6-	line;
+`},
+		"")
+
 	aflow.TestTool(t, Tool,
 		state{KernelSrc: repo.Dir},
 		args{Expression: "->root"},

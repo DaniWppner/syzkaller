@@ -1,9 +1,12 @@
 // Copyright 2025 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package blob provides storage abstractions and cloud storage implementations
+// for storing and retrieving testing artifacts such as logs and test data.
 package blob
 
 import (
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -34,13 +37,21 @@ func (gcs *gcsDriver) Write(source io.Reader, parts ...string) (string, error) {
 		return "", fmt.Errorf("no identifiers for the object were passed to Write")
 	}
 	object := path.Join(gcs.bucket, path.Join(parts...))
-	w, err := gcs.client.FileWriter(object, "", "")
+	w, err := gcs.client.FileWriter(object, "", "gzip")
 	if err != nil {
 		return "", err
 	}
-	defer w.Close()
-	_, err = io.Copy(w, source)
-	if err != nil {
+	gz := gzip.NewWriter(w)
+	if _, err := io.Copy(gz, source); err != nil {
+		gz.Close()
+		w.Close()
+		return "", err
+	}
+	if err := gz.Close(); err != nil {
+		w.Close()
+		return "", err
+	}
+	if err := w.Close(); err != nil {
 		return "", err
 	}
 	return "gcs://" + object, nil

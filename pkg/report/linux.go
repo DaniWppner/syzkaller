@@ -157,9 +157,150 @@ func ctorLinux(cfg *config) (reporterImpl, []string, error) {
 const contextConsole = "console"
 
 var linuxPanickedRe = regexp.MustCompile(`Kernel panic - not syncing`)
+var replayRe = regexp.MustCompile(`^\n[^\n]*\*\* replaying previous printk message \*\*`)
+var linuxFaultInjectionRe = []byte("FAULT_INJECTION: forcing a failure")
 
 func (ctx *linux) ContainsCrash(output []byte) bool {
 	return containsCrash(output, linuxOopses, ctx.ignores)
+}
+
+func (ctx *linux) extractFaultInjectionInfo(reporter *Reporter, output []byte) (string, error) {
+	if !bytes.Contains(output, linuxFaultInjectionRe) {
+		return "", nil
+	}
+	const maxReports = 5
+	var blocks []string
+	seen := map[string]struct{}{}
+	for pos := 0; pos < len(output) && len(blocks) < maxReports; {
+		startPos, context, ok := ctx.findLineWithPattern(output, pos, linuxFaultInjectionRe)
+		if !ok {
+			break
+		}
+		pos = nextLinePos(output, startPos)
+		rep := ctx.extractFaultInjectionReport(output, startPos, context)
+		if rep == nil {
+			continue
+		}
+		if err := reporter.Symbolize(rep); err != nil {
+			return "", err
+		}
+		key := string(rep.Report)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		blocks = append(blocks, string(rep.Report))
+	}
+	return strings.Join(blocks, "\n\n"), nil
+}
+
+func (ctx *linux) findLineWithPattern(output []byte, startPos int, pattern []byte) (int, string, bool) {
+	for pos := startPos; pos < len(output); pos = nextLinePos(output, pos) {
+		next := nextLinePos(output, pos)
+		line := bytes.TrimRight(output[pos:next], "\n")
+		if bytes.Contains(line, pattern) {
+			return pos, ctx.extractContext(line), true
+		}
+	}
+	return 0, "", false
+}
+
+func (ctx *linux) extractFaultInjectionReport(output []byte, startPos int, context string) *Report {
+	var report []byte
+	cpuTraceback := false
+	endPos := startPos
+	for pos := startPos; pos < len(output); pos = nextLinePos(output, pos) {
+		next := nextLinePos(output, pos)
+		line := bytes.TrimRight(output[pos:next], "\n")
+		context1 := ctx.extractContext(line)
+		stripped, questionable := ctx.stripLinePrefix(line, context1, false)
+		isStartLine := pos == startPos
+		if !isStartLine {
+			if questionable {
+				continue
+			}
+			if context != "" && context1 != context &&
+				(!cpuTraceback || !ctx.cpuContext.MatchString(context1)) {
+				continue
+			}
+			if ctx.isFaultInjectionBoundary(line) {
+				endPos = pos
+				break
+			}
+		}
+		if bytes.Contains(line, []byte("Sending NMI from CPU")) {
+			cpuTraceback = true
+		}
+		report = append(report, stripped...)
+		report = append(report, '\n')
+		endPos = next
+	}
+	report = compactFaultInjectionReport(report)
+	if len(report) == 0 {
+		return nil
+	}
+	return &Report{
+		Output:   output,
+		StartPos: startPos,
+		EndPos:   endPos,
+		Report:   report,
+	}
+}
+
+func (ctx *linux) isFaultInjectionBoundary(line []byte) bool {
+	for _, oops := range linuxOopses {
+		if matchOops(line, oops, ctx.ignores) && !matchesAny(line, ctx.reportStartIgnores) {
+			return true
+		}
+	}
+	for _, pattern := range ctx.infoMessagesWithStack {
+		if bytes.Contains(line, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+func compactFaultInjectionReport(report []byte) []byte {
+	var compact []byte
+	hasTrace := false
+	for line := range bytes.SplitSeq(report, []byte{'\n'}) {
+		line = bytes.TrimRight(line, " \t")
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) == 0 {
+			continue
+		}
+		switch {
+		case bytes.Contains(trimmed, linuxFaultInjectionRe):
+			line = trimmed
+		case bytes.HasPrefix(trimmed, []byte("name ")):
+			line = trimmed
+		case bytes.Equal(trimmed, []byte("Call Trace:")):
+			line = trimmed
+		default:
+			if _, ok := parseLinuxBacktraceLine(line); !ok {
+				continue
+			}
+			hasTrace = true
+		}
+		compact = append(compact, line...)
+		compact = append(compact, '\n')
+	}
+	if !hasTrace {
+		return nil
+	}
+	return bytes.TrimSuffix(compact, []byte{'\n'})
+}
+
+func nextLinePos(output []byte, pos int) int {
+	if pos >= len(output) {
+		return len(output)
+	}
+	next := bytes.IndexByte(output[pos:], '\n')
+	if next == -1 {
+		return len(output)
+	}
+	return pos + next + 1
 }
 
 func (ctx *linux) Parse(output []byte) *Report {
@@ -223,6 +364,13 @@ func (ctx *linux) Parse(output []byte) *Report {
 	}
 }
 
+func isTruncatedByReplay(output []byte, pos int) bool {
+	if pos >= len(output) {
+		return false
+	}
+	return replayRe.Match(output[pos:])
+}
+
 func (ctx *linux) findFirstOops(output []byte) (oops *oops, startPos int, context string) {
 	for pos, next := 0, 0; pos < len(output); pos = next + 1 {
 		next = bytes.IndexByte(output[pos:], '\n')
@@ -234,6 +382,9 @@ func (ctx *linux) findFirstOops(output []byte) (oops *oops, startPos int, contex
 		line := output[pos:next]
 		for _, oops1 := range linuxOopses {
 			if matchOops(line, oops1, ctx.ignores) {
+				if isTruncatedByReplay(output, next) {
+					continue
+				}
 				oops = oops1
 				startPos = pos
 				context = ctx.extractContext(line)
@@ -304,6 +455,9 @@ func (ctx *linux) findReport(output []byte, oops *oops, startPos int, context st
 						}
 					}
 				}
+				continue
+			}
+			if isTruncatedByReplay(output, next) {
 				continue
 			}
 			endPos = next
@@ -403,7 +557,7 @@ func (ctx *linux) Symbolize(rep *Report) error {
 
 	// Skip getting maintainers for Android fuzzing since the kernel source
 	// directory structure is different.
-	if ctx.config.vmType == "cuttlefish" || ctx.config.vmType == "proxyapp" {
+	if ctx.config.vmType == "cuttlefish" || ctx.config.vmType == "proxyapp:android" {
 		return nil
 	}
 
@@ -671,7 +825,7 @@ func (ctx *linux) parseOpcodes(codeSlice string) (parsedOpcodes, error) {
 	width := 0
 	bytes := []byte{}
 	trapOffset := -1
-	for _, part := range strings.Split(strings.TrimSpace(codeSlice), " ") {
+	for part := range strings.SplitSeq(strings.TrimSpace(codeSlice), " ") {
 		if part == "" || len(part)%2 != 0 {
 			return parsedOpcodes{}, fmt.Errorf("invalid opcodes string %#v", part)
 		}
@@ -857,8 +1011,7 @@ func (ctx *linux) extractGuiltyFileImpl(report []byte) string {
 		clean := filepath.Clean(string(file))
 
 		// Check if the new path has *both* the same directory prefix *and* a deeper suffix.
-		if strings.HasPrefix(clean, deepestPath) {
-			suffix := strings.TrimPrefix(clean, deepestPath)
+		if suffix, ok := strings.CutPrefix(clean, deepestPath); ok {
 			if deeperPathRe.Match([]byte(suffix)) {
 				guilty = clean
 				deepestPath = filepath.Dir(guilty)
@@ -1149,6 +1302,7 @@ var linuxCorruptedTitles = []*regexp.Regexp{
 // missing stack trace does not necessarily mean the log is corrupted. Match the last line printed by show_regs(),
 // before the stack dump.
 var riscvSpecialStackStart = regexp.MustCompile(`status: [0-9a-f]{16} badaddr: [0-9a-f]{16} cause: [0-9a-f]{16}`)
+
 var linuxStackParams = &stackParams{
 	stackStartRes: []*regexp.Regexp{
 		regexp.MustCompile(`Call (?:T|t)race`),
@@ -2054,7 +2208,7 @@ var linuxOopses = append([]*oops{
 				fmt:    "inconsistent lock state in %[1]v",
 			},
 			{
-				title: compile("INFO: rcu_(?:preempt|sched|bh) (?:self-)?detected(?: expedited)? stall"),
+				title: compile("INFO: rcu_(?:preempt|sched|bh|tasks) (?:self-)?detected(?: expedited)? stall"),
 				fmt:   "INFO: rcu detected stall in %[1]v",
 				alt:   []string{"stall in %[1]v"},
 				stack: &stackFmt{
@@ -2095,7 +2249,7 @@ var linuxOopses = append([]*oops{
 				},
 			},
 			{
-				title: compile("INFO: task .* blocked for more than [0-9]+ seconds"),
+				title: compile(`INFO: task {{TASK}} blocked (?:in I/O wait )?for more than [0-9]+ seconds`),
 				fmt:   "INFO: task hung in %[1]v",
 				alt:   []string{"hang in %[1]v"},
 				stack: &stackFmt{
@@ -2107,7 +2261,7 @@ var linuxOopses = append([]*oops{
 				},
 			},
 			{
-				title: compile("INFO: task .* can't die for more than .* seconds"),
+				title: compile("INFO: task {{TASK}} can't die for more than .* seconds"),
 				fmt:   "INFO: task can't die in %[1]v",
 				alt:   []string{"hang in %[1]v"},
 				stack: &stackFmt{
@@ -2418,6 +2572,23 @@ var linuxOopses = append([]*oops{
 				stack: &stackFmt{
 					parts: []*regexp.Regexp{
 						linuxRipFrame,
+					},
+				},
+			},
+		},
+		[]*regexp.Regexp{},
+	},
+	{
+		[]byte("int3:"),
+		[]oopsFormat{
+			{
+				title: compile("int3: "),
+				fmt:   "int3 in %[1]v",
+				stack: &stackFmt{
+					parts: []*regexp.Regexp{
+						linuxRipFrame,
+						linuxCallTrace,
+						parseStackTrace,
 					},
 				},
 			},

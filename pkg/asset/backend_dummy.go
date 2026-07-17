@@ -1,6 +1,7 @@
 // Copyright 2022 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package asset manages storage and upload of build assets and artifacts.
 package asset
 
 import (
@@ -65,8 +66,8 @@ func (be *dummyStorageBackend) getPath(url string) (string, error) {
 	if strings.HasPrefix(url, "http://unknown-bucket/") {
 		return "", ErrUnknownBucket
 	}
-	if strings.HasPrefix(url, "http://download/") {
-		return strings.TrimPrefix(url, "http://download/"), nil
+	if after, ok := strings.CutPrefix(url, "http://download/"); ok {
+		return after, nil
 	}
 	return "", fmt.Errorf("unknown URL format")
 }

@@ -23,6 +23,7 @@ import (
 
 type Email struct {
 	BugIDs         []string
+	OwnEmailsCcd   bool
 	MessageID      string
 	InReplyTo      string
 	Date           time.Time
@@ -30,6 +31,7 @@ type Email struct {
 	Subject        string
 	MailingList    string
 	Author         string
+	AuthorName     string
 	OwnEmail       bool
 	Cc             []string
 	RawCc          []string // unstripped emails
@@ -60,6 +62,8 @@ const (
 	CmdSet
 	CmdUnset
 	CmdRegenerate
+	CmdReject
+	CmdUnreject
 
 	cmdTest5
 )
@@ -114,6 +118,7 @@ func Parse(r io.Reader, ownEmails, goodLists, domains []string) (*Email, error) 
 	}
 
 	bugIDs := []string{}
+	ownEmailsCcd := false
 	rawCcList := append(append(append(cc, to...), from...), originalFroms...)
 	for _, addr := range rawCcList {
 		cleaned, context, _ := RemoveAddrContext(addr.Address)
@@ -121,7 +126,10 @@ func Parse(r io.Reader, ownEmails, goodLists, domains []string) (*Email, error) 
 			cleaned = addr.Address
 		}
 		if ownAddrs[cleaned] {
-			bugIDs = append(bugIDs, context)
+			ownEmailsCcd = true
+			if context != "" {
+				bugIDs = append(bugIDs, context)
+			}
 		} else {
 			ccList = append(ccList, CanonicalEmail(cleaned))
 		}
@@ -143,20 +151,17 @@ func Parse(r io.Reader, ownEmails, goodLists, domains []string) (*Email, error) 
 	subject := decodeSubject(msg.Header.Get("Subject"))
 	var cmds []*SingleCommand
 	var patch string
-	if !fromMe {
-		for _, a := range attachments {
-			patch = ParsePatch(a)
-			if patch != "" {
-				break
-			}
+	for _, a := range attachments {
+		patch = ParsePatch(a)
+		if patch != "" {
+			break
 		}
-		if patch == "" {
-			patch = ParsePatch(body)
-		}
-		cmds = extractCommands(subject + "\n" + bodyStr)
 	}
+	if patch == "" {
+		patch = ParsePatch(body)
+	}
+	cmds = extractCommands(subject + "\n" + bodyStr)
 	bugIDs = append(bugIDs, extractBodyBugIDs(bodyStr, ownAddrs, domains)...)
-
 	link := ""
 	if match := groupsLinkRe.FindStringSubmatchIndex(bodyStr); match != nil {
 		link = bodyStr[match[2]:match[3]]
@@ -166,6 +171,7 @@ func Parse(r io.Reader, ownEmails, goodLists, domains []string) (*Email, error) 
 	}
 
 	author := CanonicalEmail(from[0].Address)
+	authorName := from[0].Name
 	mailingList := ""
 
 	goodListsMap := prepareEmails(goodLists)
@@ -185,11 +191,13 @@ func Parse(r io.Reader, ownEmails, goodLists, domains []string) (*Email, error) 
 	email := &Email{
 		BugIDs:         unique(bugIDs),
 		MessageID:      msg.Header.Get("Message-ID"),
-		InReplyTo:      extractInReplyTo(msg.Header),
+		InReplyTo:      ExtractInReplyTo(msg.Header),
 		Date:           date,
 		Link:           link,
 		Author:         author,
+		AuthorName:     authorName,
 		OwnEmail:       fromMe,
+		OwnEmailsCcd:   ownEmailsCcd,
 		MailingList:    mailingList,
 		Subject:        subject,
 		Cc:             ccList,
@@ -246,18 +254,37 @@ func RemoveAddrContext(email string) (string, string, error) {
 }
 
 func CanonicalEmail(email string) string {
-	addr, err := mail.ParseAddress(email)
+	user, domain, err := Split(email)
 	if err != nil {
 		return email
 	}
-	at := strings.IndexByte(addr.Address, '@')
-	if at == -1 {
-		return email
+	return strings.ToLower(user + domain)
+}
+
+// EmailsMatch parses the emails and compares their addresses case-insensitively, ignoring names.
+// If either email fails to parse, it falls back to an exact string comparison.
+func EmailsMatch(val1, val2 string) bool {
+	addr1, err1 := mail.ParseAddress(val1)
+	addr2, err2 := mail.ParseAddress(val2)
+	if err1 == nil && err2 == nil {
+		return strings.EqualFold(addr1.Address, addr2.Address)
 	}
-	if plus := strings.IndexByte(addr.Address[:at], '+'); plus != -1 {
-		addr.Address = addr.Address[:plus] + addr.Address[at:]
+	return val1 == val2
+}
+
+// Split splits email into user (without context) and domain (with @ prefix).
+func Split(email string) (string, string, error) {
+	addr, err := mail.ParseAddress(email)
+	if err != nil {
+		return "", "", err
 	}
-	return strings.ToLower(addr.Address)
+	user, domain, ok := strings.Cut(addr.Address, "@")
+	if !ok {
+		return "", "", fmt.Errorf("no @ in email address")
+	}
+	domain = "@" + domain
+	user, _, _ = strings.Cut(user, "+")
+	return user, domain, nil
 }
 
 func extractCommands(body string) []*SingleCommand {
@@ -361,6 +388,10 @@ func strToCmd(str string) Command {
 		return CmdUnset
 	case "regenerate":
 		return CmdRegenerate
+	case "reject":
+		return CmdReject
+	case "unreject":
+		return CmdUnreject
 	case "test_5_arg_cmd":
 		return cmdTest5
 	}
@@ -462,7 +493,7 @@ func parseBody(r io.Reader, headers mail.Header) ([]byte, [][]byte, error) {
 
 var extractMessageIDs = regexp.MustCompile(`<.+?>`)
 
-func extractInReplyTo(header mail.Header) string {
+func ExtractInReplyTo(header mail.Header) string {
 	value := header.Get("In-Reply-To")
 	// Normally there should be just one message, to which we reply.
 	// However, there have been some cases when multiple addresses were mentioned.
@@ -568,6 +599,21 @@ func RemoveFromEmailList(list []string, toRemove string) []string {
 	return result
 }
 
+// SubtractEmailLists subtracts all emails in 'toRemove' from 'list'.
+func SubtractEmailLists(list, toRemove []string) []string {
+	removeMap := make(map[string]bool)
+	for _, email := range toRemove {
+		removeMap[CanonicalEmail(email)] = true
+	}
+	var result []string
+	for _, email := range list {
+		if !removeMap[CanonicalEmail(email)] {
+			result = append(result, email)
+		}
+	}
+	return result
+}
+
 // Decode RFC 2047-encoded subjects.
 func decodeSubject(rawSubject string) string {
 	decoder := new(mime.WordDecoder)
@@ -586,4 +632,13 @@ func extractBaseCommitHint(email string) string {
 		return matches[1]
 	}
 	return ""
+}
+
+// DirectlyAddressedTo returns true if the specified bugID was explicitly mentioned
+// in the raw To/Cc headers of the email.
+func (email *Email) DirectlyAddressedTo(bugID string) bool {
+	return slices.ContainsFunc(email.RawCc, func(addr string) bool {
+		_, context, _ := RemoveAddrContext(addr)
+		return context == bugID
+	})
 }

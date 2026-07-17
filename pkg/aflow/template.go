@@ -5,6 +5,7 @@ package aflow
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"reflect"
@@ -91,13 +92,16 @@ func walkTemplate(n parse.Node, used map[string]bool, errp *error) {
 			walkTemplate(c, used, errp)
 		}
 	case *parse.FieldNode:
-		if len(n.Ident) != 1 {
-			noteError(errp, "compound values are not supported: .%v", strings.Join(n.Ident, "."))
-		}
 		used[n.Ident[0]] = true
 	case *parse.VariableNode:
+	case *parse.ChainNode:
+		walkTemplate(n.Node, used, errp)
 	case *parse.TextNode:
 	case *parse.IdentifierNode:
+	case *parse.NumberNode:
+	case *parse.StringNode:
+	case *parse.BoolNode:
+	case *parse.DotNode:
 	default:
 		noteError(errp, "unhandled node type %T", n)
 	}
@@ -111,6 +115,16 @@ var templateFuncs = template.FuncMap{
 	"titleIsUAF":            titleIs(crash.KASANUseAfterFreeRead, crash.KASANUseAfterFreeWrite),
 	"titleIsKASANNullDeref": titleIs(crash.KASANNullPtrDerefRead, crash.KASANNullPtrDerefWrite),
 	"titleIsWarning":        titleIs(crash.Warning),
+	"jsonMarshal": func(v any) string {
+		var buf bytes.Buffer
+		enc := json.NewEncoder(&buf)
+		enc.SetEscapeHTML(false)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(v); err != nil {
+			return fmt.Sprintf("error marshaling: %v", err)
+		}
+		return strings.TrimSuffix(buf.String(), "\n")
+	},
 }
 
 func titleIs(types ...crash.Type) func(string) bool {

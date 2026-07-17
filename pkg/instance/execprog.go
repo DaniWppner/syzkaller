@@ -7,10 +7,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
-	"path/filepath"
-	"slices"
 	"strconv"
 	"time"
 
@@ -22,6 +22,7 @@ import (
 	"github.com/google/syzkaller/prog"
 	"github.com/google/syzkaller/sys/targets"
 	"github.com/google/syzkaller/vm"
+	"github.com/google/syzkaller/vm/vmimpl"
 )
 
 type ExecutorLogger func(int, string, ...any)
@@ -144,6 +145,10 @@ func (inst *ExecProgInstance) runCommand(command string, opts RunOptions) (*RunR
 	if len(reps) > 0 {
 		rep = reps[0]
 	}
+	if ctxTimeout.Err() == context.DeadlineExceeded || errors.Is(err, context.DeadlineExceeded) {
+		output = append(output, []byte(fmt.Sprintf("\n[host] Command execution timed out after %v\n", opts.Duration))...)
+		err = nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to run command in VM: %w", err)
 	}
@@ -231,13 +236,24 @@ func (inst *ExecProgInstance) RunCProgRaw(src []byte, target *prog.Target, opts 
 
 func (inst *ExecProgInstance) RunSyzProgFile(progFile string, opts RunOptions) (*RunResult, error) {
 	coverFile := ""
+	ncalls := 0
+	if opts.CollectCoverage && inst.mgrCfg.TargetOS != "linux" {
+		return nil, fmt.Errorf("coverage collection via ssh cat is only supported on Linux")
+	}
+
 	if opts.CollectCoverage {
-		coverDir, err := os.MkdirTemp("", "syz-cover")
-		if err != nil {
-			return nil, err
+		if opts.Opts.Repeat {
+			return nil, fmt.Errorf("coverage retrieval is not supported when repeat is enabled")
 		}
-		defer osutil.RemoveAll(coverDir)
-		coverFile = filepath.Join(coverDir, "cover")
+		progData, err := os.ReadFile(progFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read prog file: %w", err)
+		}
+		_, ncalls, err = prog.CallSet(progData)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse prog: %w", err)
+		}
+		coverFile = fmt.Sprintf("/tmp/syz-cover-%d", time.Now().UnixNano())
 	}
 	vmProgFile, err := inst.VMInstance.Copy(progFile)
 	if err != nil {
@@ -250,18 +266,11 @@ func (inst *ExecProgInstance) RunSyzProgFile(progFile string, opts RunOptions) (
 		return nil, err
 	}
 	if coverFile != "" {
-		files, err := filepath.Glob(coverFile + "*")
+		coverage, err := inst.retrieveCoverageFiles(coverFile, ncalls)
 		if err != nil {
-			return nil, fmt.Errorf("failed to glob cover files: %w", err)
+			return nil, err
 		}
-		slices.Sort(files)
-		for _, f := range files {
-			cover, err := parseCoverageFile(f)
-			if err != nil {
-				return nil, fmt.Errorf("failed to parse cover file: %w", err)
-			}
-			res.Coverage = append(res.Coverage, cover)
-		}
+		res.Coverage = coverage
 	}
 	return res, nil
 }
@@ -279,18 +288,129 @@ func (inst *ExecProgInstance) RunSyzProg(syzProg []byte, opts RunOptions) (*RunR
 	return inst.RunSyzProgFile(progFile, opts)
 }
 
-func parseCoverageFile(filename string) ([]uint64, error) {
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		return nil, err
-	}
+func parseCoverageData(data []byte) ([]uint64, error) {
 	var res []uint64
 	for s := bufio.NewScanner(bytes.NewReader(data)); s.Scan(); {
-		v, err := strconv.ParseUint(s.Text(), 16, 64)
+		v, err := strconv.ParseUint(s.Text(), 0, 64)
 		if err != nil {
 			return nil, err
 		}
 		res = append(res, v)
 	}
 	return res, nil
+}
+
+// runStreamAndCollectStdout runs a command on the VM and streams its
+// stdout to the provided writer. Use a file for large outputs (like memory
+// dumps) to avoid OOMs, and a buffer for small outputs.
+// This function is also used by dump.go.
+// If this function returns an error, you MUST NOT reuse the same vm for
+// any further command execution since the outc channel might be constantly
+// drained, making the output incomplete.
+func runStreamAndCollectStdout(ctx context.Context, inst *vm.Instance, command string, w io.Writer) error {
+	// In case of write error to w, we want to cancel the command
+	// execution, so that we don't keep getting chunks written to the channel.
+	cancellableCtx, cancel := context.WithCancel(ctx)
+
+	outc, errc, err := inst.RunStream(cancellableCtx, command)
+	if err != nil {
+		cancel()
+		return err
+	}
+
+	// A deadlock can happen if this function returns early while outc is still active.
+	// If the channel buffer fills up, decoders in merger.go will block trying to send to outc.
+	// Consequently, merger.Wait() in Multiplex will block forever waiting for decoders to finish.
+	// Draining the channel in a background goroutine unblocks the decoders and breaks the deadlock.
+	defer func() {
+		if outc != nil {
+			go func() {
+				for range outc {
+				}
+			}()
+		}
+	}()
+	// First cancel the execution before draining.
+	defer cancel()
+
+	writeChunk := func(chunk vmimpl.Chunk) error {
+		// Filter out console and stderr by only taking from stdout.
+		if chunk.Type != vmimpl.OutputStdout {
+			return nil
+		}
+		if _, err := w.Write(chunk.Data); err != nil {
+			return fmt.Errorf("failed to write output: %w", err)
+		}
+		return nil
+	}
+
+	for {
+		select {
+		case chunk, ok := <-outc:
+			if !ok {
+				outc = nil
+				continue
+			}
+			if err := writeChunk(chunk); err != nil {
+				return err
+			}
+		case err := <-errc:
+			errc = nil
+			// Command finished. Drain outc to get any remaining command
+			// output. The deferred drain is not run here, because we still
+			// need the output.
+			n := len(outc)
+			for range n {
+				if err := writeChunk(<-outc); err != nil {
+					return err
+				}
+			}
+			// In case of race between context cancellation and receiving
+			// command error, prioritize context error.
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			outc = nil
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (inst *ExecProgInstance) runStreamAndCollectStdoutToBuf(ctx context.Context, command string) ([]byte, error) {
+	var buf bytes.Buffer
+	err := runStreamAndCollectStdout(ctx, inst.VMInstance, command, &buf)
+	return buf.Bytes(), err
+}
+
+func (inst *ExecProgInstance) retrieveCoverageFiles(vmCoverFilePrefix string, ncalls int) ([][]uint64, error) {
+	// syz-execprog generates these coverage files during execution (see tools/syz-execprog/execprog.go).
+	// Because we run a single program exactly once (opts.Repeat is false), it generates:
+	// - Per-call coverage: <prefix>_prog1.<call_index>
+	// - Extra coverage (background threads): <prefix>_prog1.extra
+	var files []string
+	for i := range ncalls {
+		files = append(files, fmt.Sprintf("%s_prog1.%d", vmCoverFilePrefix, i))
+	}
+	files = append(files, fmt.Sprintf("%s_prog1.extra", vmCoverFilePrefix))
+
+	coverage := make([][]uint64, 0, ncalls)
+	for _, file := range files {
+		catCmd := "cat " + file + " 2>/dev/null || true"
+		catCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		catOutput, err := inst.runStreamAndCollectStdoutToBuf(catCtx, catCmd)
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read coverage file %s in VM: %w", file, err)
+		}
+
+		cover, err := parseCoverageData(catOutput)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse cover data from %s: %w", file, err)
+		}
+		coverage = append(coverage, cover)
+	}
+
+	return coverage, nil
 }

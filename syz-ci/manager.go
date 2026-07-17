@@ -455,7 +455,7 @@ func (mgr *Manager) restartManager() {
 	// build attempt, so let's always reset it to the commit the current kernel was built at.
 	_, err = mgr.repo.CheckoutCommit(mgr.mgrcfg.Repo, info.KernelCommit)
 	if err != nil {
-		mgr.Errorf("failed to check out the last kernel commit %q: %v", info.KernelCommit, err)
+		mgr.Errorf("failed to check out the last kernel commit %q:\n%s", info.KernelCommit, osutil.VerboseMessage(err))
 		return
 	}
 	buildTag, err := mgr.uploadBuild(info, mgr.currentDir)
@@ -714,7 +714,7 @@ func (mgr *Manager) pollCommits(buildCommit string) ([]string, []dashapi.Commit,
 
 	var present []string
 	if len(pendingCommits) != 0 {
-		commits, _, err := mgr.repo.GetCommitsByTitles(pendingCommits)
+		commits, _, err := mgr.repo.GetCommitsByTitles(pendingCommits, time.Time{})
 		if err != nil {
 			return nil, nil, err
 		}
@@ -777,11 +777,17 @@ func (mgr *Manager) uploadBuildAssets(buildInfo *dashapi.Build, assetFolder stri
 	if osutil.IsExist(imageFile) {
 		if mgr.managercfg.Type == "qemu" {
 			// For qemu we currently use non-bootable disk images.
-			pending = append(pending, pendingAsset{imageFile, dashapi.NonBootableDisk,
-				"non_bootable_disk.raw"})
+			pending = append(pending, pendingAsset{
+				path:      imageFile,
+				assetType: dashapi.NonBootableDisk,
+				name:      "non_bootable_disk.raw",
+			})
 		} else {
-			pending = append(pending, pendingAsset{imageFile, dashapi.BootableDisk,
-				"disk.raw"})
+			pending = append(pending, pendingAsset{
+				path:      imageFile,
+				assetType: dashapi.BootableDisk,
+				name:      "disk.raw",
+			})
 		}
 	}
 	target := mgr.managercfg.SysTarget

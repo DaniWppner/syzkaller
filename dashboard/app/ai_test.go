@@ -5,15 +5,16 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"html"
+	"maps"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"golang.org/x/sync/errgroup"
 
 	"github.com/google/syzkaller/dashboard/app/aidb"
 	"github.com/google/syzkaller/dashboard/dashapi"
@@ -22,6 +23,7 @@ import (
 	"github.com/google/syzkaller/prog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
 )
 
 func TestAIMigrations(t *testing.T) {
@@ -229,7 +231,14 @@ func TestAIJob(t *testing.T) {
 		"KernelCommit":    "1111111111111111111111111111111111111111",
 		"KernelConfig":    "config1",
 		"SyzkallerCommit": "syzkaller_commit1",
+		"TargetOS":        "linux",
+		"TargetArch":      "amd64",
+		"ReproSyz":        "",
+		"ReproC":          "",
 		"ReproOpts":       "",
+		"BaseRepository":  "git://ai/base.git",
+		"BaseBranch":      "ai-base",
+		"BaseCommit":      "RC",
 	})
 
 	resp2, err2 := c.agentClient.AIJobPoll(&dashapi.AIJobPollReq{
@@ -291,8 +300,7 @@ func TestAIJob(t *testing.T) {
 		ID: resp.ID,
 		Results: map[string]any{
 			"Explanation": "foo",
-			"Number":      1,
-			"Bool":        true,
+			"Benign":      false,
 		},
 	}))
 }
@@ -304,6 +312,56 @@ func TestAIJobNotFound(t *testing.T) {
 	_, err := c.GET("/ai_job?id=non-existent-id")
 	require.Error(t, err)
 	expectFailureStatus(t, err, http.StatusNotFound)
+}
+
+func TestAIJobLongError(t *testing.T) {
+	c := NewSpannerCtx(t)
+	defer c.Close()
+
+	build := testBuild(1)
+	c.aiClient.UploadBuild(build)
+	crash := testCrash(build, 1)
+	crash.Title = "KCSAN: data-race in foo / bar"
+	c.aiClient.ReportCrash(crash)
+	c.aiClient.pollEmailExtID()
+
+	resp, err := c.agentClient.AIJobPoll(&dashapi.AIJobPollReq{
+		AgentName:    "agent-test-long-error",
+		CodeRevision: prog.GitRevision,
+		Workflows: []dashapi.AIWorkflow{
+			{Type: ai.WorkflowAssessmentKCSAN, Name: string(ai.WorkflowAssessmentKCSAN)},
+		},
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, resp.ID)
+
+	rootCause := "sys/dev/kcov.c:93:6: error: use of undeclared identifier 'kcov_cold123'"
+	longError := "build failed\n" + rootCause + "\n" + strings.Repeat("kernel config prompt failed\n", 300)
+	require.Greater(t, len(longError), 4<<10)
+	require.NoError(t, c.agentClient.AIJobDone(&dashapi.AIJobDoneReq{
+		ID:    resp.ID,
+		Error: longError,
+	}))
+
+	job, err := aidb.LoadJob(c.ctx, resp.ID)
+	require.NoError(t, err)
+	require.Equal(t, longError, job.Error)
+
+	page, err := c.GET(fmt.Sprintf("/ai_job?id=%v", resp.ID))
+	require.NoError(t, err)
+	pageText := html.UnescapeString(string(page))
+	require.Contains(t, pageText, rootCause)
+	require.Contains(t, pageText, "kernel config prompt failed")
+	require.Contains(t, pageText, "truncated to first 200 bytes")
+}
+
+func TestTruncateAIJobError(t *testing.T) {
+	err := strings.Repeat("x", maxAIJobDoneErrorLen+1)
+
+	truncated := truncateAIJobError(err)
+
+	require.Len(t, truncated, maxAIJobDoneErrorLen+len("\n... [truncated]"))
+	require.True(t, strings.HasSuffix(truncated, "\n... [truncated]"))
 }
 
 func TestAIJobActions(t *testing.T) {
@@ -326,12 +384,14 @@ func TestAIJobActions(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	jobCreateURL := fmt.Sprintf("/bug?id=%v&ai-job-create=patching", bug.keyHash(c.ctx))
-	_, err = c.AuthGET(AccessPublic, jobCreateURL)
+	jobCreateURL := fmt.Sprintf("/bug?id=%v", bug.keyHash(c.ctx))
+	values := url.Values{}
+	values.Set("ai-job-create", "patching")
+	_, err = c.AuthPOSTForm(AccessPublic, jobCreateURL, values)
 	require.Error(t, err)
 	// Redirect to login page.
 	require.Contains(t, err.Error(), fmt.Sprint(http.StatusTemporaryRedirect))
-	_, err = c.AuthGET(AccessUser, jobCreateURL)
+	_, err = c.AuthPOSTForm(AccessUser, jobCreateURL, values)
 	require.NoError(t, err)
 
 	resp, err := c.globalClient.AIJobPoll(&dashapi.AIJobPollReq{
@@ -342,18 +402,81 @@ func TestAIJobActions(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
+	require.NotEqual(t, resp.ID, "")
+	require.Equal(t, resp.Workflow, "patching")
+	require.Equal(t, resp.Args, map[string]any{
+		"BugTitle":        "title1",
+		"CrashReport":     "report1",
+		"CrashLog":        "log1",
+		"KernelRepo":      "repo1",
+		"KernelCommit":    "1111111111111111111111111111111111111111",
+		"KernelConfig":    "config1",
+		"SyzkallerCommit": "syzkaller_commit1",
+		"TargetOS":        "linux",
+		"TargetArch":      "amd64",
+		"ReproSyz":        "syncfs(1)",
+		"ReproC":          "int main() { return 1; }",
+		"ReproOpts":       "repro opts 1",
+		"BaseRepository":  "git://ai/base.git",
+		"BaseBranch":      "ai-base",
+		"BaseCommit":      "RC",
+	})
 	require.NoError(t, c.globalClient.AIJobDone(&dashapi.AIJobDoneReq{
 		ID:      resp.ID,
-		Results: map[string]any{"PatchDiff": "diff", "PatchDescription": "description"},
+		Results: map[string]any{"PatchDiff": "diff", "PatchDescription": "description subject\n\ndescription body"},
 	}))
 
-	jobAssessURL := fmt.Sprintf("/ai_job?id=%v&correct=correct", resp.ID)
-	_, err = c.AuthGET(AccessPublic, jobAssessURL)
+	jobAssessURL := fmt.Sprintf("/ai_job?id=%v", resp.ID)
+	values = url.Values{}
+	values.Set("action", "set_correctness")
+	values.Set("correct", aiCorrectnessCorrect)
+	_, err = c.AuthPOSTForm(AccessPublic, jobAssessURL, values)
 	require.Error(t, err)
 	// Redirect to login page.
 	require.Contains(t, err.Error(), fmt.Sprint(http.StatusTemporaryRedirect))
-	_, err = c.AuthGET(AccessUser, jobAssessURL)
+	_, err = c.AuthPOSTForm(AccessUser, jobAssessURL, values)
 	require.NoError(t, err)
+
+	// Test crash w/o C repro.
+	crash2 := testCrashWithRepro(build, 2)
+	crash2.ReproC = nil
+	c.aiClient.ReportCrash(crash2)
+	extID2 := c.aiClient.pollEmailExtID()
+	bug2, _, _ := c.loadBug(extID2)
+
+	jobCreateURL2 := fmt.Sprintf("/bug?id=%v", bug2.keyHash(c.ctx))
+	values = url.Values{}
+	values.Set("ai-job-create", "patching")
+	_, err = c.AuthPOSTForm(AccessUser, jobCreateURL2, values)
+	require.NoError(t, err)
+
+	resp2, err := c.globalClient.AIJobPoll(&dashapi.AIJobPollReq{
+		AgentName:    "agent-name2",
+		CodeRevision: prog.GitRevision,
+		Workflows: []dashapi.AIWorkflow{
+			{Type: "patching", Name: "patching"},
+		},
+	})
+	require.NoError(t, err)
+	require.NotEqual(t, resp2.ID, "")
+	require.Equal(t, resp2.Workflow, "patching")
+	require.Equal(t, resp2.Args, map[string]any{
+		"BugTitle":        "title2",
+		"CrashReport":     "report2",
+		"CrashLog":        "log2",
+		"KernelRepo":      "repo1",
+		"KernelCommit":    "1111111111111111111111111111111111111111",
+		"KernelConfig":    "config1",
+		"SyzkallerCommit": "syzkaller_commit1",
+		"TargetOS":        "linux",
+		"TargetArch":      "amd64",
+		"ReproSyz":        "syncfs(2)",
+		"ReproC":          "",
+		"ReproOpts":       "repro opts 2",
+		"BaseRepository":  "git://ai/base.git",
+		"BaseBranch":      "ai-base",
+		"BaseCommit":      "RC",
+	})
 }
 
 func TestAIAssessmentKCSAN(t *testing.T) {
@@ -380,27 +503,41 @@ func TestAIAssessmentKCSAN(t *testing.T) {
 	_, err = c.GET(fmt.Sprintf("/ai_job?id=%v", resp.ID))
 	require.NoError(t, err)
 
+	// Verify JSON output.
+	respJSON, err := c.GET(fmt.Sprintf("/ai_job?id=%v&json=1", resp.ID))
+	require.NoError(t, err)
+	require.Contains(t, string(respJSON), `"Trajectory"`)
+
+	// Verify export output.
+	respExportJSON, err := c.GET(fmt.Sprintf("/ai_job?id=%v&export=1", resp.ID))
+	require.NoError(t, err)
+	var exportResp dashapi.AIJobPollResp
+	require.NoError(t, json.Unmarshal(respExportJSON, &exportResp))
+	require.Equal(t, resp.ID, exportResp.ID)
+	require.Equal(t, string(ai.WorkflowAssessmentKCSAN), exportResp.Workflow)
+
 	// Since the job is not completed, setting correctness must fail.
-	_, err = c.GET(fmt.Sprintf("/ai_job?id=%v&correct=%v", resp.ID, aiCorrectnessCorrect))
+	values := url.Values{}
+	values.Set("action", "set_correctness")
+	values.Set("correct", aiCorrectnessCorrect)
+	_, err = c.POSTForm(fmt.Sprintf("/ai_job?id=%v", resp.ID), values)
 	require.Error(t, err)
 
 	require.NoError(t, c.agentClient.AIJobDone(&dashapi.AIJobDoneReq{
 		ID: resp.ID,
 		Results: map[string]any{
-			"Confident":   true,
 			"Benign":      true,
 			"Explanation": "I don't care about races.",
 		},
 	}))
 
 	// Now setting correctness must not fail.
-	_, err = c.GET(fmt.Sprintf("/ai_job?id=%v&correct=%v", resp.ID, aiCorrectnessCorrect))
+	_, err = c.POSTForm(fmt.Sprintf("/ai_job?id=%v", resp.ID), values)
 	require.NoError(t, err)
 
 	// Verify history via UI helper to also test parsing logic.
-	history, err := aidb.LoadJobJournal(c.ctx, resp.ID, aidb.ActionJobReview)
+	uiHistory, err := LoadUIJobReviewHistory(c.ctx, resp.ID)
 	require.NoError(t, err)
-	uiHistory := makeUIJobReviewHistory(history)
 	require.Len(t, uiHistory, 1)
 	require.Equal(t, uiHistory[0].Correct, aiCorrectnessCorrect)
 	require.NotEmpty(t, uiHistory[0].User)
@@ -413,12 +550,14 @@ func TestAIAssessmentKCSAN(t *testing.T) {
 	c.advanceTime(time.Second)
 
 	// Re-mark the result as incorrect, this should remove the label.
-	_, err = c.GET(fmt.Sprintf("/ai_job?id=%v&correct=%v", resp.ID, aiCorrectnessIncorrect))
+	valuesIncorrect := url.Values{}
+	valuesIncorrect.Set("action", "set_correctness")
+	valuesIncorrect.Set("correct", aiCorrectnessIncorrect)
+	_, err = c.POSTForm(fmt.Sprintf("/ai_job?id=%v", resp.ID), valuesIncorrect)
 	require.NoError(t, err)
 
-	history, err = aidb.LoadJobJournal(c.ctx, resp.ID, aidb.ActionJobReview)
+	uiHistory, err = LoadUIJobReviewHistory(c.ctx, resp.ID)
 	require.NoError(t, err)
-	uiHistory = makeUIJobReviewHistory(history)
 	require.Len(t, uiHistory, 2)
 	require.Equal(t, uiHistory[0].Correct, aiCorrectnessIncorrect)
 	require.Equal(t, uiHistory[1].Correct, aiCorrectnessCorrect)
@@ -464,6 +603,11 @@ func TestAIJobsFiltering(t *testing.T) {
 	resp, err = c.GET("/ains/ai?workflow=patching")
 	require.NoError(t, err)
 	require.NotContains(t, string(resp), "KCSAN: data-race")
+
+	// Verify JSON output.
+	resp, err = c.GET("/ains/ai?json=1")
+	require.NoError(t, err)
+	require.Contains(t, string(resp), `"Workflow": "assessment-kcsan"`)
 }
 
 func TestAIJobCustomCommit(t *testing.T) {
@@ -496,7 +640,7 @@ func TestAIJobCustomCommit(t *testing.T) {
 
 	require.True(t, job.Args.Valid)
 	args := job.Args.Value.(map[string]any)
-	require.Equal(t, "custom123", args["FixedBaseCommit"])
+	require.Equal(t, "custom123", args["BaseCommit"])
 }
 
 func TestAIJobAutoCreate(t *testing.T) {
@@ -548,6 +692,10 @@ func TestAIJobAutoCreate(t *testing.T) {
 	// This finishes successfully, and must never be recreated again.
 	c.agentClient.AIJobDone(&dashapi.AIJobDoneReq{
 		ID: pollResp5.ID,
+		Results: map[string]any{
+			"Explanation": "foo",
+			"Benign":      false,
+		},
 	})
 
 	c.advanceTime(10 * 24 * time.Hour)
@@ -834,9 +982,7 @@ func TestAIJobNamespaces(t *testing.T) {
 	c.transformContext = func(ctx context.Context) context.Context {
 		cfg := *getConfig(ctx)
 		newClients := map[string]APIClient{}
-		for k, v := range cfg.Clients {
-			newClients[k] = v
-		}
+		maps.Copy(newClients, cfg.Clients)
 		newClients["restricted-ai"] = APIClient{
 			Key:             "restrictedkey123456",
 			Methods:         AIMethods,
@@ -895,7 +1041,12 @@ func TestAIJobNamespaces(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	pollResp3, err := unrestrictedClient.AIJobPoll(pollReq)
+	pollReq3 := &dashapi.AIJobPollReq{
+		AgentName:    "unrestricted-agent-3",
+		CodeRevision: "unknown",
+		Workflows:    []dashapi.AIWorkflow{{Type: ai.WorkflowRepro, Name: "repro"}},
+	}
+	pollResp3, err := unrestrictedClient.AIJobPoll(pollReq3)
 	require.NoError(t, err)
 	require.Equal(t, jobIDAins2, pollResp3.ID)
 
@@ -914,4 +1065,303 @@ func TestAIJobNamespaces(t *testing.T) {
 
 	err = restrictedClient.AIJobDone(&dashapi.AIJobDoneReq{ID: jobIDAins})
 	require.NoError(t, err)
+}
+
+func TestAIManualJobCreate(t *testing.T) {
+	c := NewSpannerCtx(t)
+	defer c.Close()
+
+	build := testBuild(1)
+	build.Manager = "manager1"
+	_, err := apiUploadBuild(c.ctx, "ains", build)
+	require.NoError(t, err)
+
+	_, err = c.agentClient.AIJobPoll(&dashapi.AIJobPollReq{AgentName: "agent-name",
+		CodeRevision: prog.GitRevision,
+		Workflows: []dashapi.AIWorkflow{
+			{Type: "repro-c", Name: "repro-c"},
+		},
+	})
+	require.NoError(t, err)
+
+	body, err := c.POSTForm("/ains/ai", url.Values{
+		"ai-job-create":  []string{"repro-c"},
+		"KernelRepo":     []string{""},
+		"KernelCommit":   []string{"123456"},
+		"KernelConfig":   []string{".config"},
+		"BugDescription": []string{"test bug"},
+		"TargetArch":     []string{"amd64"},
+	})
+	require.NoError(t, err)
+	require.Contains(t, string(body), "Kernel repo git address is required")
+
+	body, err = c.POSTForm("/ains/ai", url.Values{
+		"ai-job-create":  []string{"repro-c"},
+		"KernelRepo":     []string{"https://repo.test"},
+		"KernelCommit":   []string{""},
+		"KernelConfig":   []string{".config"},
+		"BugDescription": []string{"test bug"},
+		"TargetArch":     []string{"amd64"},
+	})
+	require.NoError(t, err)
+	require.Contains(t, string(body), "Kernel Commit Hash or branch name is required")
+
+	body, err = c.POSTForm("/ains/ai", url.Values{
+		"ai-job-create":  []string{"repro-c"},
+		"KernelRepo":     []string{"https://repo.test"},
+		"KernelCommit":   []string{"123456"},
+		"BugDescription": []string{"test bug"},
+		"TargetArch":     []string{"amd64"},
+	})
+	require.NoError(t, err)
+	require.Contains(t, string(body), "either a custom kernel config or a manager is required")
+
+	body, err = c.POSTForm("/ains/ai", url.Values{
+		"ai-job-create":  []string{"repro-c"},
+		"KernelRepo":     []string{"https://repo.test"},
+		"KernelCommit":   []string{"123456"},
+		"KernelConfig":   []string{"test config"},
+		"BugDescription": []string{"test bug"},
+		"TargetArch":     []string{"amd64"},
+	})
+	require.NoError(t, err)
+	require.Contains(t, string(body), "AI workflow repro-c is created")
+
+	job, err := c.agentClient.AIJobPoll(&dashapi.AIJobPollReq{
+		AgentName:    "agent-name",
+		CodeRevision: prog.GitRevision,
+		Workflows: []dashapi.AIWorkflow{
+			{Type: "repro-c", Name: "repro-c"},
+		},
+	})
+	require.NoError(t, err)
+	require.NotEqual(t, "", job.ID)
+	require.Equal(t, "repro-c", job.Workflow)
+
+	args := job.Args
+	require.Equal(t, "test bug", args["BugDescription"])
+	require.Equal(t, "https://repo.test", args["KernelRepo"])
+	require.Equal(t, "123456", args["KernelCommit"])
+
+	body, err = c.POSTForm("/ains/ai", url.Values{
+		"ai-job-create": []string{"patching"},
+		"ReproC":        []string{"int main() {}"},
+		"KernelConfig":  []string{".config"},
+	})
+	require.NoError(t, err)
+	require.Contains(t, string(body), "AI workflow patching is created")
+
+	job, err = c.agentClient.AIJobPoll(&dashapi.AIJobPollReq{
+		AgentName:    "agent-name2",
+		CodeRevision: prog.GitRevision,
+		Workflows: []dashapi.AIWorkflow{
+			{Type: "patching", Name: "patching"},
+		},
+	})
+	require.NoError(t, err)
+	require.NotEqual(t, "", job.ID, job)
+	require.Equal(t, "patching", job.Workflow)
+	require.Equal(t, "int main() {}", job.Args["ReproC"])
+	require.Contains(t, job.Args, "ReproSyz")
+	require.Equal(t, "", job.Args["ReproSyz"])
+	require.Contains(t, job.Args, "ReproOpts")
+	require.Equal(t, "", job.Args["ReproOpts"])
+	require.Equal(t, "git://ai/base.git", job.Args["BaseRepository"])
+	require.Equal(t, "ai-base", job.Args["BaseBranch"])
+	require.Equal(t, "RC", job.Args["BaseCommit"])
+
+	_, err = c.AuthGET(AccessUser, "/ains/ai")
+	require.NoError(t, err)
+
+	_, err = c.AuthGET(AccessUser, fmt.Sprintf("/ai_job?id=%v", job.ID))
+	require.NoError(t, err)
+
+	// Verify that a public user cannot access the job page.
+	_, err = c.AuthGET(AccessPublic, fmt.Sprintf("/ai_job?id=%v", job.ID))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "307")
+	err = c.agentClient.AIJobDone(&dashapi.AIJobDoneReq{
+		ID:      job.ID,
+		Results: map[string]any{"status": "success"},
+	})
+	require.NoError(t, err)
+}
+
+func TestAIReproCJobCreateFromBugPage(t *testing.T) {
+	c := NewSpannerCtx(t)
+	defer c.Close()
+
+	build := testBuild(1)
+	c.aiClient.UploadBuild(build)
+	crash := testCrashWithRepro(build, 1)
+	c.aiClient.ReportCrash(crash)
+	extID := c.aiClient.pollEmailExtID()
+	bug, _, _ := c.loadBug(extID)
+
+	_, err := c.globalClient.AIJobPoll(&dashapi.AIJobPollReq{
+		AgentName:    "agent-name",
+		CodeRevision: prog.GitRevision,
+		Workflows: []dashapi.AIWorkflow{
+			{Type: "repro-c", Name: "repro-c"},
+		},
+	})
+	require.NoError(t, err)
+
+	jobCreateURL := fmt.Sprintf("/bug?id=%v", bug.keyHash(c.ctx))
+	values := url.Values{}
+	values.Set("ai-job-create", "repro-c")
+	_, err = c.AuthPOSTForm(AccessUser, jobCreateURL, values)
+	require.NoError(t, err)
+
+	resp, err := c.globalClient.AIJobPoll(&dashapi.AIJobPollReq{
+		AgentName:    "agent-name",
+		CodeRevision: prog.GitRevision,
+		Workflows: []dashapi.AIWorkflow{
+			{Type: "repro-c", Name: "repro-c"},
+		},
+	})
+	require.NoError(t, err)
+	require.NotEqual(t, "", resp.ID)
+	require.Equal(t, "repro-c", resp.Workflow)
+
+	require.Equal(t, "title1\n\nreport1", resp.Args["BugDescription"])
+}
+
+func TestAIJobRestart(t *testing.T) {
+	c := NewSpannerCtx(t)
+	defer c.Close()
+
+	c.SetAIConfig("ains", &AIConfig{
+		Stages: []AIPatchStageConfig{
+			{Name: "moderation", ServingIntegration: "lore", MailingList: "moderation@test.com", AddressComments: true},
+		},
+	})
+
+	// 1. Setup bug and patching job 1.
+	extID, jobID1 := c.setupAIPatchJob(t)
+
+	// Poll job 1 (now it is RUNNING).
+	pollReq := &dashapi.AIJobPollReq{
+		AgentName:    "test-agent",
+		CodeRevision: prog.GitRevision,
+		Workflows: []dashapi.AIWorkflow{
+			{Type: ai.WorkflowPatching, Name: "patching"},
+		},
+	}
+	resp1, err := c.agentClient.AIJobPoll(pollReq)
+	require.NoError(t, err)
+	require.Equal(t, jobID1, resp1.ID)
+
+	jobURL1 := fmt.Sprintf("/ai_job?id=%v", jobID1)
+	values := url.Values{}
+	values.Set("action", "restart")
+
+	// Try to restart RUNNING job -> should fail with 400
+	_, err = c.AuthPOSTForm(AccessUser, jobURL1, values)
+	require.Error(t, err)
+	c.expectBadReqest(err)
+	require.Contains(t, err.Error(), "cannot restart a running job")
+
+	// Mark job 1 as SUCCESSFUL.
+	c.finishAIPatchJob(t, jobID1, nil)
+
+	// Try to restart SUCCESSFUL job -> should fail with 400
+	_, err = c.AuthPOSTForm(AccessUser, jobURL1, values)
+	require.Error(t, err)
+	c.expectBadReqest(err)
+	require.Contains(t, err.Error(), "cannot restart a successful job")
+
+	// Create job 2 (a failed patching job).
+	jobID2 := c.createAIJob(extID, "patching", "")
+	resp2, err := c.agentClient.AIJobPoll(pollReq)
+	require.NoError(t, err)
+	require.Equal(t, jobID2, resp2.ID)
+
+	// Mark job 2 as FAILED.
+	err = c.agentClient.AIJobDone(&dashapi.AIJobDoneReq{
+		ID:    jobID2,
+		Error: "some workflow error",
+	})
+	require.NoError(t, err)
+
+	jobURL2 := fmt.Sprintf("/ai_job?id=%v", jobID2)
+
+	// Public user cannot restart.
+	_, err = c.AuthPOSTForm(AccessPublic, jobURL2, values)
+	require.Error(t, err)
+
+	// User can restart FAILED job, and it should redirect to the new job.
+	_, err = c.AuthPOSTForm(AccessUser, jobURL2, values)
+	require.Error(t, err)
+	var httpErr *HTTPError
+	require.ErrorAs(t, err, &httpErr)
+	require.Equal(t, http.StatusFound, httpErr.Code)
+	loc := httpErr.Headers.Get("Location")
+	require.True(t, strings.HasPrefix(loc, "/ai_job?id="))
+	newJobID := strings.TrimPrefix(loc, "/ai_job?id=")
+	require.NotEmpty(t, newJobID)
+	require.NotEqual(t, jobID2, newJobID)
+
+	// Verify the new job is polled and has same arguments.
+	pollResp, err := c.agentClient.AIJobPoll(pollReq)
+	require.NoError(t, err)
+	require.Equal(t, newJobID, pollResp.ID)
+	require.Equal(t, "patching", pollResp.Workflow)
+	require.NotEmpty(t, pollResp.Args["BugTitle"])
+	require.Equal(t, "amd64", pollResp.Args["TargetArch"])
+
+	// 2. Setup patch iteration job to test it cannot be restarted.
+	// Confirm published report for job 1 (moderation stage).
+	pollReportResp, err := c.globalClient.AIPollReport(&dashapi.PollExternalReportReq{Source: "lore"})
+	require.NoError(t, err)
+	require.NotNil(t, pollReportResp.Result)
+
+	err = c.globalClient.AIConfirmReport(&dashapi.ConfirmPublishedReq{
+		ReportID:       pollReportResp.Result.ID,
+		PublishedExtID: "msg-id-moderation",
+	})
+	require.NoError(t, err)
+
+	// Simulate comment arrival on the thread.
+	_, err = c.globalClient.AIReportCommand(&dashapi.SendExternalCommandReq{
+		Source:       dashapi.AIJobSourceLore,
+		RootExtID:    "msg-id-moderation",
+		MessageExtID: "<comment-1>",
+		Author:       "reviewer@email.com",
+		Comment:      &dashapi.CommentCommand{Body: "Please fix this"},
+	})
+	require.NoError(t, err)
+
+	c.advanceTime(31 * time.Minute)
+
+	// Poll for patch iteration job.
+	pollReqIteration := &dashapi.AIJobPollReq{
+		AgentName:    "test-agent",
+		CodeRevision: prog.GitRevision,
+		Workflows: []dashapi.AIWorkflow{
+			{Type: ai.WorkflowPatchIteration, Name: "patch-iteration"},
+		},
+	}
+	respIteration, err := c.agentClient.AIJobPoll(pollReqIteration)
+	require.NoError(t, err)
+	require.NotEmpty(t, respIteration.ID)
+
+	// Mark patch iteration job as FAILED.
+	err = c.agentClient.AIJobDone(&dashapi.AIJobDoneReq{
+		ID:    respIteration.ID,
+		Error: "iteration failed",
+	})
+	require.NoError(t, err)
+
+	// Try to restart FAILED patch-iteration job -> should fail with 400.
+	patchIterationJobURL := fmt.Sprintf("/ai_job?id=%v", respIteration.ID)
+	_, err = c.AuthPOSTForm(AccessUser, patchIterationJobURL, values)
+	require.Error(t, err)
+	c.expectBadReqest(err)
+	require.Contains(t, err.Error(), "cannot restart a patch iteration workflow")
+}
+
+func TestManualAIWorkflows(t *testing.T) {
+	assert.Nil(t, manualAIWorkflows(nil))
+	assert.Nil(t, manualAIWorkflows(&Config{}))
 }

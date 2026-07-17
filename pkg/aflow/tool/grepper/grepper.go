@@ -1,6 +1,7 @@
 // Copyright 2026 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package grepper provides tools for regex searching across repository files.
 package grepper
 
 import (
@@ -20,6 +21,10 @@ The tool executes git grep on the kernel sources and returns the output.
 The codesearch set of tools provide more precise results,
 use them instead of this tool if they can answer your question.
 
+Important note: this tool CANNOT be used to search syzkaller syzlang descriptions (sys/*)
+or expressions containing 'syz_' since they are syzkaller pseudo-syscalls, 
+and not present in the Linux kernel. Use the {{.toolReadDescription}} tool instead.
+
 The following git grep flags are used:
 --extended-regexp: you need to provide expression in extended regexp syntax
 --line-number: line numbers are shown in the output
@@ -37,6 +42,7 @@ type state struct {
 
 type args struct {
 	Expression string `jsonschema:"Git grep expression in extended regexp syntax."`
+	PathPrefix string `jsonschema:"Optional path prefix or file to restrict the scope of the grep." json:",omitempty"`
 }
 
 type results struct {
@@ -44,8 +50,14 @@ type results struct {
 }
 
 func grepper(ctx *aflow.Context, state state, args args) (results, error) {
-	output, err := osutil.RunCmd(time.Hour, state.KernelSrc, "git", "grep", "--extended-regexp",
-		"--line-number", "--show-function", "-C1", "--no-color", "--", args.Expression)
+	cmdArgs := []string{
+		"grep", "--extended-regexp", "--line-number",
+		"--show-function", "-C1", "-e", args.Expression, "--",
+	}
+	if args.PathPrefix != "" {
+		cmdArgs = append(cmdArgs, args.PathPrefix)
+	}
+	output, err := osutil.RunCmd(time.Hour, state.KernelSrc, "git", cmdArgs...)
 	if err != nil {
 		if exitErr := new(exec.ExitError); errors.As(err, &exitErr) {
 			if exitErr.ExitCode() == 1 && len(output) == 0 {
@@ -66,8 +78,33 @@ func grepper(ctx *aflow.Context, state state, args args) (results, error) {
 	// but should be bearable for syz-agent.
 	// Each match takes 3-6 lines (counting context, function lines, and -- delimiters).
 	const maxLines = 500
+	// Grep can match some effectively binary files, e.g. svg.
+	// They can contain lines >100K. We mainly intend to match source/docs files
+	// which should not contain long lines, so cap at 200 chars.
+	const maxLineLen = 200
 	lines := slices.Collect(bytes.Lines(output))
+	var truncated bool
+	for i, line := range lines {
+		hasNewline := len(line) > 0 && line[len(line)-1] == '\n'
+		contentLen := len(line)
+		if hasNewline {
+			contentLen--
+		}
+		if contentLen > maxLineLen {
+			newLine := slices.Clone(line[:maxLineLen])
+			newLine = append(newLine, []byte("...")...)
+			if hasNewline {
+				newLine = append(newLine, '\n')
+			}
+			lines[i] = newLine
+			truncated = true
+		}
+	}
+
 	if len(lines) <= maxLines {
+		if truncated {
+			return results{string(slices.Concat(lines...))}, nil
+		}
 		return results{string(output)}, nil
 	}
 	res := fmt.Sprintf(`
@@ -75,6 +112,6 @@ Full output is too long, showing %v out of %v lines.
 Use more precise expression if possible.
 
 %s
-`, maxLines, len(lines), slices.Concat(lines[:maxLines]))
+`, maxLines, len(lines), slices.Concat(lines[:maxLines]...))
 	return results{res}, nil
 }

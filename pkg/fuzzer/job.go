@@ -21,6 +21,15 @@ import (
 	"github.com/google/syzkaller/prog"
 )
 
+type JobType string
+
+const (
+	JobTriage          JobType = "triage"
+	JobCandidateTriage JobType = "candidate_triage"
+	JobSmash           JobType = "smash"
+	JobHints           JobType = "hints"
+)
+
 type job interface {
 	run(fuzzer *Fuzzer)
 }
@@ -32,7 +41,7 @@ type jobIntrospector interface {
 type JobInfo struct {
 	Name   string
 	Calls  []string
-	Type   string
+	Type   JobType
 	Execs  atomic.Int32
 	ProgId string
 	// debug counter of the amount of times a testcase execution was triggered
@@ -210,11 +219,9 @@ func (job *triageJob) run(fuzzer *Fuzzer) {
 	}
 	var wg sync.WaitGroup
 	for call, info := range job.calls {
-		wg.Add(1)
-		go func() {
+		wg.Go(func() {
 			job.handleCall(call, info)
-			wg.Done()
-		}()
+		})
 	}
 	wg.Wait()
 }
@@ -304,7 +311,7 @@ func (job *triageJob) doHandleCall(p *prog.Prog, call int, info *triageCall, fPC
 			p:    p.Clone(),
 			info: &JobInfo{
 				Name:            p.String(),
-				Type:            "smash",
+				Type:            JobSmash,
 				Calls:           []string{p.CallName(call)},
 				ProgId:          job.info.ProgId,
 				FromFPCovOrigin: fPCovOrigin,
@@ -317,7 +324,7 @@ func (job *triageJob) doHandleCall(p *prog.Prog, call int, info *triageCall, fPC
 				call: call,
 				info: &JobInfo{
 					Name:            p.String(),
-					Type:            "hints",
+					Type:            JobHints,
 					Calls:           []string{p.CallName(call)},
 					ProgId:          job.info.ProgId,
 					FromFPCovOrigin: fPCovOrigin,

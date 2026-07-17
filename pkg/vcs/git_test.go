@@ -5,13 +5,13 @@ package vcs
 
 import (
 	"fmt"
-	"os/exec"
 	"reflect"
 	"slices"
 	"testing"
 	"time"
 
 	"github.com/google/syzkaller/pkg/debugtracer"
+	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -187,7 +187,7 @@ func TestGetCommitsByTitles(t *testing.T) {
 	repo.Git("commit", "--no-edit", "--allow-empty", "-m", "abc")
 	repo.Git("commit", "--no-edit", "--allow-empty", "-m", "target")
 	commitA, _ := repo.repo.Commit(HEAD)
-	results, missing, err := repo.repo.GetCommitsByTitles([]string{"target"})
+	results, missing, err := repo.repo.GetCommitsByTitles([]string{"target"}, time.Time{})
 	validateSuccess(commitA, results, missing, err)
 
 	// Put another commit with the title we search for in another branch.
@@ -195,12 +195,12 @@ func TestGetCommitsByTitles(t *testing.T) {
 	repo.Git("checkout", "-b", "branch-b")
 	repo.Git("commit", "--no-edit", "--allow-empty", "-m", "target")
 	repo.Git("checkout", "branch-a")
-	results, missing, err = repo.repo.GetCommitsByTitles([]string{"target"})
+	results, missing, err = repo.repo.GetCommitsByTitles([]string{"target"}, time.Time{})
 	validateSuccess(commitA, results, missing, err)
 
 	// We expect GetCommitsByTitles to only find commits in the current branch.
 	repo.Git("checkout", "branch-b")
-	results, missing, err = repo.repo.GetCommitsByTitles([]string{"xyz"})
+	results, missing, err = repo.repo.GetCommitsByTitles([]string{"xyz"}, time.Time{})
 	if err != nil {
 		t.Fatalf("expected success, got %v", err)
 	}
@@ -645,7 +645,7 @@ func TestBaseForDiffMerge(t *testing.T) {
 
 	// Merge master into branchA, resolve the conflict.
 	repo.Git("checkout", "branchA")
-	if err := exec.Command("git", "-C", repo.Dir, "merge", "master").Run(); err == nil {
+	if _, err := osutil.RunCmd(time.Minute, repo.Dir, "git", "merge", "master"); err == nil {
 		t.Fatalf("conflict expected during merge -> branchA")
 	}
 	repo.CommitChangeset("merge master->branchA",
@@ -655,7 +655,7 @@ func TestBaseForDiffMerge(t *testing.T) {
 
 	// Merge master into branchB, resolve the conflict.
 	repo.Git("checkout", "branchB")
-	if err := exec.Command("git", "-C", repo.Dir, "merge", "master").Run(); err == nil {
+	if _, err := osutil.RunCmd(time.Minute, repo.Dir, "git", "merge", "master"); err == nil {
 		t.Fatalf("conflict expected during merge -> branchB")
 	}
 	repo.CommitChangeset("merge master->branchB",

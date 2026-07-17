@@ -67,7 +67,7 @@ LABEL homepage="https://github.com/google/syzkaller"
 RUN apt-get update --allow-releaseinfo-change && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
     python3 python-is-python3 python3-legacy-cgi \
-    make nano unzip curl ca-certificates binutils flex bison bc libelf-dev libssl-dev \
+    make nano unzip curl ca-certificates binutils flex bison bc lz4 libelf-dev libssl-dev \
     # Explicitly install git runtime dependencies since we build it from source.
     libcurl3t64-gnutls libexpat1 libpcre2-8-0 zlib1g perl liberror-perl
 
@@ -104,18 +104,19 @@ ENV GOPATH /gopath
 ENV GOMODCACHE /syzkaller/.cache/gomod
 
 # Install clang.
+ARG CLANG_VERSION=22
 RUN apt-get install -y -q gnupg apt-transport-https
 RUN curl https://apt.llvm.org/llvm-snapshot.gpg.key | tee /usr/share/keyrings/llvm-snapshot.gpg
 # It uses SHA-1 signatures which are deprecated since 2026, so we have to use trusted=yes.
-RUN echo "deb [arch=amd64,arm64 signed-by=/usr/share/keyrings/llvm-snapshot.gpg trusted=yes] http://apt.llvm.org/trixie/ llvm-toolchain-trixie-21 main" | tee /etc/apt/sources.list.d/llvm-21.list
+RUN echo "deb [arch=amd64,arm64 signed-by=/usr/share/keyrings/llvm-snapshot.gpg trusted=yes] http://apt.llvm.org/trixie/ llvm-toolchain-trixie-${CLANG_VERSION} main" | tee /etc/apt/sources.list.d/llvm-${CLANG_VERSION}.list
 RUN apt-get update --allow-releaseinfo-change
-RUN apt-get install -y -q --no-install-recommends clang-21 clang-format-21 clang-tidy-21 lld-21 llvm-21-dev libclang-cpp21-dev libclang-21-dev
+RUN apt-get install -y -q --no-install-recommends clang-${CLANG_VERSION} clang-format-${CLANG_VERSION} clang-tidy-${CLANG_VERSION} lld-${CLANG_VERSION} llvm-${CLANG_VERSION}-dev libclang-cpp${CLANG_VERSION}-dev libclang-${CLANG_VERSION}-dev
 RUN apt-get install -y -q --no-install-recommends flatbuffers-compiler
-RUN update-alternatives --install /usr/bin/clang clang /usr/bin/clang-21 100
-RUN update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-21 100
-RUN update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/bin/clang-tidy-21 100
-RUN update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-21 100
-RUN update-alternatives --install /usr/bin/ld.lld ld.lld /usr/bin/lld-21 100
+RUN update-alternatives --install /usr/bin/clang clang /usr/bin/clang-${CLANG_VERSION} 100
+RUN update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-${CLANG_VERSION} 100
+RUN update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/bin/clang-tidy-${CLANG_VERSION} 100
+RUN update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-${CLANG_VERSION} 100
+RUN update-alternatives --install /usr/bin/ld.lld ld.lld /usr/bin/lld-${CLANG_VERSION} 100
 RUN apt autoremove -y -q
 
 # Install the Spanner emulator.
@@ -144,10 +145,10 @@ ENV SOURCEDIR_NETBSD /syzkaller/netbsd
 ENV RUSTUP_HOME=/usr/local/rustup
 ENV CARGO_HOME=/usr/local/cargo
 ENV PATH=/usr/local/cargo/bin:$PATH
-ENV RUST_VERSION=1.91.1
+ENV RUST_VERSION=1.96.0
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain $RUST_VERSION
 RUN rustup component add rust-src
-RUN apt-get install -y bindgen
+RUN cargo install --version 0.72.1 bindgen-cli && rm -rf /usr/local/cargo/registry/cache /usr/local/cargo/registry/src
 
 # Use the latest libdw-dev release, otherwise we get compilation error when CONFIG_RUST=y.
 RUN apt-get install -y --no-install-recommends libdw-dev libelf-dev

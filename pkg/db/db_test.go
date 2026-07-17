@@ -4,6 +4,8 @@
 package db
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"math/rand"
 	"os"
@@ -255,4 +257,68 @@ func tempFile(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return fn
+}
+
+func TestDecompressionBombValLen(t *testing.T) {
+	// Regression test for decompression bomb: io.ReadAll(flate.NewReader(...))
+	// had no output size limit. A record whose decompressed value exceeds
+	// maxValLen must be rejected with an error.
+	fn := tempFile(t)
+	defer os.Remove(fn)
+
+	// Build a corpus DB with a single record whose value decompresses to
+	// maxValLen+1 bytes (a long run of zeros compresses very well).
+	bigVal := make([]byte, maxValLen+1)
+	var buf bytes.Buffer
+	serializeHeader(&buf, 0)
+	serializeRecord(&buf, "testkey", bigVal, 1)
+	if err := os.WriteFile(fn, buf.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := Open(fn, true)
+	if err == nil {
+		t.Fatal("Open should have returned an error for decompression bomb value")
+	}
+	if db == nil {
+		t.Fatal("db must be non-nil in repair mode even on error")
+	}
+	t.Logf("correctly rejected decompression bomb: %v", err)
+}
+
+func TestOversizeKeyLen(t *testing.T) {
+	// Regression test for OOM: keyLen is a raw uint32 with no bounds check.
+	// A crafted 24-byte corpus DB file with keyLen=maxKeyLen+1 must be rejected
+	// with an error rather than causing a large allocation.
+	f, err := os.CreateTemp("", "syz-db-oom-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	defer os.Remove(f.Name())
+
+	// Header: dbMagic(4) + curVersion(4) + userVersion(8)
+	header := make([]byte, 0, 16)
+	header = binary.LittleEndian.AppendUint32(header, dbMagic)
+	header = binary.LittleEndian.AppendUint32(header, curVersion)
+	header = binary.LittleEndian.AppendUint64(header, 0)
+	// Record: recMagic(4) + keyLen > maxKeyLen (4)
+	header = binary.LittleEndian.AppendUint32(header, recMagic)
+	header = binary.LittleEndian.AppendUint32(header, maxKeyLen+1)
+
+	if _, err := f.Write(header); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := Open(f.Name(), true)
+	if err == nil {
+		t.Fatal("Open should have returned an error for oversize keyLen")
+	}
+	if db == nil {
+		t.Fatal("db must be non-nil in repair mode even on error")
+	}
+	// No records should have been recovered — the first record was malformed.
+	if len(db.Records) != 0 {
+		t.Fatalf("expected 0 records, got %d", len(db.Records))
+	}
 }

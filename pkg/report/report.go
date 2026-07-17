@@ -240,6 +240,14 @@ func (reporter *Reporter) Symbolize(rep *Report) error {
 	return nil
 }
 
+func (reporter *Reporter) ExtractFaultInjectionInfo(output []byte) (string, error) {
+	linux, ok := reporter.impl.(*linux)
+	if !ok {
+		return "", nil
+	}
+	return linux.extractFaultInjectionInfo(reporter, output)
+}
+
 func (reporter *Reporter) isInteresting(rep *Report) bool {
 	if len(reporter.interests) == 0 {
 		return true
@@ -261,10 +269,10 @@ func (reporter *Reporter) isInteresting(rep *Report) bool {
 	return false
 }
 
+// ReportToGuiltyFile does its best to extract the guilty file data.
 // There are cases when we need to extract a guilty file, but have no ability to do it the
 // proper way -- parse and symbolize the raw console output log. One of such cases is
 // the syz-fillreports tool, which only has access to the already symbolized logs.
-// ReportToGuiltyFile does its best to extract the data.
 func (reporter *Reporter) ReportToGuiltyFile(title string, report []byte) string {
 	ii, ok := reporter.impl.(interface {
 		extractGuiltyFileRaw(title string, report []byte) string
@@ -445,6 +453,7 @@ func compile(re string) *regexp.Regexp {
 	re = strings.ReplaceAll(re, "{{PC}}", "\\[\\<?(?:0x)?[0-9a-f]+\\>?\\]")
 	re = strings.ReplaceAll(re, "{{FUNC}}", "([a-zA-Z0-9_]+)(?:\\.|\\+)")
 	re = strings.ReplaceAll(re, "{{SRC}}", "([a-zA-Z0-9-_/.]+\\.[a-z]+:[0-9]+)")
+	re = strings.ReplaceAll(re, "{{TASK}}", `[\s\S]{0,100}?`)
 	return regexp.MustCompile(re)
 }
 

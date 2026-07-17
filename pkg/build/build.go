@@ -43,7 +43,7 @@ type Params struct {
 	Build        json.RawMessage
 }
 
-// Information that is returned from the Image function.
+// ImageDetails contains information that is returned from the Image function.
 type ImageDetails struct {
 	Signature  string
 	CompilerID string
@@ -82,7 +82,7 @@ func sanitize(params *Params) {
 func Image(params Params) (details ImageDetails, err error) {
 	sanitize(&params)
 	var builder builder
-	builder, err = getBuilder(params.TargetOS, params.TargetArch, params.VMType)
+	builder, err = getBuilder(params)
 	if err != nil {
 		return
 	}
@@ -119,7 +119,7 @@ func Image(params Params) (details ImageDetails, err error) {
 
 func Clean(params Params) error {
 	sanitize(&params)
-	builder, err := getBuilder(params.TargetOS, params.TargetArch, params.VMType)
+	builder, err := getBuilder(params)
 	if err != nil {
 		return err
 	}
@@ -154,9 +154,13 @@ type builder interface {
 	clean(params Params) error
 }
 
-func getBuilder(targetOS, targetArch, vmType string) (builder, error) {
-	if targetOS == targets.Linux {
-		switch vmType {
+func getBuilder(params Params) (builder, error) {
+	const shellPrefix = "SHELL:"
+	if strings.HasPrefix(params.Make, shellPrefix) {
+		return shell{script: params.Make[len(shellPrefix):]}, nil
+	}
+	if params.TargetOS == targets.Linux {
+		switch params.VMType {
 		case targets.GVisor:
 			return gvisor{}, nil
 		case "cuttlefish":
@@ -176,10 +180,10 @@ func getBuilder(targetOS, targetArch, vmType string) (builder, error) {
 		targets.Darwin:  darwin{},
 		targets.TestOS:  test{},
 	}
-	if builder, ok := builders[targetOS]; ok {
+	if builder, ok := builders[params.TargetOS]; ok {
 		return builder, nil
 	}
-	return nil, fmt.Errorf("unsupported image type %v/%v/%v", targetOS, targetArch, vmType)
+	return nil, fmt.Errorf("unsupported image type %v/%v/%v", params.TargetOS, params.TargetArch, params.VMType)
 }
 
 func compilerIdentity(compiler string) (string, error) {
@@ -198,7 +202,7 @@ func compilerIdentity(compiler string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	for _, line := range strings.Split(string(output), "\n") {
+	for line := range strings.SplitSeq(string(output), "\n") {
 		if bazel {
 			// Strip extracting and log lines...
 			if strings.Contains(line, "Extracting Bazel") {
@@ -289,9 +293,9 @@ func extractCauseInner(s []byte, kernelSrc string) ([]byte, string) {
 		}
 	}
 	file = strings.TrimPrefix(file, "./")
-	if strings.HasSuffix(file, ".o") {
+	if before, ok := strings.CutSuffix(file, ".o"); ok {
 		// Linker may point to object files instead.
-		file = strings.TrimSuffix(file, ".o") + ".c"
+		file = before + ".c"
 	}
 	res := bytes.Join(lines, []byte{'\n'})
 	// gcc uses these weird quotes around identifiers, which may be
@@ -305,7 +309,7 @@ func extractCauseRaw(s []byte) [][]byte {
 	weak := true
 	var cause [][]byte
 	dedup := make(map[string]bool)
-	for _, line := range bytes.Split(s, []byte{'\n'}) {
+	for line := range bytes.SplitSeq(s, []byte{'\n'}) {
 		for _, pattern := range buildFailureCauses {
 			if !pattern.pattern.Match(line) {
 				continue

@@ -1,6 +1,7 @@
 // Copyright 2025 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package codesearch provides C-level symbol indexing and fast regex-based code search capabilities.
 package codesearch
 
 import (
@@ -33,103 +34,132 @@ type Command struct {
 
 // Commands are used to run unit tests and for the syz-codesearch tool.
 var Commands = []Command{
-	{"dir-index", 1, func(index *Index, args []string) (string, error) {
-		subdirs, files, err := index.DirIndex(args[0])
-		if err != nil {
-			return "", err
-		}
-		b := new(strings.Builder)
-		fmt.Fprintf(b, "directory %v subdirs:\n", args[0])
-		for _, subdir := range subdirs {
-			fmt.Fprintf(b, " - %v\n", subdir)
-		}
-		fmt.Fprintf(b, "\ndirectory %v files:\n", args[0])
-		for _, file := range files {
-			fmt.Fprintf(b, " - %v\n", file)
-		}
-		return b.String(), nil
-	}},
-	{"read-file", 1, func(index *Index, args []string) (string, error) {
-		return index.ReadFile(args[0])
-	}},
-	{"file-index", 1, func(index *Index, args []string) (string, error) {
-		entities, err := index.FileIndex(args[0])
-		if err != nil {
-			return "", err
-		}
-		b := new(strings.Builder)
-		fmt.Fprintf(b, "file %v defines the following entities:\n\n", args[0])
-		for _, ent := range entities {
-			fmt.Fprintf(b, "%v %v\n", ent.Kind, ent.Name)
-		}
-		return b.String(), nil
-	}},
-	{"def-comment", 2, func(index *Index, args []string) (string, error) {
-		info, err := index.DefinitionComment(args[0], args[1])
-		if err != nil {
-			return "", err
-		}
-		if info.Body == "" {
-			return fmt.Sprintf("%v %v is defined in %v and is not commented\n",
-				info.Kind, args[1], info.File), nil
-		}
-		return fmt.Sprintf("%v %v is defined in %v and commented as:\n\n%v",
-			info.Kind, args[1], info.File, info.Body), nil
-	}},
-	{"def-source", 3, func(index *Index, args []string) (string, error) {
-		info, err := index.DefinitionSource(args[0], args[1], args[2] == "yes")
-		if err != nil {
-			return "", err
-		}
-		return fmt.Sprintf("%v %v is defined in %v:\n\n%v", info.Kind, args[1], info.File, info.Body), nil
-	}},
-	{"find-references", 5, func(index *Index, args []string) (string, error) {
-		contextLines, err := strconv.Atoi(args[3])
-		if err != nil {
-			return "", fmt.Errorf("failed to parse number of context lines %q: %w", args[3], err)
-		}
-		outputLimit, err := strconv.Atoi(args[4])
-		if err != nil {
-			return "", fmt.Errorf("failed to parse output limit %q: %w", args[4], err)
-		}
-		refs, totalCount, err := index.FindReferences(args[0], args[1], args[2], contextLines, outputLimit)
-		if err != nil {
-			return "", err
-		}
-		b := new(strings.Builder)
-		fmt.Fprintf(b, "%v has %v references:\n\n", args[1], totalCount)
-		for _, ref := range refs {
-			fmt.Fprintf(b, "%v %v %v it at %v:%v\n%v\n\n",
-				ref.ReferencingEntityKind, ref.ReferencingEntityName, ref.ReferenceKind,
-				ref.SourceFile, ref.SourceLine, ref.SourceSnippet)
-		}
-		return b.String(), nil
-	}},
-	{"struct-layout", 0, func(index *Index, args []string) (string, error) {
-		if len(args) != 2 && len(args) != 3 {
-			return "", fmt.Errorf("codesearch command struct-layout requires 2 or 3 args, but %v provided",
-				len(args))
-		}
-		var fieldOffset *uint
-		if len(args) == 3 {
-			val, err := strconv.ParseUint(args[2], 10, 64)
+	{
+		Name:  "dir-index",
+		NArgs: 1,
+		Func: func(index *Index, args []string) (string, error) {
+			subdirs, files, err := DirIndex(index.srcDirs, args[0])
 			if err != nil {
-				return "", fmt.Errorf("bad offset: %w", err)
+				return "", err
 			}
-			fieldOffset = new(uint)
-			*fieldOffset = uint(val)
-		}
-		fields, err := index.GetStructLayout(args[0], args[1], fieldOffset)
-		if err != nil {
-			return "", err
-		}
-		b := new(strings.Builder)
-		fmt.Fprintf(b, "struct %v has %v fields:\n", args[1], len(fields))
-		for _, f := range fields {
-			fmt.Fprintf(b, "[%v - %v] %v\n", f.OffsetBits, f.OffsetBits+f.SizeBits, f.Name)
-		}
-		return b.String(), nil
-	}},
+			b := new(strings.Builder)
+			fmt.Fprintf(b, "directory %v subdirs:\n", args[0])
+			for _, subdir := range subdirs {
+				fmt.Fprintf(b, " - %v\n", subdir)
+			}
+			fmt.Fprintf(b, "\ndirectory %v files:\n", args[0])
+			for _, file := range files {
+				fmt.Fprintf(b, " - %v\n", file)
+			}
+			return b.String(), nil
+		}},
+	{
+		Name:  "read-file",
+		NArgs: 3,
+		Func: func(index *Index, args []string) (string, error) {
+			firstLine, err := strconv.Atoi(args[1])
+			if err != nil {
+				return "", fmt.Errorf("failed to parse first line %q: %w", args[1], err)
+			}
+			lineCount, err := strconv.Atoi(args[2])
+			if err != nil {
+				return "", fmt.Errorf("failed to parse line count %q: %w", args[2], err)
+			}
+			return ReadFile(index.srcDirs, args[0], firstLine, lineCount)
+		}},
+	{
+		Name:  "file-index",
+		NArgs: 1,
+		Func: func(index *Index, args []string) (string, error) {
+			entities, err := index.FileIndex(args[0])
+			if err != nil {
+				return "", err
+			}
+			b := new(strings.Builder)
+			fmt.Fprintf(b, "file %v defines the following entities:\n\n", args[0])
+			for _, ent := range entities {
+				fmt.Fprintf(b, "%v %v\n", ent.Kind, ent.Name)
+			}
+			return b.String(), nil
+		}},
+	{
+		Name:  "def-comment",
+		NArgs: 2,
+		Func: func(index *Index, args []string) (string, error) {
+			info, err := index.DefinitionComment(args[0], args[1])
+			if err != nil {
+				return "", err
+			}
+			if info.Body == "" {
+				return fmt.Sprintf("%v %v is defined in %v and is not commented\n",
+					info.Kind, args[1], info.File), nil
+			}
+			return fmt.Sprintf("%v %v is defined in %v and commented as:\n\n%v",
+				info.Kind, args[1], info.File, info.Body), nil
+		}},
+	{
+		Name:  "def-source",
+		NArgs: 2,
+		Func: func(index *Index, args []string) (string, error) {
+			info, err := index.DefinitionSource(args[0], args[1])
+			if err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("%v %v is defined in %v:\n\n%v", info.Kind, args[1], info.File, info.Body), nil
+		}},
+	{
+		Name:  "find-references",
+		NArgs: 5,
+		Func: func(index *Index, args []string) (string, error) {
+			contextLines, err := strconv.Atoi(args[3])
+			if err != nil {
+				return "", fmt.Errorf("failed to parse number of context lines %q: %w", args[3], err)
+			}
+			outputLimit, err := strconv.Atoi(args[4])
+			if err != nil {
+				return "", fmt.Errorf("failed to parse output limit %q: %w", args[4], err)
+			}
+			refs, totalCount, err := index.FindReferences(args[0], args[1], args[2], contextLines, outputLimit)
+			if err != nil {
+				return "", err
+			}
+			b := new(strings.Builder)
+			fmt.Fprintf(b, "%v has %v references:\n\n", args[1], totalCount)
+			for _, ref := range refs {
+				fmt.Fprintf(b, "%v %v %v it at %v:%v\n%v\n\n",
+					ref.ReferencingEntityKind, ref.ReferencingEntityName, ref.ReferenceKind,
+					ref.SourceFile, ref.SourceLine, ref.SourceSnippet)
+			}
+			return b.String(), nil
+		}},
+	{
+		Name:  "struct-layout",
+		NArgs: 0,
+		Func: func(index *Index, args []string) (string, error) {
+			if len(args) != 2 && len(args) != 3 {
+				return "", fmt.Errorf("codesearch command struct-layout requires 2 or 3 args, but %v provided",
+					len(args))
+			}
+			var fieldOffset *uint
+			if len(args) == 3 {
+				val, err := strconv.ParseUint(args[2], 10, 64)
+				if err != nil {
+					return "", fmt.Errorf("bad offset: %w", err)
+				}
+				fieldOffset = new(uint)
+				*fieldOffset = uint(val)
+			}
+			fields, err := index.GetStructLayout(args[0], args[1], fieldOffset)
+			if err != nil {
+				return "", err
+			}
+			b := new(strings.Builder)
+			fmt.Fprintf(b, "struct %v has %v fields:\n", args[1], len(fields))
+			for _, f := range fields {
+				fmt.Fprintf(b, "[%v - %v] %v\n", f.OffsetBits, f.OffsetBits+f.SizeBits, f.Name)
+			}
+			return b.String(), nil
+		}},
 }
 
 func IsSourceFile(file string) bool {
@@ -178,60 +208,10 @@ type Entity struct {
 	Name string
 }
 
-func (index *Index) DirIndex(dir string) ([]string, []string, error) {
-	if err := escaping(dir); err != nil {
-		return nil, nil, err
-	}
-	exists := false
-	var subdirs, files []string
-	for _, root := range index.srcDirs {
-		exists1, subdirs1, files1, err := dirIndex(root, dir)
-		if err != nil {
-			return nil, nil, err
-		}
-		if exists1 {
-			exists = true
-		}
-		subdirs = append(subdirs, subdirs1...)
-		files = append(files, files1...)
-	}
-	if !exists {
-		return nil, nil, aflow.BadCallError("the directory does not exist")
-	}
-	slices.Sort(subdirs)
-	slices.Sort(files)
-	// Dedup dirs across src/build trees,
-	// also dedup files, but hopefully there are no duplicates.
-	subdirs = slices.Compact(subdirs)
-	files = slices.Compact(files)
-	return subdirs, files, nil
-}
-
-func (index *Index) ReadFile(file string) (string, error) {
-	if err := escaping(file); err != nil {
-		return "", err
-	}
-	for _, dir := range index.srcDirs {
-		data, err := os.ReadFile(filepath.Join(dir, file))
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			var errno syscall.Errno
-			if errors.As(err, &errno) && errno == syscall.EISDIR {
-				return "", aflow.BadCallError("the file is a directory")
-			}
-			return "", err
-		}
-		return string(data), nil
-	}
-	return "", aflow.BadCallError("the file does not exist")
-}
-
 func (index *Index) FileIndex(file string) ([]Entity, error) {
 	file = filepath.Clean(file)
 	// This allows to distinguish missing files from files that don't define anything.
-	if _, err := index.ReadFile(file); err != nil {
+	if _, err := ReadFile(index.srcDirs, file, 1, 1); err != nil {
 		return nil, err
 	}
 	var entities []Entity
@@ -253,14 +233,14 @@ type EntityInfo struct {
 }
 
 func (index *Index) DefinitionComment(contextFile, name string) (*EntityInfo, error) {
-	return index.definitionSource(contextFile, name, true, false)
+	return index.definitionSource(contextFile, name, true)
 }
 
-func (index *Index) DefinitionSource(contextFile, name string, includeLines bool) (*EntityInfo, error) {
-	return index.definitionSource(contextFile, name, false, includeLines)
+func (index *Index) DefinitionSource(contextFile, name string) (*EntityInfo, error) {
+	return index.definitionSource(contextFile, name, false)
 }
 
-func (index *Index) definitionSource(contextFile, name string, comment, includeLines bool) (*EntityInfo, error) {
+func (index *Index) definitionSource(contextFile, name string, comment bool) (*EntityInfo, error) {
 	def := index.findDefinition(contextFile, name)
 	if def == nil {
 		return nil, aflow.BadCallError("requested entity does not exist")
@@ -269,7 +249,7 @@ func (index *Index) definitionSource(contextFile, name string, comment, includeL
 	if comment {
 		lineRange = def.Comment
 	}
-	src, err := index.formatSource(lineRange, includeLines)
+	src, err := index.formatSource(lineRange)
 	if err != nil {
 		return nil, err
 	}
@@ -317,7 +297,8 @@ func (index *Index) FindReferences(contextFile, name, srcPrefix string, contextL
 			// the reference is in another file and refers to a static 'foo'
 			// defined in that file (which is not the target 'foo').
 			if ref.Name != name || !isField && (ref.EntityKind != target.Kind ||
-				target.IsStatic && target.Body.File != def.Body.File) {
+				target.IsStatic && !strings.HasSuffix(target.Body.File, ".h") &&
+					target.Body.File != def.Body.File) {
 				continue
 			}
 			totalCount++
@@ -332,7 +313,7 @@ func (index *Index) FindReferences(contextFile, name, srcPrefix string, contextL
 					EndLine:   min(def.Body.EndLine, ref.Line+uint32(contextLines)),
 				}
 				var err error
-				snippet, err = index.formatSource(lines, true)
+				snippet, err = index.formatSource(lines)
 				if err != nil {
 					return nil, 0, err
 				}
@@ -393,7 +374,7 @@ func (index *Index) GetStructLayout(contextFile, name string, fieldOffset *uint)
 	return res, nil
 }
 
-func (index *Index) formatSource(lines LineRange, includeLines bool) (string, error) {
+func (index *Index) formatSource(lines LineRange) (string, error) {
 	if lines.File == "" {
 		return "", nil
 	}
@@ -402,12 +383,12 @@ func (index *Index) formatSource(lines LineRange, includeLines bool) (string, er
 		if !osutil.IsExist(file) {
 			continue
 		}
-		return formatSourceFile(file, int(lines.StartLine), int(lines.EndLine), includeLines)
+		return formatSourceFile(file, int(lines.StartLine), int(lines.EndLine))
 	}
 	return "", fmt.Errorf("codesearch: can't find %q file in any of %v", lines.File, index.srcDirs)
 }
 
-func formatSourceFile(file string, start, end int, includeLines bool) (string, error) {
+func formatSourceFile(file string, start, end int) (string, error) {
 	data, err := os.ReadFile(file)
 	if err != nil {
 		return "", err
@@ -415,17 +396,13 @@ func formatSourceFile(file string, start, end int, includeLines bool) (string, e
 	lines := bytes.Split(data, []byte{'\n'})
 	start--
 	end--
-	if start < 0 || end < start || end > len(lines) {
+	if start < 0 || end < start || end >= len(lines) {
 		return "", fmt.Errorf("codesearch: bad line range [%v-%v] for file %v with %v lines",
-			start, end, file, len(lines))
+			start+1, end+1, file, len(lines))
 	}
 	b := new(strings.Builder)
 	for line := start; line <= end; line++ {
-		if includeLines {
-			fmt.Fprintf(b, "%4v:\t%s\n", line+1, lines[line])
-		} else {
-			fmt.Fprintf(b, "%s\n", lines[line])
-		}
+		fmt.Fprintf(b, "%4v:\t%s\n", line+1, lines[line])
 	}
 	return b.String(), nil
 }
@@ -462,4 +439,70 @@ func dirIndex(root, subdir string) (bool, []string, []string, error) {
 		}
 	}
 	return true, subdirs, files, err
+}
+
+func DirIndex(srcDirs []string, dir string) ([]string, []string, error) {
+	if err := escaping(dir); err != nil {
+		return nil, nil, err
+	}
+	exists := false
+	var subdirs, files []string
+	for _, root := range srcDirs {
+		exists1, subdirs1, files1, err := dirIndex(root, dir)
+		if err != nil {
+			return nil, nil, err
+		}
+		if exists1 {
+			exists = true
+		}
+		subdirs = append(subdirs, subdirs1...)
+		files = append(files, files1...)
+	}
+	if !exists {
+		return nil, nil, aflow.BadCallError("the directory does not exist")
+	}
+	slices.Sort(subdirs)
+	slices.Sort(files)
+	// Dedup dirs across src/build trees,
+	// also dedup files, but hopefully there are no duplicates.
+	subdirs = slices.Compact(subdirs)
+	files = slices.Compact(files)
+	return subdirs, files, nil
+}
+
+func ReadFile(srcDirs []string, file string, firstLine, lineCount int) (string, error) {
+	if err := escaping(file); err != nil {
+		return "", err
+	}
+	firstLine = max(1, firstLine)
+	lineCount = max(1, min(100, lineCount))
+	for _, dir := range srcDirs {
+		path := filepath.Join(dir, file)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			var errno syscall.Errno
+			if errors.As(err, &errno) && errno == syscall.EISDIR {
+				return "", aflow.BadCallError("the file is a directory")
+			}
+			return "", err
+		}
+		lines := bytes.Split(data, []byte{'\n'})
+		if last := len(lines) - 1; last >= 0 && len(lines[last]) == 0 {
+			lines = lines[:last]
+		}
+		if firstLine > len(lines) {
+			return "", aflow.BadCallError("file %v does not have line %v, it has only %v lines",
+				file, firstLine, len(lines))
+		}
+		end := min(firstLine+lineCount-1, len(lines))
+		b := new(strings.Builder)
+		for i := firstLine - 1; i < end; i++ {
+			fmt.Fprintf(b, "%4v:\t%s\n", i+1, lines[i])
+		}
+		return b.String(), nil
+	}
+	return "", aflow.BadCallError("the file does not exist")
 }

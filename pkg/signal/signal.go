@@ -6,6 +6,7 @@ package signal
 
 import (
 	"fmt"
+	"maps"
 	"strings"
 )
 
@@ -27,9 +28,7 @@ func (s Signal) Empty() bool {
 
 func (s Signal) Copy() Signal {
 	c := make(Signal, len(s))
-	for e, p := range s {
-		c[e] = p
-	}
+	maps.Copy(c, s)
 	return c
 }
 
@@ -135,5 +134,3 @@ func (s Signal) ToRaw() []uint64 {
 	}
 	return raw
 }
-
-

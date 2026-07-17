@@ -1,6 +1,7 @@
 // Copyright 2016 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package repro extracts, minimizes, and simplifies crash reproducers from execution logs.
 package repro
 
 import (
@@ -8,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -23,6 +25,7 @@ import (
 	"github.com/google/syzkaller/sys/targets"
 	"github.com/google/syzkaller/vm"
 	"github.com/google/syzkaller/vm/dispatcher"
+	"github.com/google/syzkaller/vm/vmimpl"
 )
 
 type Result struct {
@@ -386,8 +389,8 @@ func lastEntries(entries []*prog.LogEntry) []*prog.LogEntry {
 	}
 	sort.Ints(indices)
 	var lastEntries []*prog.LogEntry
-	for i := len(indices) - 1; i >= 0; i-- {
-		lastEntries = append(lastEntries, entries[indices[i]])
+	for _, indice := range slices.Backward(indices) {
+		lastEntries = append(lastEntries, entries[indice])
 	}
 	return lastEntries
 }
@@ -871,25 +874,32 @@ func (pw *poolWrapper) RunSyz(ctx context.Context, syzProg []byte, opts instance
 
 func (pw *poolWrapper) run(ctx context.Context, duration time.Duration, logf instance.ExecutorLogger, typ string,
 	fn func(*instance.ExecProgInstance) error) error {
-	if err := ctx.Err(); err != nil {
-		// Note that we could also propagate ctx down to SetupExecProg() and RunCProg() operations,
-		// but so far it does not seem to be worth the effort.
-		return err
-	}
 	var runErr error
-	err := pw.pool.Run(ctx, func(ctx context.Context, inst *vm.Instance, updInfo dispatcher.UpdateInfo) {
-		updInfo(func(info *dispatcher.Info) {
-			info.Status = fmt.Sprintf("reproducing (%s, %.1f min)", typ, duration.Minutes())
-		})
-		ret, err := instance.SetupExecProg(inst, pw.cfg, pw.reporter, &instance.OptionalConfig{Logf: logf})
-		if err != nil {
-			runErr = err
-			return
+	for {
+		if err := ctx.Err(); err != nil {
+			// Note that we could also propagate ctx down to SetupExecProg() and RunCProg() operations,
+			// but so far it does not seem to be worth the effort.
+			return err
 		}
-		runErr = fn(ret)
-	})
-	if err != nil {
-		return err
+		err := pw.pool.Run(ctx, func(ctx context.Context, inst *vm.Instance, updInfo dispatcher.UpdateInfo) {
+			updInfo(func(info *dispatcher.Info) {
+				info.Status = fmt.Sprintf("reproducing (%s, %.1f min)", typ, duration.Minutes())
+			})
+			ret, err := instance.SetupExecProg(inst, pw.cfg, pw.reporter, &instance.OptionalConfig{Logf: logf})
+			if err != nil {
+				runErr = err
+			} else {
+				runErr = fn(ret)
+			}
+		})
+		if err != nil {
+			return err
+		}
+		if errors.Is(runErr, vmimpl.ErrPreempted) {
+			logf(0, "VM was preempted during %s execution: %v, retrying", typ, runErr)
+			continue
+		}
+		break
 	}
 	return runErr
 }

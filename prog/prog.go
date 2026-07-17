@@ -1,6 +1,8 @@
 // Copyright 2015 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package prog implements syzkaller test program representation, parsing, mutation,
+// generation, and serialization.
 package prog
 
 import (
@@ -70,7 +72,7 @@ func (p *Prog) countArgs() int {
 	return total
 }
 
-// These properties are parsed and serialized according to the tag and the type
+// CallProps represents properties that are parsed and serialized according to the tag and the type
 // of the corresponding fields.
 // IMPORTANT: keep the exact values of "key" tag for existing props unchanged,
 // otherwise the backwards compatibility would be broken.
@@ -121,7 +123,7 @@ func (arg *ArgCommon) Dir() Dir {
 	return arg.dir
 }
 
-// Used for ConstType, IntType, FlagsType, LenType, ProcType and CsumType.
+// ConstArg is used for ConstType, IntType, FlagsType, LenType, ProcType and CsumType.
 type ConstArg struct {
 	ArgCommon
 	Val uint64
@@ -161,7 +163,7 @@ func (arg *ConstArg) Value() (uint64, uint64) {
 	}
 }
 
-// Used for PtrType and VmaType.
+// PointerArg is used for PtrType and VmaType.
 type PointerArg struct {
 	ArgCommon
 	Address uint64
@@ -219,7 +221,7 @@ func (target *Target) PhysicalAddr(arg *PointerArg) uint64 {
 	return target.DataOffset + arg.Address
 }
 
-// Used for BufferType.
+// DataArg is used for BufferType.
 type DataArg struct {
 	ArgCommon
 	data []byte // for in/inout args
@@ -261,7 +263,7 @@ func (arg *DataArg) SetData(data []byte) {
 	arg.data = slices.Clone(data)
 }
 
-// Used for StructType and ArrayType.
+// GroupArg is used for StructType and ArrayType.
 // Logical group of args (struct or array).
 type GroupArg struct {
 	ArgCommon
@@ -316,7 +318,7 @@ func (arg *GroupArg) fixedInnerSize() bool {
 	}
 }
 
-// Used for UnionType.
+// UnionArg is used for UnionType.
 type UnionArg struct {
 	ArgCommon
 	Option Arg
@@ -338,7 +340,7 @@ func (arg *UnionArg) Size() uint64 {
 	return arg.Option.Size()
 }
 
-// Used for ResourceType.
+// ResultArg is used for ResourceType.
 // This is the only argument that can be used as syscall return value.
 // Either holds constant value or reference another ResultArg.
 type ResultArg struct {
@@ -373,7 +375,7 @@ func (arg *ResultArg) Size() uint64 {
 	return arg.Type().Size()
 }
 
-// Returns inner arg for pointer args.
+// InnerArg returns inner arg for pointer args.
 func InnerArg(arg Arg) Arg {
 	if _, ok := arg.Type().(*PtrType); ok {
 		res := arg.(*PointerArg).Res
@@ -623,6 +625,7 @@ func (p *Prog) sanitize(fix bool) error {
 	return nil
 }
 
+// ForeachProp executes f for each property.
 // TODO: This method might be more generic - it can be applied to any struct.
 func (props *CallProps) ForeachProp(f func(fieldName, key string, value reflect.Value)) {
 	valueObj := reflect.ValueOf(props).Elem()

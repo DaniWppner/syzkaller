@@ -1,12 +1,14 @@
 // Copyright 2024 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package validator provides input validation, pattern matching, and access control validation functions.
 package validator
 
 import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/google/syzkaller/pkg/auth"
@@ -51,11 +53,9 @@ func PanicIfNot(results ...Result) error {
 var ErrValueNotAllowed = errors.New("value is not allowed")
 
 func Allowlisted(str string, allowlist []string, valueName ...string) Result {
-	for _, allowed := range allowlist {
-		if allowed == str {
-			return Result{
-				Ok: true,
-			}
+	if slices.Contains(allowlist, str) {
+		return Result{
+			Ok: true,
 		}
 	}
 	if len(valueName) == 0 {

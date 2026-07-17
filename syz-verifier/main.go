@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/google/syzkaller/pkg/execbackend"
 	"github.com/google/syzkaller/pkg/flatrpc"
 	"github.com/google/syzkaller/pkg/fuzzer/queue"
 	"github.com/google/syzkaller/pkg/log"
@@ -22,10 +23,10 @@ import (
 	"github.com/google/syzkaller/vm"
 )
 
-// poolInfo contains kernel-specific information for spawning virtual machines
-// and reporting crashes. It also keeps track of the Runners executing on
-// spawned VMs, what programs have been sent to each Runner and what programs
-// have yet to be sent on any of the Runners.
+// Setup configures the verifier environment, including kernel-specific information
+// for spawning virtual machines and reporting crashes. It also keeps track of the
+// Runners executing on spawned VMs, what programs have been sent to each Runner
+// and what programs have yet to be sent on any of the Runners.
 func Setup(name string, cfg *mgrconfig.Config, debug bool) (*Kernel, error) {
 	kernel := &Kernel{
 		name:            name,
@@ -45,7 +46,7 @@ func Setup(name string, cfg *mgrconfig.Config, debug bool) (*Kernel, error) {
 	// Executor process restarts between program executions to clear accumulated kernel/VM stat.
 	cfg.Experimental.ResetAccState = true
 
-	kernel.serv, err = rpcserver.New(&rpcserver.RemoteConfig{
+	kernel.serv, err = execbackend.New(&rpcserver.RemoteConfig{
 		Config:  cfg,
 		Manager: kernel,
 		Stats:   kernel.servStats,

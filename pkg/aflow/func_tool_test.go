@@ -4,10 +4,14 @@
 package aflow
 
 import (
+	"context"
 	"errors"
 	"testing"
+	"time"
 
-	"google.golang.org/genai"
+	"github.com/google/syzkaller/pkg/aflow/backend"
+	"github.com/google/syzkaller/pkg/aflow/trajectory"
+	"github.com/stretchr/testify/require"
 )
 
 func TestToolErrors(t *testing.T) {
@@ -20,12 +24,7 @@ func TestToolErrors(t *testing.T) {
 	testFlow[struct{}, flowOutputs](t, nil,
 		"tool faulty failed: error: hard error\nargs: map[CallError:false]",
 		&LLMAgent{
-			Name:        "smarty",
-			Model:       "model",
-			Reply:       "Reply",
-			TaskType:    FormalReasoningTask,
-			Instruction: "Do something!",
-			Prompt:      "Prompt",
+			Reply: "Reply",
 			Tools: []Tool{
 				NewFuncTool("faulty", func(ctx *Context, state struct{}, args toolArgs) (struct{}, error) {
 					if args.CallError {
@@ -36,8 +35,8 @@ func TestToolErrors(t *testing.T) {
 			},
 		},
 		[]any{
-			&genai.Part{
-				FunctionCall: &genai.FunctionCall{
+			&backend.Part{
+				FunctionCall: &backend.FunctionCall{
 					ID:   "id0",
 					Name: "faulty",
 					Args: map[string]any{
@@ -45,8 +44,8 @@ func TestToolErrors(t *testing.T) {
 					},
 				},
 			},
-			&genai.Part{
-				FunctionCall: &genai.FunctionCall{
+			&backend.Part{
+				FunctionCall: &backend.FunctionCall{
 					ID:   "id0",
 					Name: "faulty",
 					Args: map[string]any{
@@ -57,4 +56,107 @@ func TestToolErrors(t *testing.T) {
 		},
 		nil,
 	)
+}
+
+func TestToolLoopDetection(t *testing.T) {
+	session := &agentSession{LLMAgent: &LLMAgent{Name: "test-agent"}}
+	args := map[string]any{"Query": "test"}
+
+	// The first 3 identical calls should be allowed.
+	for range defaultLoopDetectionLimit {
+		call := &backend.FunctionCall{Name: "test-tool", Args: args}
+		err := session.recordAndCheckDuplicate(call)
+		require.NoError(t, err)
+	}
+
+	// The 4th identical call should be detected as a duplicate.
+	call := &backend.FunctionCall{Name: "test-tool", Args: args}
+	err := session.recordAndCheckDuplicate(call)
+	var badCallErr *badCallError
+	require.ErrorAs(t, err, &badCallErr)
+	require.Contains(t, err.Error(), "repeating the same tool call")
+
+	// A different call should not be detected as a duplicate.
+	diffCall := &backend.FunctionCall{Name: "diff-tool", Args: args}
+	err = session.recordAndCheckDuplicate(diffCall)
+	require.NoError(t, err, "unexpected error on different call: %v", err)
+}
+
+func TestToolHistorySequentialLeak(t *testing.T) {
+	args := map[string]any{"Q": "1"}
+	toolExecutionCount := 0
+	agent := &LLMAgent{
+		Name:  "test-agent",
+		Model: "model",
+		Reply: "Done",
+		Tools: []Tool{
+			NewFuncTool("test-tool", func(ctx *Context, state struct{},
+				args struct {
+					Q string `jsonschema:"query string"`
+				}) (struct{}, error) {
+				toolExecutionCount++
+				return struct{}{}, nil
+			}, "description"),
+		},
+	}
+
+	// Run 1 executes 3 parallel identical tool calls (filling history to loop limit).
+	ctx1 := newTestContext(t, func(model string, cfg *backend.GenerateConfig, req []*backend.Message) (
+		*backend.GenerateResponse, error) {
+		if len(req) == 1 {
+			return &backend.GenerateResponse{
+				Parts: []backend.Part{
+					{FunctionCall: &backend.FunctionCall{ID: "c1", Name: "test-tool", Args: args}},
+					{FunctionCall: &backend.FunctionCall{ID: "c2", Name: "test-tool", Args: args}},
+					{FunctionCall: &backend.FunctionCall{ID: "c3", Name: "test-tool", Args: args}},
+				},
+			}, nil
+		}
+		return &backend.GenerateResponse{
+			Parts: []backend.Part{{Text: "Done"}},
+		}, nil
+	})
+
+	require.NoError(t, agent.execute(ctx1), "run 1 failed")
+
+	// Run 2 is a completely fresh run and executes 1 tool call.
+	ctx2 := newTestContext(t, func(model string, cfg *backend.GenerateConfig, req []*backend.Message) (
+		*backend.GenerateResponse, error) {
+		if len(req) == 1 {
+			return &backend.GenerateResponse{
+				Parts: []backend.Part{
+					{FunctionCall: &backend.FunctionCall{ID: "c4", Name: "test-tool", Args: args}},
+				},
+			}, nil
+		}
+		return &backend.GenerateResponse{
+			Parts: []backend.Part{{Text: "Done"}},
+		}, nil
+	})
+
+	require.NoError(t, agent.execute(ctx2), "run 2 failed")
+
+	// Expected behavior: 3 calls in Run 1 + 1 call in Run 2 = 4 executions.
+	// Buggy behavior: 1st call of Run 2 is incorrectly blocked by leaked history = only 3 executions.
+	require.Equal(t, 4, toolExecutionCount, "state leak bug demonstrated! (one call was blocked by leaked history)")
+}
+
+func newTestContext(t *testing.T,
+	generateContent func(string, *backend.GenerateConfig, []*backend.Message) (
+		*backend.GenerateResponse, error)) *Context {
+	stub := stubContext{
+		timeNow:         time.Now,
+		generateContent: generateContent,
+	}
+	cache, err := newTestCache(t, t.TempDir(), 0, time.Now)
+	require.NoError(t, err, "failed to create test cache")
+	ctx := context.WithValue(context.Background(), stubContextKey, &stub)
+	return &Context{
+		Context:     ctx,
+		provider:    &dummyProvider{},
+		stubContext: stub,
+		cache:       cache,
+		state:       map[string]any{},
+		onEvent:     func(span *trajectory.Span) error { return nil },
+	}
 }

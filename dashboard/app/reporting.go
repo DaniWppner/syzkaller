@@ -428,7 +428,7 @@ func createNotification(ctx context.Context, typ dashapi.BugNotif, public bool, 
 		CC:        kernelRepo.CC.Always,
 	}
 	if public {
-		notif.Maintainers = append(crash.Maintainers, kernelRepo.CC.Maintainers...)
+		notif.Maintainers = slices.Concat(crash.Maintainers, kernelRepo.CC.Maintainers)
 	}
 	if (public || reporting.moderation) && bugReporting.CC != "" {
 		notif.CC = append(notif.CC, strings.Split(bugReporting.CC, "|")...)
@@ -1525,6 +1525,7 @@ type bugReportSorter []*Bug
 
 func (a bugReportSorter) Len() int      { return len(a) }
 func (a bugReportSorter) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
+
 func (a bugReportSorter) Less(i, j int) bool {
 	if a[i].ReproLevel != a[j].ReproLevel {
 		return a[i].ReproLevel > a[j].ReproLevel

@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 
@@ -125,11 +126,7 @@ func (s *labelSet) ValidateValues(label BugLabelType, values []BugLabel) string 
 }
 
 func (s *labelSet) Help() string {
-	var sortedKeys []BugLabelType
-	for key := range s.labels {
-		sortedKeys = append(sortedKeys, key)
-	}
-	slices.Sort(sortedKeys)
+	sortedKeys := slices.Sorted(maps.Keys(s.labels))
 
 	var help strings.Builder
 	for _, key := range sortedKeys {
@@ -171,7 +168,7 @@ func (s *labelSet) Help() string {
 func writeWrapped(sb *strings.Builder, str string) {
 	const limit = 80
 	lineLen := 0
-	for _, token := range strings.Fields(str) {
+	for token := range strings.FieldsSeq(str) {
 		if lineLen >= limit ||
 			lineLen > 0 && lineLen+len(token) >= limit {
 			sb.WriteByte('\n')

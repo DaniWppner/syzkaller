@@ -35,7 +35,7 @@ func (repo *TestRepo) Git(args ...string) {
 	cmd.Env = filterEnv()
 
 	if _, err := osutil.Run(time.Minute, cmd); err != nil {
-		repo.t.Fatal(err)
+		repo.t.Fatal(osutil.VerboseMessage(err))
 	}
 }
 
@@ -56,6 +56,10 @@ func MakeTestRepo(t *testing.T, dir string) *TestRepo {
 	repo.Git("init")
 	repo.Git("config", "--add", "user.email", userEmail)
 	repo.Git("config", "--add", "user.name", userName)
+	repo.Git("config", "--add", "gc.auto", "0")
+	repo.Git("config", "--add", "gc.autoDetach", "false")
+	repo.Git("config", "--add", "maintenance.auto", "false")
+	repo.Git("config", "--add", "maintenance.autoDetach", "false")
 	return repo
 }
 
@@ -63,7 +67,7 @@ func (repo *TestRepo) CommitFileChange(branch, change string) {
 	id := fmt.Sprintf("%v-%v-%v", repo.name, branch, change)
 	file := filepath.Join(repo.Dir, "file")
 	if err := osutil.WriteFile(file, []byte(id)); err != nil {
-		repo.t.Fatal(err)
+		repo.t.Fatal(osutil.VerboseMessage(err))
 	}
 	repo.Git("add", file)
 	repo.Git("commit", "-m", id)
@@ -72,13 +76,26 @@ func (repo *TestRepo) CommitFileChange(branch, change string) {
 	}
 	com, err := repo.repo.Commit(HEAD)
 	if err != nil {
-		repo.t.Fatal(err)
+		repo.t.Fatal(osutil.VerboseMessage(err))
 	}
 	repo.Commits[branch][change] = com
 }
 
 func (repo *TestRepo) CommitChange(description string) *Commit {
 	return repo.CommitChangeset(description)
+}
+
+func (repo *TestRepo) CommitChangeAt(description string, date time.Time) {
+	dateStr := date.Format(time.RFC3339)
+	cmd := osutil.Command("git", "commit", "--allow-empty", "-m", description)
+	cmd.Dir = repo.Dir
+	cmd.Env = append(os.Environ(),
+		"GIT_AUTHOR_DATE="+dateStr,
+		"GIT_COMMITTER_DATE="+dateStr,
+	)
+	if _, err := osutil.Run(time.Minute, cmd); err != nil {
+		repo.t.Fatal(err)
+	}
 }
 
 type FileContent struct {
@@ -104,7 +121,7 @@ func (repo *TestRepo) CommitChangeset(description string, actions ...FileContent
 	repo.Git("commit", "--allow-empty", "-m", description)
 	com, err := repo.repo.Commit(HEAD)
 	if err != nil {
-		repo.t.Fatal(err)
+		repo.t.Fatal(osutil.VerboseMessage(err))
 	}
 	repo.t.Logf("%q's hash is %s", description, com.Hash)
 	return com

@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"cmp"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -103,12 +104,7 @@ func (cf *ConstFile) Serialize() []byte {
 	if len(cf.arches) == 0 {
 		return nil
 	}
-	var arches []string
-	for arch := range cf.arches {
-		arches = append(arches, arch)
-	}
-
-	slices.Sort(arches)
+	arches := slices.Sorted(maps.Keys(cf.arches))
 	var consts []constVal
 	for _, cv := range cf.m {
 		consts = append(consts, cv)
@@ -217,11 +213,11 @@ func (cf *ConstFile) deserializeFile(data []byte, file, arch string, eh ast.Erro
 		if line == "" || line[0] == '#' {
 			continue
 		}
-		eq := strings.IndexByte(line, '=')
-		if eq == -1 {
+		before, after, ok := strings.Cut(line, "=")
+		if !ok {
 			return errf("expect '='")
 		}
-		name, val := strings.TrimSpace(line[:eq]), strings.TrimSpace(line[eq+1:])
+		name, val := strings.TrimSpace(before), strings.TrimSpace(after)
 		if arch != "" {
 			// Old format.
 			if !cf.parseOldConst(arch, name, val, errf) {
@@ -233,7 +229,7 @@ func (cf *ConstFile) deserializeFile(data []byte, file, arch string, eh ast.Erro
 			if name != "arches" {
 				return errf("missing arches header")
 			}
-			for _, arch := range strings.Split(val, ",") {
+			for arch := range strings.SplitSeq(val, ",") {
 				arches = append(arches, strings.TrimSpace(arch))
 			}
 			continue
@@ -252,7 +248,7 @@ type errft func(msg string, args ...any) bool
 
 func (cf *ConstFile) parseConst(arches []string, name, line string, weak bool, errf errft) bool {
 	var dflt map[string]uint64
-	for _, pair := range strings.Split(line, ",") {
+	for pair := range strings.SplitSeq(line, ",") {
 		fields := strings.Split(pair, ":")
 		if len(fields) == 1 {
 			// Default value.

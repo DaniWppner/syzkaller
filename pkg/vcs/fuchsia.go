@@ -78,6 +78,14 @@ func (ctx *fuchsia) CheckoutCommit(repo, commit string) (*Commit, error) {
 	return ctx.repo.CheckoutCommit(repo, commit)
 }
 
+func (ctx *fuchsia) FetchTags(repo string) error {
+	return ctx.repo.FetchTags(repo)
+}
+
+func (ctx *fuchsia) fetchRemote(repo, commit string) error {
+	return ctx.repo.fetchRemote(repo, commit)
+}
+
 func (ctx *fuchsia) SwitchCommit(commit string) (*Commit, error) {
 	return ctx.repo.SwitchCommit(commit)
 }
@@ -86,12 +94,12 @@ func (ctx *fuchsia) Commit(commit string) (*Commit, error) {
 	return ctx.repo.Commit(commit)
 }
 
-func (ctx *fuchsia) GetCommitByTitle(title string) (*Commit, error) {
-	return ctx.repo.GetCommitByTitle(title)
+func (ctx *fuchsia) GetCommitByTitle(title string, since time.Time) (*Commit, error) {
+	return ctx.repo.GetCommitByTitle(title, since)
 }
 
-func (ctx *fuchsia) GetCommitsByTitles(titles []string) ([]*Commit, []string, error) {
-	return ctx.repo.GetCommitsByTitles(titles)
+func (ctx *fuchsia) GetCommitsByTitles(titles []string, since time.Time) ([]*Commit, []string, error) {
+	return ctx.repo.GetCommitsByTitles(titles, since)
 }
 
 func (ctx *fuchsia) ExtractFixTagsFromCommits(baseCommit, email string) ([]*Commit, error) {
@@ -120,6 +128,10 @@ func (ctx *fuchsia) MergeBases(firstCommit, secondCommit string) ([]*Commit, err
 
 func (ctx *fuchsia) CommitExists(commit string) (bool, error) {
 	return ctx.repo.CommitExists(commit)
+}
+
+func (ctx *fuchsia) cherryPick(commit string) error {
+	return ctx.repo.cherryPick(commit)
 }
 
 func (ctx *fuchsia) PushCommit(repo, commit string) error {

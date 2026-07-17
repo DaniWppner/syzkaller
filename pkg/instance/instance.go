@@ -267,6 +267,20 @@ func (env *env) Test(numVMs int, reproSyz, reproOpts, reproC []byte, collectCove
 	if err := mgrconfig.Complete(env.cfg); err != nil {
 		return nil, err
 	}
+	if len(reproC) > 0 {
+		// Compile locally to verify it works before wasting VM time.
+		bin, err := csource.BuildNoWarn(env.cfg.Target, reproC)
+		if err != nil {
+			// Return a result indicating compilation failure for all VMs.
+			results := make([]EnvTestResult, numVMs)
+			testErr := &TestError{Title: fmt.Sprintf("compilation failed: %v", err)}
+			for i := range results {
+				results[i] = EnvTestResult{Error: testErr}
+			}
+			return results, nil
+		}
+		os.Remove(bin)
+	}
 	reporter, err := report.NewReporter(env.cfg)
 	if err != nil {
 		return nil, err
@@ -328,9 +342,8 @@ func (inst *inst) test() EnvTestResult {
 		ret := EnvTestResult{
 			Error: testErr,
 		}
-		var bootErr vm.BootErrorer
-		if errors.As(err, &bootErr) {
-			testErr.Title, testErr.Output = bootErr.BootError()
+		if bootErr, ok := errors.AsType[vm.BootError](err); ok {
+			testErr.Title, testErr.Output = bootErr.Details()
 			ret.RawOutput = testErr.Output
 			rep := inst.reporter.Parse(testErr.Output)
 			if rep != nil && rep.Type == crash.UnexpectedReboot {
@@ -351,10 +364,9 @@ func (inst *inst) test() EnvTestResult {
 			testErr.Title = rep.Title
 		} else {
 			testErr.Infra = true
-			var infraErr vm.InfraErrorer
-			if errors.As(err, &infraErr) {
+			if infraErr, ok := errors.AsType[vm.InfraError](err); ok {
 				// In case there's more info available.
-				testErr.Title, testErr.Output = infraErr.InfraError()
+				testErr.Title, testErr.Output = infraErr.Details()
 			}
 		}
 		return ret
@@ -376,6 +388,7 @@ func (inst *inst) test() EnvTestResult {
 func (inst *inst) testInstance() error {
 	execProg, err := SetupExecProg(inst.vm, inst.cfg, inst.reporter, &OptionalConfig{
 		OldFlagsCompatMode: !inst.optionalFlags,
+		StraceBin:          "", // Do not use strace for instance testing.
 	})
 	if err != nil {
 		return err
@@ -409,6 +422,7 @@ func (inst *inst) testInstance() error {
 func (inst *inst) testRepro() ([]byte, [][]uint64, error) {
 	execProg, err := SetupExecProg(inst.vm, inst.cfg, inst.reporter, &OptionalConfig{
 		OldFlagsCompatMode: !inst.optionalFlags,
+		StraceBin:          inst.cfg.StraceBin,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -464,12 +478,15 @@ func (inst *inst) csourceOptions() (csource.Options, error) {
 	return opts, nil
 }
 
+// ExecprogCmd returns the command to run execprog.
 // nolint:revive
 func ExecprogCmd(execprog, executor, OS, arch, vmType string, opts csource.Options,
 	optionalFlags bool, slowdown int, coverFile, progFile string) string {
 	repeatCount := 1
 	if opts.Repeat {
-		repeatCount = 0
+		// syz-execprog uses 0 for infinite loop. Allow specific repeat count
+		// for better control (e.g. flake testing or coverage collection).
+		repeatCount = opts.RepeatTimes
 	}
 	sandbox := opts.Sandbox
 	if sandbox == "" {
@@ -494,7 +511,7 @@ func ExecprogCmd(execprog, executor, OS, arch, vmType string, opts csource.Optio
 	}
 	coverArg := ""
 	if coverFile != "" {
-		coverArg = " -cover=%v -coverfile=" + coverFile
+		coverArg = " -cover=true -coverfile=" + coverFile
 	}
 	return fmt.Sprintf("%v -executor=%v -arch=%v%v -sandbox=%v"+
 		" -procs=%v -repeat=%v -threaded=%v -collide=%v%v%v %v",
@@ -510,6 +527,7 @@ var MakeBin = func() string {
 	return "make"
 }()
 
+// RunnerCmd returns the command to run the runner.
 // nolint:revive
 func RunnerCmd(prog, fwdAddr, os, arch string, poolIdx, vmIdx int, threaded, newEnv bool) string {
 	return fmt.Sprintf("%s -addr=%s -os=%s -arch=%s -pool=%d -vm=%d "+
@@ -539,8 +557,7 @@ func RunSmokeTest(cfg *mgrconfig.Config) (*report.Report, error) {
 	reportData, err := os.ReadFile(filepath.Join(cfg.Workdir, "report.json"))
 	if err != nil {
 		if os.IsNotExist(err) {
-			var verboseErr *osutil.VerboseError
-			if errors.As(retErr, &verboseErr) {
+			if verboseErr, ok := errors.AsType[*osutil.VerboseError](retErr); ok {
 				// Include more details into the report.
 				prefix := fmt.Sprintf("%s, exit code %d\n\n", verboseErr, verboseErr.ExitCode)
 				output = append([]byte(prefix), output...)

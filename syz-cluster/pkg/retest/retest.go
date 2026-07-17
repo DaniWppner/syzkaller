@@ -1,6 +1,8 @@
 // Copyright 2026 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package retest provides execution logic for re-testing reproducers on base and patched kernel environments
+// to detect bugs and regressions.
 package retest
 
 import (
@@ -111,9 +113,7 @@ func testOnEnv(env instance.Env, finding *api.RawFinding) *testResult {
 		return ret
 	}
 
-	var testErr *instance.TestError
-	var crashErr *instance.CrashError
-	if errors.As(res.Error, &testErr) {
+	if testErr, ok := errors.AsType[*instance.TestError](res.Error); ok {
 		ret.Status = api.StepResultError
 		ret.Error = testErr.Title
 		ret.Title = testErr.Title
@@ -121,7 +121,7 @@ func testOnEnv(env instance.Env, finding *api.RawFinding) *testResult {
 			ret.Report = testErr.Report.Report
 			ret.Title = testErr.Report.Title
 		}
-	} else if errors.As(res.Error, &crashErr) {
+	} else if crashErr, ok := errors.AsType[*instance.CrashError](res.Error); ok {
 		ret.Status = api.StepResultFailed
 		if crashErr.Report != nil {
 			ret.Report = crashErr.Report.Report

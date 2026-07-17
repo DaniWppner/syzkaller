@@ -163,7 +163,7 @@ func (w *execContext) serializeKFuzzTestCall(c *Call) error {
 	// to some struct input. This is the data that must be flattened and sent
 	// to the fuzzing driver with a relocation table.
 	dataArg := c.Args[1].(*PointerArg)
-	finalBlob := MarshallKFuzztestArg(dataArg.Res)
+	finalBlob := MarshalKFuzztestArg(dataArg.Res)
 	if len(finalBlob) > int(KFuzzTestMaxInputSize) {
 		return fmt.Errorf("encoded blob was too large")
 	}
@@ -269,8 +269,7 @@ func (w *execContext) writeChecksums() {
 	slices.SortFunc(csumArgs, func(a, b Arg) int {
 		return cmp.Compare(w.args[a].Addr, w.args[b].Addr)
 	})
-	for i := len(csumArgs) - 1; i >= 0; i-- {
-		arg := csumArgs[i]
+	for _, arg := range slices.Backward(csumArgs) {
 		info := w.csumMap[arg]
 		if _, ok := arg.Type().(*CsumType); !ok {
 			panic("csum arg is not csum type")

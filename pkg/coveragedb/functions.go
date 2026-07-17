@@ -8,8 +8,7 @@ import (
 	"fmt"
 
 	"cloud.google.com/go/spanner"
-	"github.com/google/syzkaller/pkg/coveragedb/spannerclient"
-	"google.golang.org/api/iterator"
+	pkgspanner "github.com/google/syzkaller/pkg/spanner"
 )
 
 // FuncLines represents the 'functions' table records.
@@ -20,7 +19,7 @@ type FuncLines struct {
 	Lines    []int64 // List of lines we know belong to this function name according to the addr2line output.
 }
 
-func MakeFuncFinder(ctx context.Context, client spannerclient.SpannerClient, ns string, timePeriod TimePeriod,
+func MakeFuncFinder(ctx context.Context, client *spanner.Client, ns string, timePeriod TimePeriod,
 ) (*FunctionFinder, error) {
 	stmt := spanner.Statement{
 		SQL: `select
@@ -40,19 +39,11 @@ where
 	defer iter.Stop()
 
 	ff := &FunctionFinder{}
-	for {
-		row, err := iter.Next()
-		if err == iterator.Done {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("iter.Next(): %w", err)
-		}
-		var r FuncLines
-		if err = row.ToStruct(&r); err != nil {
-			return nil, fmt.Errorf("row.ToStruct(): %w", err)
-		}
-
+	rows, err := pkgspanner.ReadRows[FuncLines](iter)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range rows {
 		for _, val := range r.Lines {
 			ff.addLine(r.FilePath, r.FuncName, int(val))
 		}

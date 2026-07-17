@@ -8,8 +8,7 @@
 				"file": "source0.c",
 				"start_line": 19,
 				"end_line": 22
-			},
-			"comment": {}
+			}
 		},
 		{
 			"name": "field_refs",
@@ -20,7 +19,6 @@
 				"start_line": 39,
 				"end_line": 46
 			},
-			"comment": {},
 			"refs": [
 				{
 					"name": "some_struct",
@@ -87,7 +85,6 @@
 				"start_line": 29,
 				"end_line": 33
 			},
-			"comment": {},
 			"refs": [
 				{
 					"name": "some_struct",
@@ -136,8 +133,7 @@
 				"file": "source0.h",
 				"start_line": 12,
 				"end_line": 15
-			},
-			"comment": {}
+			}
 		},
 		{
 			"name": "function_with_comment_in_header",
@@ -148,7 +144,11 @@
 				"start_line": 24,
 				"end_line": 27
 			},
-			"comment": {},
+			"comment": {
+				"file": "source0.h",
+				"start_line": 4,
+				"end_line": 7
+			},
 			"refs": [
 				{
 					"name": "same_name_in_several_files",
@@ -166,8 +166,7 @@
 				"file": "source0.c",
 				"start_line": 35,
 				"end_line": 37
-			},
-			"comment": {}
+			}
 		},
 		{
 			"name": "open",
@@ -185,6 +184,24 @@
 			}
 		},
 		{
+			"name": "reference_to_header_static",
+			"type": "void ()",
+			"kind": "function",
+			"body": {
+				"file": "source0.c",
+				"start_line": 48,
+				"end_line": 51
+			},
+			"refs": [
+				{
+					"name": "func_in_header",
+					"kind": "calls",
+					"entity_kind": "function",
+					"line": 50
+				}
+			]
+		},
+		{
 			"name": "another_struct",
 			"kind": "struct",
 			"body": {
@@ -192,7 +209,6 @@
 				"start_line": 36,
 				"end_line": 38
 			},
-			"comment": {},
 			"fields": [
 				{
 					"name": "x",
@@ -209,7 +225,6 @@
 				"start_line": 17,
 				"end_line": 20
 			},
-			"comment": {},
 			"fields": [
 				{
 					"name": "x",
@@ -257,7 +272,6 @@
 				"start_line": 6,
 				"end_line": 9
 			},
-			"comment": {},
 			"fields": [
 				{
 					"name": "X",
@@ -279,7 +293,6 @@
 				"start_line": 40,
 				"end_line": 44
 			},
-			"comment": {},
 			"fields": [
 				{
 					"name": "x",
@@ -305,8 +318,7 @@
 				"file": "source0.h",
 				"start_line": 46,
 				"end_line": 49
-			},
-			"comment": {}
+			}
 		},
 		{
 			"name": "another_struct_t",
@@ -315,8 +327,7 @@
 				"file": "source0.h",
 				"start_line": 36,
 				"end_line": 38
-			},
-			"comment": {}
+			}
 		},
 		{
 			"name": "some_enum_t",
@@ -325,8 +336,7 @@
 				"file": "source0.h",
 				"start_line": 51,
 				"end_line": 51
-			},
-			"comment": {}
+			}
 		},
 		{
 			"name": "some_struct_t",
@@ -335,8 +345,7 @@
 				"file": "source0.h",
 				"start_line": 22,
 				"end_line": 22
-			},
-			"comment": {}
+			}
 		},
 		{
 			"name": "typedefed_struct_t",
@@ -345,8 +354,7 @@
 				"file": "source0.h",
 				"start_line": 32,
 				"end_line": 34
-			},
-			"comment": {}
+			}
 		}
 	]
 }

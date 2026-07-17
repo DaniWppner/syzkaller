@@ -97,14 +97,13 @@ func (merger *OutputMerger) AddDecoder(name string, typ OutputType, r io.ReadClo
 		done: make(chan struct{}),
 	}
 	merger.decoderErr[name] = state
-	merger.wg.Add(1)
-	go func() {
-		defer merger.wg.Done()
+	merger.wg.Go(func() {
 		defer close(state.done)
 		err := merger.runDecoder(typ, r, decoder)
 		state.err = MergerError{name, r, err}
-	}()
+	})
 }
+
 func (merger *OutputMerger) runDecoder(typ OutputType, r io.ReadCloser,
 	decoder func(data []byte) (start, size int, decoded []byte)) error {
 	var pending []byte
@@ -121,11 +120,7 @@ func (merger *OutputMerger) runDecoder(typ OutputType, r io.ReadCloser,
 					merger.Output <- Chunk{decoded, typ} // note: this can block
 				}
 			}
-			// Remove all carriage returns.
 			buf := buf[:n]
-			if bytes.IndexByte(buf, '\r') != -1 {
-				buf = bytes.ReplaceAll(buf, []byte("\r"), nil)
-			}
 			pending = append(pending, buf...)
 			if pos := bytes.LastIndexByte(pending, '\n'); pos != -1 {
 				out := pending[:pos+1]

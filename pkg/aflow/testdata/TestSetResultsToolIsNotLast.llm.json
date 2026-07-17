@@ -5,7 +5,7 @@
 			"systemInstruction": {
 				"parts": [
 					{
-						"text": "Instructions\nPrefer calling several tools at the same time to save round-trips.\n\n\nUse set-results tool to provide results of the analysis.\nIt must be called exactly once before the final reply.\nIgnore results of this tool.\n"
+						"text": "Instruction\nPrefer calling several tools at the same time to save round-trips.\n\n\nUse set-results tool to provide results of the analysis.\nIt must be called exactly once before the final reply.\nIgnore results of this tool.\n"
 					}
 				],
 				"role": "user"
@@ -18,12 +18,12 @@
 							"description": "tool",
 							"name": "tool",
 							"parametersJsonSchema": {
-								"additionalProperties": false,
-								"type": "object"
+								"type": "object",
+								"additionalProperties": false
 							},
 							"responseJsonSchema": {
-								"additionalProperties": false,
-								"type": "object"
+								"type": "object",
+								"additionalProperties": false
 							}
 						}
 					]
@@ -34,44 +34,43 @@
 							"description": "Use this tool to provide results of the analysis.",
 							"name": "set-results",
 							"parametersJsonSchema": {
-								"additionalProperties": false,
+								"type": "object",
 								"properties": {
 									"Result": {
-										"description": "Result",
-										"type": "integer"
+										"type": "integer",
+										"description": "Result"
 									}
 								},
 								"required": [
 									"Result"
 								],
-								"type": "object"
+								"additionalProperties": false
 							},
 							"responseJsonSchema": {
-								"additionalProperties": false,
+								"type": "object",
 								"properties": {
 									"Result": {
-										"description": "Result",
-										"type": "integer"
+										"type": "integer",
+										"description": "Result"
 									}
 								},
 								"required": [
 									"Result"
 								],
-								"type": "object"
+								"additionalProperties": false
 							}
 						}
 					]
 				}
 			],
-			"responseModalities": [
-				"TEXT"
-			]
+			"thinkingLevel": 3,
+			"includeThoughts": true
 		},
 		"Request": [
 			{
 				"parts": [
 					{
-						"text": "Initial Prompt"
+						"text": "Prompt"
 					}
 				],
 				"role": "user"
@@ -84,7 +83,7 @@
 			{
 				"parts": [
 					{
-						"text": "Initial Prompt"
+						"text": "Prompt"
 					}
 				],
 				"role": "user"
@@ -100,16 +99,16 @@
 						}
 					}
 				],
-				"role": "user"
+				"role": "model"
 			},
 			{
 				"parts": [
 					{
 						"functionResponse": {
-							"name": "set-results",
 							"response": {
 								"Result": 42
-							}
+							},
+							"name": "set-results"
 						}
 					}
 				],
@@ -123,7 +122,7 @@
 			{
 				"parts": [
 					{
-						"text": "Initial Prompt"
+						"text": "Prompt"
 					}
 				],
 				"role": "user"
@@ -139,16 +138,16 @@
 						}
 					}
 				],
-				"role": "user"
+				"role": "model"
 			},
 			{
 				"parts": [
 					{
 						"functionResponse": {
-							"name": "set-results",
 							"response": {
 								"Result": 42
-							}
+							},
+							"name": "set-results"
 						}
 					}
 				],
@@ -162,7 +161,7 @@
 						}
 					}
 				],
-				"role": "user"
+				"role": "model"
 			},
 			{
 				"parts": [

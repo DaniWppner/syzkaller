@@ -4,12 +4,12 @@
 package aflow
 
 import (
-	"net/http"
+	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/google/syzkaller/pkg/aflow/backend"
 	"github.com/stretchr/testify/assert"
-	"google.golang.org/genai"
 )
 
 func TestLLMTool(t *testing.T) {
@@ -23,38 +23,31 @@ func TestLLMTool(t *testing.T) {
 		Something string `jsonschema:"something"`
 	}
 	testFlow[inputs, outputs](t, map[string]any{"Input": 42}, map[string]any{"Reply": "YES"},
-		Pipeline(
-			&LLMAgent{
-				Name:        "smarty",
-				Model:       "model",
-				TaskType:    FormalReasoningTask,
-				Reply:       "Reply",
-				Instruction: "Do something!",
-				Prompt:      "Prompt",
-				Tools: []Tool{
-					&LLMTool{
-						Name:        "researcher",
-						Model:       "sub-agent-model",
-						TaskType:    FormalReasoningTask,
-						Description: "researcher description",
-						Instruction: "researcher instruction",
-						Tools: []Tool{
-							NewFuncTool("researcher-tool", func(ctx *Context, state inputs, args toolArgs) (struct{}, error) {
-								// State passed all the way from the workflow inputs.
-								assert.Equal(t, state.Input, 42)
-								assert.True(t, strings.HasPrefix(args.Something, "subtool input"),
-									"args.Something=%q", args.Something)
-								return struct{}{}, nil
-							}, "researcher-tool description"),
-						},
+		&LLMAgent{
+			Reply: "Reply",
+			Tools: []Tool{
+				&LLMTool{
+					Name:        "researcher",
+					Model:       "sub-agent-model",
+					TaskType:    FormalReasoningTask,
+					Description: "researcher description",
+					Instruction: "researcher instruction",
+					Tools: []Tool{
+						NewFuncTool("researcher-tool", func(ctx *Context, state inputs, args toolArgs) (struct{}, error) {
+							// State passed all the way from the workflow inputs.
+							assert.Equal(t, state.Input, 42)
+							assert.True(t, strings.HasPrefix(args.Something, "subtool input"),
+								"args.Something=%q", args.Something)
+							return struct{}{}, nil
+						}, "researcher-tool description"),
 					},
 				},
 			},
-		),
+		},
 		[]any{
 			// Main agent calls the tool sub-agent.
-			&genai.Part{
-				FunctionCall: &genai.FunctionCall{
+			&backend.Part{
+				FunctionCall: &backend.FunctionCall{
 					ID:   "id0",
 					Name: "researcher",
 					Args: map[string]any{
@@ -63,8 +56,8 @@ func TestLLMTool(t *testing.T) {
 				},
 			},
 			// Sub-agent calls own tool.
-			&genai.Part{
-				FunctionCall: &genai.FunctionCall{
+			&backend.Part{
+				FunctionCall: &backend.FunctionCall{
 					ID:   "id1",
 					Name: "researcher-tool",
 					Args: map[string]any{
@@ -73,10 +66,10 @@ func TestLLMTool(t *testing.T) {
 				},
 			},
 			// Sub-agent returns result.
-			genai.NewPartFromText("Nothing."),
+			backend.Part{Text: "Nothing."},
 			// Repeat the same one more time.
-			&genai.Part{
-				FunctionCall: &genai.FunctionCall{
+			backend.Part{
+				FunctionCall: &backend.FunctionCall{
 					ID:   "id2",
 					Name: "researcher",
 					Args: map[string]any{
@@ -84,8 +77,8 @@ func TestLLMTool(t *testing.T) {
 					},
 				},
 			},
-			&genai.Part{
-				FunctionCall: &genai.FunctionCall{
+			backend.Part{
+				FunctionCall: &backend.FunctionCall{
 					ID:   "id3",
 					Name: "researcher-tool",
 					Args: map[string]any{
@@ -94,8 +87,8 @@ func TestLLMTool(t *testing.T) {
 				},
 			},
 			// Now model input token overflow.
-			&genai.Part{
-				FunctionCall: &genai.FunctionCall{
+			backend.Part{
+				FunctionCall: &backend.FunctionCall{
 					ID:   "id4",
 					Name: "researcher-tool",
 					Args: map[string]any{
@@ -103,14 +96,71 @@ func TestLLMTool(t *testing.T) {
 					},
 				},
 			},
-			genai.APIError{
-				Code:    http.StatusBadRequest,
-				Message: "The input token count exceeds the maximum number of tokens allowed 1048576.",
-			},
-			genai.NewPartFromText("Still nothing."),
+			&backend.InputTokenOverflowError{Err: fmt.Errorf("the input token count exceeds the maximum")},
+			backend.Part{Text: "Still nothing."},
 			// Main returns result.
-			genai.NewPartFromText("YES"),
+			backend.Part{Text: "YES"},
 		},
+		nil,
+	)
+}
+
+func TestLLMToolMaxIters(t *testing.T) {
+	type outputs struct {
+		Reply string
+	}
+	type toolArgs struct {
+		Arg int `jsonschema:"something"`
+	}
+	replies := []any{
+		// Main agent calls the tool sub-agent.
+		&backend.Part{
+			FunctionCall: &backend.FunctionCall{
+				ID:   "id0",
+				Name: "researcher",
+				Args: map[string]any{
+					"Question": "What do you think?",
+				},
+			},
+		},
+	}
+	// Sub-agent calls own tool maxLLMIterations times.
+	for i := range maxLLMIterations {
+		replies = append(replies, &backend.Part{
+			FunctionCall: &backend.FunctionCall{
+				ID:   "id1",
+				Name: "researcher-tool",
+				Args: map[string]any{
+					"Arg": i,
+				},
+			},
+		})
+	}
+	replies = append(replies,
+		// Sub-agent returns result.
+		backend.Part{Text: "Nothing."},
+		// Main returns result.
+		backend.Part{Text: "YES"},
+	)
+	testFlow[struct{}, outputs](t, nil, map[string]any{"Reply": "YES"},
+		&LLMAgent{
+			Reply: "Reply",
+			Tools: []Tool{
+				&LLMTool{
+					Name:        "researcher",
+					Model:       "sub-agent-model",
+					TaskType:    FormalReasoningTask,
+					Description: "researcher description",
+					Instruction: "researcher instruction",
+					Tools: []Tool{
+						NewFuncTool("researcher-tool", func(ctx *Context, state struct{}, args toolArgs) (struct{}, error) {
+							return struct{}{}, nil
+						}, "researcher-tool description"),
+					},
+				},
+			},
+		},
+		replies,
 		nil,
 	)
 }

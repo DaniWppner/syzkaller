@@ -8,7 +8,7 @@ import (
 	"math/rand"
 )
 
-// Our heatmaps are a flexible mechanism to assign a probability distribution to
+// Heatmap is a flexible mechanism to assign a probability distribution to
 // some collection of bytes. Usage:
 //  1. Choose a heatmap and initialize it: `hm := MakeXYZHeatmap(data)`.
 //     Different heatmaps implement different probability distributions
@@ -20,7 +20,7 @@ type Heatmap interface {
 	ChooseLocation() int
 }
 
-// Generic heatmaps model a probability distribution based on sparse data,
+// MakeGenericHeatmap creates a generic heatmap which models a probability distribution based on sparse data,
 // prioritising selection of regions which are not a single repeated byte. It
 // views data as a series of chunks of length `granularity`, ignoring chunks
 // which are a single repeated byte. Indices are chosen uniformly amongst the

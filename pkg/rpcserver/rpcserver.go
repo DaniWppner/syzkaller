@@ -1,6 +1,7 @@
 // Copyright 2024 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package rpcserver provides the RPC server for communication between manager and executor instances.
 package rpcserver
 
 import (
@@ -28,9 +29,30 @@ import (
 	"github.com/google/syzkaller/pkg/vminfo"
 	"github.com/google/syzkaller/prog"
 	"github.com/google/syzkaller/sys/targets"
-	"github.com/google/syzkaller/vm/dispatcher"
 	"golang.org/x/sync/errgroup"
 )
+
+type RunnerInfo struct {
+	Status         string
+	DetailedStatus func() []byte
+	MachineInfo    func() []byte
+}
+
+type UpdateInfo func(func(*RunnerInfo))
+
+type Server interface {
+	Setup() error
+	Close() error
+	Port() int
+	TriagedCorpus()
+	Serve(context.Context) error
+	SetSource(source queue.Source)
+	Features() flatrpc.Feature
+	CreateInstance(id int, injectExec chan<- bool, updInfo UpdateInfo) chan error
+	ShutdownInstance(id int, crashed bool, extraExecs ...report.ExecutorInfo) ([]ExecRecord, []byte)
+	StopFuzzing(id int)
+	DistributeSignalDelta(plus signal.Signal)
+}
 
 type Config struct {
 	vminfo.Config
@@ -50,6 +72,8 @@ type Config struct {
 	DebugTimeouts bool
 	Procs         int
 	Slowdown      int
+	ExecutorBin   string
+	Timeouts      targets.Timeouts
 	pcBase        uint64
 	localModules  []*vminfo.KernelModule
 
@@ -67,21 +91,9 @@ type RemoteConfig struct {
 type Manager interface {
 	MaxSignal() signal.Signal
 	BugFrames() (leaks []string, races []string)
-	MachineChecked(features flatrpc.Feature, syscalls map[*prog.Syscall]bool) (queue.Source, error)
+	MachineChecked(features flatrpc.Feature, syscalls map[*prog.Syscall]bool) error
 	CoverageFilter(modules []*vminfo.KernelModule) ([]uint64, error)
 	DebugFilter(modules []*vminfo.KernelModule) ([]uint64, error)
-}
-
-type Server interface {
-	Listen() error
-	Close() error
-	Port() int
-	TriagedCorpus()
-	Serve(context.Context) error
-	CreateInstance(id int, injectExec chan<- bool, updInfo dispatcher.UpdateInfo) chan error
-	ShutdownInstance(id int, crashed bool, extraExecs ...report.ExecutorInfo) ([]ExecRecord, []byte)
-	StopFuzzing(id int)
-	DistributeSignalDelta(plus signal.Signal)
 }
 
 type server struct {
@@ -98,6 +110,7 @@ type server struct {
 	checkFailures    int
 	onHandshake      chan *handshakeResult
 	baseSource       *queue.DynamicSourceCtl
+	enabledFeatures  flatrpc.Feature
 	setupFeatures    flatrpc.Feature
 	canonicalModules *cover.Canonicalizer
 	coverFilter      []uint64
@@ -188,8 +201,11 @@ func New(cfg *RemoteConfig) (Server, error) {
 		// gVisor/Starnix are not Linux, so filtering against Linux ranges won't work.
 		FilterSignal:      cfg.Type != targets.GVisor && cfg.Type != targets.Starnix,
 		PrintMachineCheck: true,
+		DebugTimeouts:     cfg.Debug,
 		Procs:             cfg.Procs,
 		Slowdown:          cfg.Timeouts.Slowdown,
+		ExecutorBin:       cfg.ExecutorBin,
+		Timeouts:          cfg.Timeouts,
 		pcBase:            pcBase,
 		localModules:      cfg.LocalModules,
 	}, cfg.Manager), nil
@@ -228,15 +244,21 @@ func newImpl(cfg *Config, mgr Manager) *server {
 }
 
 func (serv *server) Close() error {
+	// Unset the source so that we don't hold references to it (allowing GC)
+	// and don't serve any new requests from lingering connections.
+	serv.baseSource.Store(queue.Callback(func() *queue.Request {
+		return nil
+	}))
 	return serv.serv.Close()
 }
 
-func (serv *server) Listen() error {
+func (serv *server) Setup() error {
 	s, err := flatrpc.Listen(serv.cfg.RPC)
 	if err != nil {
 		return err
 	}
 	serv.serv = s
+	log.Logf(0, "serving rpc on tcp://%v", serv.Port())
 	return nil
 }
 
@@ -485,12 +507,12 @@ func (serv *server) runCheck(ctx context.Context, info *handshakeResult) error {
 		return checkErr
 	}
 	enabledFeatures := features.Enabled()
+	serv.enabledFeatures = enabledFeatures
 	serv.setupFeatures = features.NeedSetup()
-	newSource, err := serv.mgr.MachineChecked(enabledFeatures, enabledCalls)
+	err := serv.mgr.MachineChecked(enabledFeatures, enabledCalls)
 	if err != nil {
 		return err
 	}
-	serv.baseSource.Store(newSource)
 	serv.checkDone.Store(true)
 	return nil
 }
@@ -545,7 +567,7 @@ func (serv *server) printMachineCheck(checkFilesInfo []*flatrpc.FileInfo, enable
 	log.Logf(0, "machine check:\n%s", buf.Bytes())
 }
 
-func (serv *server) CreateInstance(id int, injectExec chan<- bool, updInfo dispatcher.UpdateInfo) chan error {
+func (serv *server) CreateInstance(id int, injectExec chan<- bool, updInfo UpdateInfo) chan error {
 	runner := &Runner{
 		id:            id,
 		source:        serv.execSource,
@@ -554,6 +576,7 @@ func (serv *server) CreateInstance(id int, injectExec chan<- bool, updInfo dispa
 		filterSignal:  serv.cfg.FilterSignal,
 		debug:         serv.cfg.Debug,
 		debugTimeouts: serv.cfg.DebugTimeouts,
+		progTarget:    serv.target,
 		sysTarget:     serv.sysTarget,
 		injectExec:    injectExec,
 		infoc:         make(chan chan []byte),
@@ -583,7 +606,7 @@ func (serv *server) StopFuzzing(id int) {
 	runner := serv.runners[id]
 	serv.mu.Unlock()
 	if runner.updInfo != nil {
-		runner.updInfo(func(info *dispatcher.Info) {
+		runner.updInfo(func(info *RunnerInfo) {
 			info.Status = "fuzzing is stopped"
 		})
 	}
@@ -603,6 +626,14 @@ func (serv *server) DistributeSignalDelta(plus signal.Signal) {
 	serv.foreachRunnerAsync(func(runner *Runner) {
 		runner.SendSignalUpdate(plusRaw)
 	})
+}
+
+func (serv *server) SetSource(source queue.Source) {
+	serv.baseSource.Store(source)
+}
+
+func (serv *server) Features() flatrpc.Feature {
+	return serv.enabledFeatures
 }
 
 func (serv *server) TriagedCorpus() {

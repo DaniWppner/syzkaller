@@ -23,6 +23,32 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 	{{end}}
 {{end}}
 
+{{/* Common page head part with Bootstrap, invoked with *uiHeader */}}
+{{define "head_bootstrap"}}
+	{{/* Required meta tags for responsive design on mobile devices */}}
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	{{/* Bootstrap 5.3.3 CSS compiled styles from Google Hosted Libraries */}}
+	<link href="https://ajax.googleapis.com/ajax/libs/bootstrap/5.3.3/css/bootstrap.min.css"
+		rel="stylesheet"
+		integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH"
+		crossorigin="anonymous">
+	{{/* Bootstrap 5.3.3 JS Bundle from Google Hosted Libraries, deferred to load asynchronously */}}
+	<script src="https://ajax.googleapis.com/ajax/libs/bootstrap/5.3.3/js/bootstrap.bundle.min.js"
+		integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz"
+		crossorigin="anonymous"
+		defer></script>
+	{{/* Google Analytics tracking code, injected only if AnalyticsTrackingID is configured in production */}}
+	{{if .AnalyticsTrackingID}}
+		<script async src="https://www.googletagmanager.com/gtag/js?id={{.AnalyticsTrackingID}}"></script>
+		<script>
+			window.dataLayer = window.dataLayer || [];
+			function gtag() { dataLayer.push(arguments); }
+			gtag('js', new Date());
+			gtag('config', '{{.AnalyticsTrackingID}}');
+		</script>
+	{{end}}
+{{end}}
+
 {{/* Common page header, invoked with *uiHeader */}}
 {{define "header"}}
 	<header id="topbar">
@@ -133,11 +159,7 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 	</header>
 	<br>
 	{{if .Message}}
-		<script>
-			document.addEventListener("DOMContentLoaded", function() {
-				alert("{{.Message}}");
-			});
-		</script>
+		<div class="flash-message">{{.Message}}</div>
 	{{end}}
 {{end}}
 
@@ -154,9 +176,25 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 	{{if .Filter.NoSubsystem}}
 		NoSubsystem={{.Filter.NoSubsystem}} ({{link (call .DropURL "no_subsystem" "") "drop"}})
 	{{end}}
+	{{if .Filter.WithRepro}}
+		WithRepro ({{link (call .DropURL "with_repro" "") "drop"}})
+	{{end}}
+	{{if .Filter.WithAIPatch}}
+		WithAIPatch ({{link (call .DropURL "with_ai_patch" "") "drop"}})
+	{{end}}
 	{{$drop := .DropURL}}
 	{{range .Filter.Labels}}
 		Label={{.}} ({{link (call $drop "label" .) "drop"}})
+	{{end}}
+	<br>
+{{end}}
+{{if or (not .Filter.WithRepro) (and .Filter.HasAI (not .Filter.WithAIPatch))}}
+	<b>Extra filters: </b>
+	{{if not .Filter.WithRepro}}
+		[{{link (call .SetURL "with_repro" "true") "With Repro"}}]
+	{{end}}
+	{{if and .Filter.HasAI (not .Filter.WithAIPatch)}}
+		[{{link (call .SetURL "with_ai_patch" "true") "With AI Patch Pending Review"}}]
 	{{end}}
 	<br>
 {{end}}
@@ -680,6 +718,43 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 {{end}}
 {{end}}
 
+{{/* List of AI patch versions, invoked with *uiBugPage */}}
+{{define "patch_version_list"}}
+<table class="list_table">
+	<thead><tr>
+			<th><a onclick="return sortTable(this, 'Version', numSort)" href="#">Version</a></th>
+			<th><a onclick="return sortTable(this, 'Stage', textSort)" href="#">Stage</a></th>
+			<th><a onclick="return sortTable(this, 'Reported', textSort)" href="#">Reported</a></th>
+			<th><a onclick="return sortTable(this, 'Report Link', textSort)" href="#">Report Link</a></th>
+			<th><a onclick="return sortTable(this, 'Job', textSort)" href="#">Job</a></th>
+			{{if .Header.AIActions}}<th>Actions</th>{{end}}
+	</tr></thead>
+	<tbody>
+	{{range $v := .PatchVersions}}
+	<tr>
+			<td>{{$v.Version}}</td>
+			<td>{{$v.Stage}}</td>
+			<td>{{formatTime $v.Reported}}</td>
+			<td class="tag">
+				{{if $v.Link}}<a href="{{$v.Link}}">Discussion</a>{{else}}Not reported{{end}}
+			</td>
+			<td class="tag">{{link $v.JobLink $v.JobID}}</td>
+			{{if $.Header.AIActions}}
+			<td>
+				{{if $v.CanIterate}}
+					<form method="POST" style="display:inline;">
+						<input type="hidden" name="ai-job-iteration" value="{{$v.ReportingID}}">
+						<button class="button" type="submit">Process Comments</button>
+					</form>
+				{{end}}
+			</td>
+			{{end}}
+	</tr>
+	{{end}}
+	</tbody>
+</table>
+{{end}}
+
 {{/* List of AI jobs, invoked with []*uiAIJob */}}
 {{define "ai_job_list"}}
 <table class="list_table">
@@ -697,13 +772,13 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 	</tr></thead>
 	<tbody>
 	{{range $job := .}}
-	<tr>
+	<tr {{if $job.IsCurrent}}class="ai_current_job"{{end}}>
 		<td class="tag">{{link $job.Link $job.ID}}</td>
 		<td>{{$job.Workflow}}</td>
-		<td>
+		<td class="ai_result">
 			{{range $res := $job.Results}}
 				{{if $res.IsBool}}
-					{{$res.Name}}: {{if $res.Value}}✅{{else}}❌{{end}}&nbsp;
+					<span>{{$res.Name}}: {{if $res.Value}}✅{{else}}❌{{end}}</span>
 				{{end}}
 			{{end}}
 		</td>
@@ -713,7 +788,12 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 		<td>{{formatTime $job.Started}}</td>
 		<td>{{formatTime $job.Finished}}</td>
 		<td class="tag">{{link $job.CodeRevisionLink $job.CodeRevision}}</td>
-		<td>{{$job.Error}}</td>
+		<td class="ai_job_error_cell">
+			<pre class="ai_job_error">{{$job.ErrorSummary}}</pre>
+			{{if lt (len $job.ErrorSummary) (len $job.Error)}}
+				<div class="ai_job_error_note">truncated to first 200 bytes; open job for full error</div>
+			{{end}}
+		</td>
 	</tr>
 	{{end}}
 	</tbody>

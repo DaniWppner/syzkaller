@@ -12,6 +12,7 @@
 package gce
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -19,9 +20,12 @@ import (
 	"math/rand"
 	"net/http"
 	"regexp"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/sys/targets"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
@@ -40,6 +44,9 @@ type Context struct {
 	Network    string
 	Subnetwork string
 
+	preemptibleZoneList zoneList
+	zoneList            zoneList
+
 	computeService *compute.Service
 	metadataServer string
 
@@ -47,6 +54,13 @@ type Context struct {
 	// GCE API calls too quickly. Our quota is 20 QPS, but we limit ourselves
 	// to less than that because several independent programs can do API calls.
 	apiRateGate <-chan time.Time
+}
+
+type zoneList struct {
+	sync.RWMutex
+	preferredZone string
+	list          []string
+	score         map[string]float64
 }
 
 type CreateArgs struct {
@@ -133,10 +147,41 @@ func NewContext(customZoneID, customProjectID string) (*Context, error) {
 	if ctx.InternalIP == "" {
 		return nil, fmt.Errorf("failed to get current instance internal IP")
 	}
+	upZones := ctx.queryZones()
+	ctx.zoneList = ctx.newZoneList(upZones)
+	ctx.preemptibleZoneList = ctx.newZoneList(upZones)
 	return ctx, nil
 }
 
-func (ctx *Context) CreateInstance(cfg *InstanceConfig) (string, error) {
+func (ctx *Context) queryZones() (zoneList *compute.ZoneList) {
+	err := ctx.apiCall(func() (err error) {
+		zoneList, err = ctx.computeService.RegionZones.List(ctx.ProjectID, ctx.RegionID).Do()
+		return
+	})
+	if err != nil {
+		log.Errorf("failed to query region %v zones. Project will only use %v", ctx.RegionID, ctx.ZoneID)
+	}
+	return
+}
+
+func (ctx *Context) newZoneList(computeZoneList *compute.ZoneList) (zl zoneList) {
+	zl.preferredZone = ctx.ZoneID
+	zl.list = []string{ctx.ZoneID}
+	zl.score = map[string]float64{
+		ctx.ZoneID: 1.0,
+	}
+	if computeZoneList != nil {
+		for _, zone := range computeZoneList.Items {
+			if zone.Status == "UP" && zone.Name != ctx.ZoneID {
+				zl.list = append(zl.list, zone.Name)
+				zl.score[zone.Name] = 1.0
+			}
+		}
+	}
+	return
+}
+
+func (ctx *Context) CreateInstance(cfg *InstanceConfig) (ip, zone string, err error) {
 	prefix := "https://www.googleapis.com/compute/v1/projects/" + ctx.ProjectID
 	sshkeyAttr := "syzkaller:" + cfg.SSHKey
 	oneAttr := "1"
@@ -144,7 +189,6 @@ func (ctx *Context) CreateInstance(cfg *InstanceConfig) (string, error) {
 	instance := &compute.Instance{
 		Name:        cfg.Name,
 		Description: "syzkaller worker",
-		MachineType: prefix + "/zones/" + ctx.ZoneID + "/machineTypes/" + cfg.MachineType,
 		Disks: []*compute.AttachedDisk{
 			{
 				AutoDelete: true,
@@ -198,41 +242,55 @@ func (ctx *Context) CreateInstance(cfg *InstanceConfig) (string, error) {
 	if instance.Scheduling.Preemptible {
 		instance.Scheduling.ProvisioningModel = "SPOT"
 	}
+	zoneList := &ctx.preemptibleZoneList
 retry:
+	zones := zoneList.get()
 	if !instance.Scheduling.Preemptible && strings.HasPrefix(cfg.MachineType, "e2-") {
 		// Otherwise we get "Error 400: Efficient instances do not support
 		// onHostMaintenance=TERMINATE unless they are preemptible".
 		instance.Scheduling.OnHostMaintenance = "MIGRATE"
 	}
-	var op *compute.Operation
-	err := ctx.apiCall(func() (err error) {
-		op, err = ctx.computeService.Instances.Insert(ctx.ProjectID, ctx.ZoneID, instance).Do()
-		return
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to create instance: %w", err)
-	}
-	if err := ctx.waitForZonalCompletion("create instance", op.Name, false); err != nil {
-		var resourcePoolExhaustedError resourcePoolExhaustedError
-		if errors.As(err, &resourcePoolExhaustedError) && instance.Scheduling.Preemptible {
-			instance.Scheduling.Preemptible = false
-			instance.Scheduling.ProvisioningModel = "STANDARD"
-			goto retry
+	for i, currentZone := range zones {
+		instance.MachineType = prefix + "/zones/" + currentZone + "/machineTypes/" + cfg.MachineType
+		var op *compute.Operation
+		err = ctx.apiCall(func() (err error) {
+			op, err = ctx.computeService.Instances.Insert(ctx.ProjectID, currentZone, instance).Do()
+			return
+		})
+		if err != nil {
+			zoneList.recordInsertionFailure(currentZone)
+			return "", currentZone, fmt.Errorf("failed to create instance: %w", err)
 		}
-		return "", err
+		if err = ctx.waitForZonalCompletion("create instance", currentZone, op.Name, false); err != nil {
+			zoneList.recordInsertionFailure(currentZone)
+			if _, ok := errors.AsType[resourcePoolExhaustedError](err); ok {
+				if i < len(zones)-1 {
+					continue
+				}
+				if instance.Scheduling.Preemptible {
+					zoneList = &ctx.zoneList
+					instance.Scheduling.Preemptible = false
+					instance.Scheduling.ProvisioningModel = "STANDARD"
+					goto retry
+				}
+			}
+			return "", currentZone, err
+		}
+		zone = currentZone
+		zoneList.recordInsertionSuccess(zone)
+		break
 	}
 
 	var inst *compute.Instance
 	err = ctx.apiCall(func() (err error) {
-		inst, err = ctx.computeService.Instances.Get(ctx.ProjectID, ctx.ZoneID, cfg.Name).Do()
+		inst, err = ctx.computeService.Instances.Get(ctx.ProjectID, zone, cfg.Name).Do()
 		return
 	})
 	if err != nil {
-		return "", fmt.Errorf("error getting instance %s details after creation: %w", cfg.Name, err)
+		return "", zone, fmt.Errorf("error getting instance %s details after creation: %w", cfg.Name, err)
 	}
 
 	// Finds its internal IP.
-	ip := ""
 	for _, iface := range inst.NetworkInterfaces {
 		if strings.HasPrefix(iface.NetworkIP, "10.") {
 			ip = iface.NetworkIP
@@ -240,9 +298,9 @@ retry:
 		}
 	}
 	if ip == "" {
-		return "", fmt.Errorf("didn't find instance internal IP address")
+		err = fmt.Errorf("didn't find instance internal IP address")
 	}
-	return ip, nil
+	return ip, zone, err
 }
 
 func diskSizeGB(machineType string) int {
@@ -255,31 +313,62 @@ func diskSizeGB(machineType string) int {
 	return 0
 }
 
-func (ctx *Context) DeleteInstance(name string, wait bool) error {
+func (ctx *Context) DeleteInstance(name, zone string, wait bool) error {
 	var op *compute.Operation
 	err := ctx.apiCall(func() (err error) {
-		op, err = ctx.computeService.Instances.Delete(ctx.ProjectID, ctx.ZoneID, name).Do()
+		op, err = ctx.computeService.Instances.Delete(ctx.ProjectID, zone, name).Do()
 		return
 	})
 	var apiErr *googleapi.Error
 	if errors.As(err, &apiErr) && apiErr.Code == 404 {
+		// Instance doesn't exist.
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("failed to delete instance: %w", err)
 	}
 	if wait {
-		if err := ctx.waitForZonalCompletion("delete instance", op.Name, true); err != nil {
+		if err := ctx.waitForZonalCompletion("delete instance", zone, op.Name, true); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (ctx *Context) IsInstanceRunning(name string) bool {
+// DeleteInstanceAcrossZones handles manager crashes: if instance i was running in zone z1,
+// and we later recreate i in zone z2, ensure the original i is deleted.
+func (ctx *Context) DeleteInstanceAcrossZones(name string, wait bool) error {
+	var zoneList []string
+	err := ctx.apiCall(func() error {
+		req := ctx.computeService.Instances.AggregatedList(ctx.ProjectID).
+			Filter(fmt.Sprintf("name = %v", name))
+		return req.Pages(context.Background(), func(page *compute.InstanceAggregatedList) error {
+			for _, list := range page.Items {
+				for _, inst := range list.Instances {
+					// inst.Zone is a URL like "https://www.googleapis.com/compute/v1/projects/project/zones/zone"
+					parts := strings.Split(inst.Zone, "/")
+					zone := parts[len(parts)-1]
+					zoneList = append(zoneList, zone)
+				}
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return fmt.Errorf("failed to get zones for instance %v, aborting delete: %w", name, err)
+	}
+	for _, zone := range zoneList {
+		if err := ctx.DeleteInstance(name, zone, wait); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (ctx *Context) IsInstanceRunning(name, zone string) bool {
 	var inst *compute.Instance
 	err := ctx.apiCall(func() (err error) {
-		inst, err = ctx.computeService.Instances.Get(ctx.ProjectID, ctx.ZoneID, name).Do()
+		inst, err = ctx.computeService.Instances.Get(ctx.ProjectID, zone, name).Do()
 		return
 	})
 	if err != nil {
@@ -354,15 +443,15 @@ func (err resourcePoolExhaustedError) Error() string {
 	return string(err)
 }
 
-func (ctx *Context) waitForZonalCompletion(desc, opName string, ignoreNotFound bool) error {
-	return ctx.waitForCompletion("zone", desc, opName, ignoreNotFound)
+func (ctx *Context) waitForZonalCompletion(desc, zone, opName string, ignoreNotFound bool) error {
+	return ctx.waitForCompletion("zone", desc, zone, opName, ignoreNotFound)
 }
 
 func (ctx *Context) waitForGlobalCompletion(desc, opName string, ignoreNotFound bool) error {
-	return ctx.waitForCompletion("global", desc, opName, ignoreNotFound)
+	return ctx.waitForCompletion("global", desc, "", opName, ignoreNotFound)
 }
 
-func (ctx *Context) waitForCompletion(typ, desc, opName string, ignoreNotFound bool) error {
+func (ctx *Context) waitForCompletion(typ, desc, zone, opName string, ignoreNotFound bool) error {
 	for {
 		time.Sleep(3 * time.Second)
 		var op *compute.Operation
@@ -371,7 +460,7 @@ func (ctx *Context) waitForCompletion(typ, desc, opName string, ignoreNotFound b
 			case "global":
 				op, err = ctx.computeService.GlobalOperations.Wait(ctx.ProjectID, opName).Do()
 			case "zone":
-				op, err = ctx.computeService.ZoneOperations.Wait(ctx.ProjectID, ctx.ZoneID, opName).Do()
+				op, err = ctx.computeService.ZoneOperations.Wait(ctx.ProjectID, zone, opName).Do()
 			default:
 				panic("unknown operation type: " + typ)
 			}
@@ -385,7 +474,7 @@ func (ctx *Context) waitForCompletion(typ, desc, opName string, ignoreNotFound b
 			continue
 		case "DONE":
 			if op.Error != nil {
-				reason := ""
+				var reason strings.Builder
 				for _, operr := range op.Error.Errors {
 					if operr.Code == "ZONE_RESOURCE_POOL_EXHAUSTED" ||
 						operr.Code == "ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS" {
@@ -394,9 +483,9 @@ func (ctx *Context) waitForCompletion(typ, desc, opName string, ignoreNotFound b
 					if ignoreNotFound && operr.Code == "RESOURCE_NOT_FOUND" {
 						return nil
 					}
-					reason += fmt.Sprintf("%+v.", operr)
+					reason.WriteString(fmt.Sprintf("%+v.", operr))
 				}
-				return fmt.Errorf("%v operation failed: %v", desc, reason)
+				return fmt.Errorf("%v operation failed: %v", desc, reason.String())
 			}
 			return nil
 		default:
@@ -467,4 +556,61 @@ var regionNameRe = regexp.MustCompile("^[a-zA-Z0-9]*-[a-zA-Z0-9]*")
 
 func zoneToRegion(zone string) string {
 	return regionNameRe.FindString(zone)
+}
+
+// promotes item to index 0 in list, while keeping the rest of the list as is.
+func promote(list []string, item string) []string {
+	if prefIdx := slices.Index(list, item); prefIdx > 0 {
+		pref := list[prefIdx]
+		copy(list[1:prefIdx+1], list[0:prefIdx])
+		list[0] = pref
+	}
+	return list
+}
+
+func (z *zoneList) sort() {
+	promote(z.list, z.preferredZone) // Ensure that in case of equal scores, we favor preferredZone.
+	slices.SortStableFunc(z.list, func(a, b string) int {
+		return cmp.Compare(z.score[b], z.score[a])
+	})
+}
+
+func (z *zoneList) recordInsertion(zone string, success bool) {
+	z.Lock()
+	defer z.Unlock()
+	if score, ok := z.score[zone]; ok {
+		score *= 0.9
+		if success {
+			score += 0.1
+		}
+		z.score[zone] = score
+		z.sort()
+	}
+}
+
+func (z *zoneList) recordInsertionFailure(zone string) {
+	z.recordInsertion(zone, false)
+}
+
+func (z *zoneList) recordInsertionSuccess(zone string) {
+	z.recordInsertion(zone, true)
+}
+
+func (z *zoneList) recordPreemption(zone string) {
+	// Technically not an insertion failure, but for our purposes it's the same.
+	z.recordInsertionFailure(zone)
+}
+
+func (ctx *Context) ReportPreemption(zone string) {
+	ctx.preemptibleZoneList.recordPreemption(zone)
+}
+
+func (z *zoneList) get() []string {
+	z.RLock()
+	defer z.RUnlock()
+	list := slices.Clone(z.list)
+	if rand.Intn(100) < 5 { // Occasionally make preferredZone our first choice. It's cheaper and faster.
+		promote(list, z.preferredZone)
+	}
+	return list
 }

@@ -9,36 +9,45 @@ import (
 	"fmt"
 	"maps"
 	"os"
-	"slices"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+	_ "time/tzdata"
 
+	"github.com/google/syzkaller/pkg/aflow/backend"
 	"github.com/google/syzkaller/pkg/aflow/trajectory"
+	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/osutil"
-	"google.golang.org/genai"
+	"golang.org/x/sync/errgroup"
 )
 
 // Execute executes the given AI workflow with provided inputs and returns workflow outputs.
-// The model argument overrides Gemini models used to execute LLM agents,
-// if not set, then default models for each agent are used.
 // The workdir argument should point to a dir owned by aflow to store private data,
 // it can be shared across parallel executions in the same process, and preferably
 // preserved across process restarts for caching purposes.
-func (flow *Flow) Execute(ctx context.Context, model, workdir string, inputs map[string]any,
-	cache *Cache, onEvent onEvent) (map[string]any, error) {
-	if err := flow.checkInputs(inputs); err != nil {
+func (flow *Flow) Execute(ctx context.Context, provider backend.Provider, workdir string, debug bool,
+	inputs map[string]any, cache *Cache, onEvent onEvent) (map[string]any, error) {
+	convertedInputs, err := flow.checkInputs(inputs)
+	if err != nil {
 		return nil, fmt.Errorf("flow inputs are missing: %w", err)
 	}
+	inputs = convertedInputs
 	inputs = maps.Clone(inputs)
 	maps.Insert(inputs, maps.All(flow.Consts))
+	llmClient, err := provider.Client(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize LLM client: %w", err)
+	}
+
 	c := &Context{
-		Context:  ctx,
-		Workdir:  osutil.Abs(workdir),
-		llmModel: model,
-		cache:    cache,
-		state:    inputs,
-		onEvent:  onEvent,
+		Context:     ctx,
+		Workdir:     osutil.Abs(workdir),
+		provider:    provider,
+		cache:       cache,
+		state:       inputs,
+		onEvent:     onEvent,
+		runnerDebug: debug,
 	}
 
 	defer c.Close()
@@ -48,8 +57,14 @@ func (flow *Flow) Execute(ctx context.Context, model, workdir string, inputs map
 	if c.timeNow == nil {
 		c.timeNow = time.Now
 	}
+	if c.sleep == nil {
+		c.sleep = time.Sleep
+	}
 	if c.generateContent == nil {
-		c.generateContent = c.generateContentGemini
+		c.generateContent = func(model string, cfg *backend.GenerateConfig,
+			req []*backend.Message) (*backend.GenerateResponse, error) {
+			return llmClient.GenerateContent(c.Context, model, cfg, req)
+		}
 	}
 	span := &trajectory.Span{
 		Type: trajectory.SpanFlow,
@@ -96,8 +111,7 @@ func (e *flowError) Unwrap() error {
 }
 
 func IsModelQuotaError(err error) string {
-	var quotaErr *modelQuotaError
-	if errors.As(err, &quotaErr) {
+	if quotaErr, ok := errors.AsType[*modelQuotaError](err); ok {
 		return quotaErr.model
 	}
 	return ""
@@ -111,13 +125,14 @@ func (err *modelQuotaError) Error() string {
 	return fmt.Sprintf("model %q is over daily quota", err.model)
 }
 
-func isTokenOverflowError(err error) bool {
-	var overflowErr *tokenOverflowError
+func isInputTokenOverflowError(err error) bool {
+	var overflowErr *backend.InputTokenOverflowError
 	return errors.As(err, &overflowErr)
 }
 
-type tokenOverflowError struct {
-	error
+func isOutputTokenOverflowError(err error) bool {
+	var overflowErr *backend.OutputTokenOverflowError
+	return errors.As(err, &overflowErr)
 }
 
 // QuotaResetTime returns the time when RPD quota will be reset
@@ -156,117 +171,33 @@ type (
 )
 
 var (
-	createClientOnce sync.Once
-	createClientErr  error
-	client           *genai.Client
-	modelList        map[string]*modelInfo
-	stubContextKey   = contextKeyType(1)
+	stubContextKey = contextKeyType(1)
 )
 
-type modelInfo struct {
-	Thinking         bool
-	MaxTemperature   float32
-	InputTokenLimit  int
-	OutputTokenLimit int
-}
-
-func (ctx *Context) generateContentGemini(model string, cfg *genai.GenerateContentConfig,
-	req []*genai.Content) (*genai.GenerateContentResponse, error) {
-	createClientOnce.Do(func() {
-		client, modelList, createClientErr = loadModelList(ctx.Context)
-	})
-	if createClientErr != nil {
-		return nil, createClientErr
-	}
-	info := modelList[model]
-	if info == nil {
-		models := slices.Collect(maps.Keys(modelList))
-		slices.Sort(models)
-		return nil, fmt.Errorf("model %q does not exist (models: %v)", model, models)
-	}
-	*cfg.Temperature = min(*cfg.Temperature, info.MaxTemperature)
-	if info.Thinking {
-		// Don't alter the original object (that may affect request caching).
-		cfgCopy := *cfg
-		cfg = &cfgCopy
-		cfg.ThinkingConfig = &genai.ThinkingConfig{
-			// We capture them in the trajectory for analysis.
-			IncludeThoughts: true,
-			// Enable "dynamic thinking" ("the model will adjust the budget based on the complexity of the request").
-			// See https://ai.google.dev/gemini-api/docs/thinking#set-budget
-			// However, thoughts output also consumes total output token budget.
-			// We may consider adjusting ThinkingLevel parameter.
-			ThinkingLevel: genai.ThinkingLevelHigh,
-		}
-	}
-	// Sometimes LLM requests just hang dead for tens of minutes,
-	// abort them after 10 minutes and retry. We don't stream reply tokens,
-	// so some large requests can take several minutes.
-	timedCtx, cancel := context.WithTimeout(ctx.Context, 10*time.Minute)
-	defer cancel()
-	resp, err := client.Models.GenerateContent(timedCtx, modelPrefix+model, req, cfg)
-	if err != nil && timedCtx.Err() == context.DeadlineExceeded {
-		return nil, &retryError{time.Second, err}
-	}
-	return resp, err
-}
-
-const modelPrefix = "models/"
-
-func loadModelList(ctx context.Context) (*genai.Client, map[string]*modelInfo, error) {
-	if os.Getenv("GOOGLE_API_KEY") == "" {
-		return nil, nil, fmt.Errorf("set GOOGLE_API_KEY env var to use with Gemini" +
-			" (see https://ai.google.dev/gemini-api/docs/api-key)")
-	}
-	client, err := genai.NewClient(ctx, nil)
-	if err != nil {
-		return nil, nil, err
-	}
-	models := make(map[string]*modelInfo)
-	for m, err := range client.Models.All(ctx) {
-		if err != nil {
-			return nil, nil, err
-		}
-		if !slices.Contains(m.SupportedActions, "generateContent") ||
-			strings.Contains(m.Name, "-image") ||
-			strings.Contains(m.Name, "-audio") {
-			continue
-		}
-		models[strings.TrimPrefix(m.Name, modelPrefix)] = &modelInfo{
-			Thinking:         m.Thinking,
-			MaxTemperature:   m.MaxTemperature,
-			InputTokenLimit:  int(m.InputTokenLimit),
-			OutputTokenLimit: int(m.OutputTokenLimit),
-		}
-	}
-	return client, models, nil
-}
-
 type Context struct {
-	Context     context.Context
-	Workdir     string
-	llmModel    string
-	cache       *Cache
-	cachedDirs  []string
-	tempDirs    []string
-	state       map[string]any
-	onEvent     onEvent
-	spanSeq     int
-	spanNesting int
+	Context       context.Context
+	Workdir       string
+	provider      backend.Provider
+	cache         *Cache
+	cachedDirs    []string
+	tempDirs      []string
+	state         map[string]any
+	onEvent       onEvent
+	spanSeq       int
+	spanNesting   int
+	runnerMu      sync.Mutex
+	runnerManager *RunnerManager
+	runnerEg      *errgroup.Group
+	runnerCancel  context.CancelFunc
+	runnerDebug   bool
 	stubContext
 }
 
 type stubContext struct {
 	timeNow         func() time.Time
-	generateContent func(string, *genai.GenerateContentConfig, []*genai.Content) (
-		*genai.GenerateContentResponse, error)
-}
-
-func (ctx *Context) modelName(model string) string {
-	if ctx.llmModel != "" {
-		return ctx.llmModel
-	}
-	return model
+	sleep           func(time.Duration)
+	generateContent func(string, *backend.GenerateConfig, []*backend.Message) (
+		*backend.GenerateResponse, error)
 }
 
 func (ctx *Context) Cache(typ, desc string, populate func(string) error) (string, error) {
@@ -278,13 +209,34 @@ func (ctx *Context) Cache(typ, desc string, populate func(string) error) (string
 	return dir, nil
 }
 
-func CacheObject[T any](ctx *Context, typ, desc string, populate func() (T, error)) (T, error) {
+func CacheObject[T any](
+	ctx *Context,
+	typ,
+	desc string,
+	populate func() (T, error),
+) (obj T, id string, err error) {
 	dir, obj, err := cacheCreateObject(ctx.cache, typ, desc, populate)
 	if err != nil {
-		return obj, err
+		return obj, "", err
 	}
 	ctx.cachedDirs = append(ctx.cachedDirs, dir)
-	return obj, nil
+	id = typ + "/" + filepath.Base(dir)
+	return obj, id, nil
+}
+
+func RetrieveObject[T any](ctx *Context, cachedID string) (T, error) {
+	var res T
+	if !filepath.IsLocal(cachedID) {
+		return res, fmt.Errorf("invalid cached ID (not local): %q", cachedID)
+	}
+	parts := strings.Split(cachedID, "/")
+	if len(parts) != 2 {
+		return res, fmt.Errorf("invalid cached ID format: %q", cachedID)
+	}
+	if parts[0] == "" || parts[1] == "" {
+		return res, fmt.Errorf("invalid cached ID: parts cannot be empty")
+	}
+	return CacheReadObject[T](ctx, parts[0], parts[1], "object")
 }
 
 func CacheReadObject[T any](ctx *Context, typ, id, filename string) (T, error) {
@@ -303,6 +255,18 @@ func (ctx *Context) TempDir() (string, error) {
 }
 
 func (ctx *Context) Close() {
+	ctx.runnerMu.Lock()
+	cancel := ctx.runnerCancel
+	eg := ctx.runnerEg
+	ctx.runnerManager = nil
+	ctx.runnerCancel = nil
+	ctx.runnerEg = nil
+	ctx.runnerMu.Unlock()
+
+	if cancel != nil {
+		cancel()
+		eg.Wait()
+	}
 	for _, dir := range ctx.cachedDirs {
 		ctx.cache.Release(dir)
 	}
@@ -334,4 +298,46 @@ func (ctx *Context) finishSpan(span *trajectory.Span, spanErr error) error {
 		err = spanErr
 	}
 	return err
+}
+
+var (
+	ErrRunnerNotInitialized     = errors.New("RunnerManager is not initialized (requires configure-runner)")
+	ErrRunnerAlreadyInitialized = errors.New("RunnerManager is already initialized")
+)
+
+// InitRunnerManager initializes the continuous RunnerManager. It must be called exactly once per flow.
+func (ctx *Context) InitRunnerManager(cfg *mgrconfig.Config) (*RunnerManager, error) {
+	ctx.runnerMu.Lock()
+	defer ctx.runnerMu.Unlock()
+	if ctx.runnerManager != nil {
+		return nil, ErrRunnerAlreadyInitialized
+	}
+	runnerCtx, cancel := context.WithCancel(ctx.Context)
+	eg, egCtx := errgroup.WithContext(runnerCtx)
+
+	rm, err := newRunnerManager(egCtx, cfg, ctx.runnerDebug)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+
+	ctx.runnerManager = rm
+	ctx.runnerCancel = cancel
+	ctx.runnerEg = eg
+
+	eg.Go(func() error {
+		return rm.Loop()
+	})
+
+	return rm, nil
+}
+
+// GetRunnerManager returns the initialized RunnerManager, or an error if it hasn't been configured.
+func (ctx *Context) GetRunnerManager() (*RunnerManager, error) {
+	ctx.runnerMu.Lock()
+	defer ctx.runnerMu.Unlock()
+	if ctx.runnerManager == nil {
+		return nil, ErrRunnerNotInitialized
+	}
+	return ctx.runnerManager, nil
 }

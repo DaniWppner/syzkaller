@@ -5,7 +5,7 @@
 			"systemInstruction": {
 				"parts": [
 					{
-						"text": "Do something!\nPrefer calling several tools at the same time to save round-trips.\n"
+						"text": "Instruction\nPrefer calling several tools at the same time to save round-trips.\n"
 					}
 				],
 				"role": "user"
@@ -18,29 +18,28 @@
 							"description": "tool 1 description",
 							"name": "faulty",
 							"parametersJsonSchema": {
-								"additionalProperties": false,
+								"type": "object",
 								"properties": {
 									"CallError": {
-										"description": "call error",
-										"type": "boolean"
+										"type": "boolean",
+										"description": "call error"
 									}
 								},
 								"required": [
 									"CallError"
 								],
-								"type": "object"
+								"additionalProperties": false
 							},
 							"responseJsonSchema": {
-								"additionalProperties": false,
-								"type": "object"
+								"type": "object",
+								"additionalProperties": false
 							}
 						}
 					]
 				}
 			],
-			"responseModalities": [
-				"TEXT"
-			]
+			"thinkingLevel": 3,
+			"includeThoughts": true
 		},
 		"Request": [
 			{
@@ -76,17 +75,17 @@
 						}
 					}
 				],
-				"role": "user"
+				"role": "model"
 			},
 			{
 				"parts": [
 					{
 						"functionResponse": {
 							"id": "id0",
-							"name": "faulty",
 							"response": {
 								"error": "you are wrong"
-							}
+							},
+							"name": "faulty"
 						}
 					}
 				],

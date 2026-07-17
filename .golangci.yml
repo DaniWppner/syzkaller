@@ -30,6 +30,7 @@ linters:
     - funlen
     - gocognit
     - goconst
+    - gocritic
     - gocyclo
     - godot
     - goprintffuncname
@@ -55,7 +56,6 @@ linters:
     - errcheck
     - gochecknoglobals
     - gochecknoinits
-    - gocritic
     - godox
     - gomodguard
     - gosec
@@ -87,6 +87,32 @@ linters:
       min-len: 3
       min-occurrences: 3
       ignore-string-values: ['\.html|^true$']
+    gocritic:
+      disable-all: true
+      enabled-checks:
+        - appendAssign
+        - argOrder
+        - badCall
+        - badCond
+        - caseOrder
+        - codegenComment
+        - dupArg
+        - dupBranchBody
+        - dupCase
+        - dupSubExpr
+        - flagDeref
+        - flagName
+        - mapKey
+        - newDeref
+        - offBy1
+        - regexpMust
+        - sloppyLen
+        - sloppyTypeAssert
+        - underef
+        - unlambda
+        - unslice
+        - valSwap
+        - wrapperFunc
     gocyclo:
       # TODO: consider reducing this value.
       min-complexity: 24
@@ -110,10 +136,6 @@ linters:
     staticcheck:
       checks:
       - all
-      - -ST1000 # at least one file in a package should have a package comment
-      - -ST1020 # comment on exported function Foo should be of the form "Foo ..."
-      - -ST1021 # comment on exported type Foo should be of the form "Foo ..." (with optional leading article)
-      - -ST1022 # comment on exported const Foo should be of the form "Foo ..."
       - -QF1008 # could remove embedded field "..." from selector
     # keep-sorted end
   exclusions:
@@ -136,6 +158,7 @@ linters:
       - path: tools/syz-trace2syz
         linters:
         - unused
+        - staticcheck
         - syz-linter
         - godot
       - path: sys/register.go
@@ -147,3 +170,4 @@ linters:
 
 issues:
   max-same-issues: 0
+  max-issues-per-linter: 0

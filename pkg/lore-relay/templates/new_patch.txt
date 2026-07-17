@@ -1,0 +1,23 @@
+{{if .Patch.Authors}}From: {{index .Patch.Authors 0}}
+
+{{end}}{{.Patch.Body}}
+
+---
+{{if .Patch.Changelog}}{{range $i, $c := .Patch.Changelog}}{{if $i}}
+{{end}}v{{$c.Version}}:
+{{if $c.Text}}{{$c.Text}}
+{{end}}{{if $c.Link}}{{$c.Link}}
+{{end}}{{end}}---
+{{end}}{{.Patch.GitDiff}}
+
+base-commit: {{.Patch.BaseCommit}}
+-- 
+{{ if .CanUpstream }}This is an AI-generated patch subject to moderation.
+Reply with '#syz upstream' to Sign-off the patch as a human author
+and send it to the upstream kernel mailing lists.
+Reply with '#syz reject' to reject it ('#syz unreject' to undo).
+
+{{ end }}See {{.DocsLink}} for information about AI-generated patches.
+You can comment on the patch as usual, syzbot will try to address
+the comments and send a new version of the patch if necessary.
+syzbot engineers can be reached at syzkaller@googlegroups.com.

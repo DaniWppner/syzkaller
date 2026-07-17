@@ -13,21 +13,21 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"path/filepath"
-	"slices"
 	"sync"
 	"time"
 
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"github.com/google/syzkaller/pkg/aflow"
+	"github.com/google/syzkaller/pkg/aflow/backend/gemini"
 	_ "github.com/google/syzkaller/pkg/aflow/flow"
 	"github.com/google/syzkaller/pkg/aflow/trajectory"
 	"github.com/google/syzkaller/pkg/log"
-	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/tool"
 	"github.com/google/syzkaller/pkg/updater"
 	"github.com/google/syzkaller/pkg/vcs"
 	"github.com/google/syzkaller/prog"
+	"google.golang.org/genai"
 )
 
 func main() {
@@ -57,11 +57,13 @@ func run(configFile string, exitOnUpgrade, autoUpdate bool, syzkallerDir, name s
 	if name == "" {
 		return fmt.Errorf("agent name must be specified")
 	}
-	kernelConfig, err := os.ReadFile(cfg.KernelConfig)
-	if err != nil {
-		return err
+	for target, tcfg := range cfg.Targets {
+		kernelConfig, err := os.ReadFile(tcfg.KernelConfig)
+		if err != nil {
+			return fmt.Errorf("failed to read kernel config for target %v: %w", target, err)
+		}
+		tcfg.kernelConfigData = string(kernelConfig)
 	}
-	cfg.kernelConfigData = string(kernelConfig)
 
 	if cfg.HTTP != "" {
 		tool.ServeHTTP(cfg.HTTP)
@@ -71,7 +73,7 @@ func run(configFile string, exitOnUpgrade, autoUpdate bool, syzkallerDir, name s
 	var upd *updater.Updater
 
 	if syzkallerDir == "" {
-		upd, err = setupUpdater(cfg, cfg.Target, exitOnUpgrade)
+		upd, err = setupUpdater(cfg, exitOnUpgrade)
 		if err != nil {
 			return err
 		}
@@ -99,7 +101,15 @@ func run(configFile string, exitOnUpgrade, autoUpdate bool, syzkallerDir, name s
 	}
 
 	if cfg.MCP {
-		http.Handle("/", mcpHandler(initState(cfg, syzkallerDir), workdir, cache))
+		if len(cfg.Targets) != 1 {
+			return fmt.Errorf("in the MCP mode, exactly one target must be specified")
+		}
+		var target *TargetConfig
+		for _, tcfg := range cfg.Targets {
+			target = tcfg
+			break
+		}
+		http.Handle("/", mcpHandler(initState(target, syzkallerDir, name), workdir, cache))
 		select {}
 	}
 
@@ -112,9 +122,7 @@ func run(configFile string, exitOnUpgrade, autoUpdate bool, syzkallerDir, name s
 
 	ctx, stop := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		for {
 			ok, err := s.poll(ctx)
 			if err != nil {
@@ -133,7 +141,7 @@ func run(configFile string, exitOnUpgrade, autoUpdate bool, syzkallerDir, name s
 			case <-time.After(delay):
 			}
 		}
-	}()
+	})
 
 	select {
 	case <-shutdownPending:
@@ -154,9 +162,8 @@ func run(configFile string, exitOnUpgrade, autoUpdate bool, syzkallerDir, name s
 
 func reportBuildError(commit *vcs.Commit, buildErr error) {
 	var output []byte
-	var verbose *osutil.VerboseError
 	title := buildErr.Error()
-	if errors.As(buildErr, &verbose) {
+	if verbose, ok := errors.AsType[*osutil.VerboseError](buildErr); ok {
 		output = verbose.Output
 	}
 	path, err := osutil.WriteTempFile(output)
@@ -168,13 +175,9 @@ func reportBuildError(commit *vcs.Commit, buildErr error) {
 		commit.Hash, title, path)
 }
 
-func setupUpdater(cfg *Config, target string, exitOnUpgrade bool) (*updater.Updater, error) {
-	osVal, vmarch, arch, _, _, err := mgrconfig.SplitTarget(target)
-	if err != nil {
-		return nil, err
-	}
+func setupUpdater(cfg *Config, exitOnUpgrade bool) (*updater.Updater, error) {
 	buildSem := osutil.NewSemaphore(1)
-	return updater.New(&updater.Config{
+	cfgUpdater := &updater.Config{
 		ReportBuildError: func(commit *vcs.Commit, _ string, buildErr error) {
 			reportBuildError(commit, buildErr)
 		},
@@ -182,15 +185,17 @@ func setupUpdater(cfg *Config, target string, exitOnUpgrade bool) (*updater.Upda
 		BuildSem:        buildSem,
 		SyzkallerRepo:   cfg.SyzkallerRepo,
 		SyzkallerBranch: cfg.SyzkallerBranch,
-		Targets: map[updater.Target]bool{
-			{
-				OS:     osVal,
-				VMArch: vmarch,
-				Arch:   arch,
-			}: true,
-		},
-		MakeTargets: []string{"agent"},
-	})
+		Targets:         make(map[updater.Target]bool),
+		MakeTargets:     []string{"agent"},
+	}
+	for _, tcfg := range cfg.Targets {
+		cfgUpdater.Targets[updater.Target{
+			OS:     tcfg.TargetOS,
+			VMArch: tcfg.TargetVMArch,
+			Arch:   tcfg.TargetArch,
+		}] = true
+	}
+	return updater.New(cfgUpdater)
 }
 
 type Server struct {
@@ -210,8 +215,7 @@ func (s *Server) poll(ctx context.Context) (bool, error) {
 		CodeRevision: prog.GitRevision,
 	}
 	for _, flow := range aflow.Flows {
-		if len(s.cfg.Workflows) != 0 && !slices.Contains(s.cfg.Workflows, flow.Name) ||
-			s.modelOverQuota(flow) {
+		if s.modelOverQuota(flow) {
 			continue
 		}
 		req.Workflows = append(req.Workflows, dashapi.AIWorkflow{
@@ -287,17 +291,70 @@ func (s *Server) executeJob(ctx context.Context, req *dashapi.AIJobPollResp) (ou
 	if flow == nil {
 		return nil, fmt.Errorf("unsupported flow %q", req.Workflow)
 	}
-	inputs := initState(s.cfg, s.syzkallerDir)
+	agentOS, _ := req.Args["TargetOS"].(string)
+	agentArch, _ := req.Args["TargetArch"].(string)
+
+	var tcfg *TargetConfig
+	for _, t := range s.cfg.Targets {
+		if t.TargetOS == agentOS && t.TargetArch == agentArch {
+			tcfg = t
+			break
+		}
+	}
+	if tcfg == nil {
+		return nil, aflow.FlowError(fmt.Errorf("dashboard requested TargetOS %q TargetArch %q, but agent does not support it",
+			agentOS, agentArch))
+	}
+
+	inputs := initState(tcfg, s.syzkallerDir, s.name)
 	maps.Insert(inputs, maps.All(req.Args))
+
 	onEvent := func(span *trajectory.Span) error {
 		log.Logf(0, "%v", span)
+
+		// The trajectory files should contain the model fallback pool, but the dashboard
+		// should not display it for start spans, so we filter it out here.
+		sendSpan := *span
+		if span.Finished.IsZero() && span.Model != "" {
+			sendSpan.Model = ""
+		}
+
 		return s.dash.AITrajectoryLog(&dashapi.AITrajectoryReq{
 			AgentName: s.cfg.DashboardClient,
 			JobID:     req.ID,
-			Span:      span,
+			Span:      &sendSpan,
 		})
 	}
-	return flow.Execute(ctx, s.cfg.Model, s.workdir, inputs, s.cache, onEvent)
+	backend := s.cfg.DefaultBackend
+	if b, ok := s.cfg.WorkflowBackends[req.Workflow]; ok {
+		backend = b
+	}
+
+	geminiCfg := gemini.Config{
+		ModelOverride: s.cfg.Model,
+	}
+	switch backend {
+	case backendVertex:
+		geminiCfg.ClientConfig = &genai.ClientConfig{
+			Backend: genai.BackendVertexAI,
+			Project: s.cfg.CloudProject,
+		}
+	case backendGemini, "":
+		if s.cfg.GeminiAPIKey != "" {
+			geminiCfg.ClientConfig = &genai.ClientConfig{
+				APIKey: s.cfg.GeminiAPIKey,
+			}
+		}
+	default:
+		return nil, fmt.Errorf("unknown LLM backend %q configured for workflow %q", backend, req.Workflow)
+	}
+
+	provider, err := gemini.NewProvider(ctx, geminiCfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize LLM provider: %w", err)
+	}
+	defer provider.Close()
+	return flow.Execute(ctx, provider, s.workdir, false, inputs, s.cache, onEvent)
 }
 
 func (s *Server) modelOverQuota(flow *aflow.Flow) bool {
@@ -321,14 +378,16 @@ func (s *Server) resetModelQuota() {
 	}
 }
 
-func initState(cfg *Config, syzkallerDir string) map[string]any {
+func initState(cfg *TargetConfig, syzkallerDir, agentName string) map[string]any {
 	return map[string]any{
-		"Syzkaller":       osutil.Abs(syzkallerDir),
-		"Image":           cfg.Image,
-		"Type":            cfg.Type,
-		"VM":              cfg.VM,
-		"KernelConfig":    cfg.kernelConfigData,
-		"FixedBaseCommit": cfg.FixedBaseCommit,
-		"FixedRepository": cfg.FixedRepository,
+		"AgentName":    agentName,
+		"TargetOS":     cfg.TargetOS,
+		"TargetArch":   cfg.TargetArch,
+		"Syzkaller":    osutil.Abs(syzkallerDir),
+		"Image":        cfg.Image,
+		"Type":         cfg.Type,
+		"VM":           cfg.VM,
+		"StraceBin":    cfg.StraceBin,
+		"KernelConfig": cfg.kernelConfigData,
 	}
 }

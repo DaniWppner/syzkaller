@@ -1,5 +1,6 @@
 // Copyright 2025 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+
 package kfuzztest
 
 import (
@@ -24,14 +25,6 @@ func NewBuilder(
 	annotations []SyzAnnotation,
 ) *Builder {
 	return &Builder{funcs, structs, constraints, annotations}
-}
-
-func (b *Builder) AddStruct(s SyzStruct) {
-	b.structs = append(b.structs, s)
-}
-
-func (b *Builder) AddFunc(f SyzFunc) {
-	b.funcs = append(b.funcs, f)
 }
 
 func (b *Builder) EmitSyzlangDescription() (string, error) {

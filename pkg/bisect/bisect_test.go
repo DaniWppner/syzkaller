@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/google/syzkaller/pkg/build"
 	"github.com/google/syzkaller/pkg/debugtracer"
@@ -92,7 +93,7 @@ func (env *testEnv) Test(numVMs int, reproSyz, reproOpts, reproC []byte, collect
 
 	fixed := false
 	if env.test.fixCommit != "" {
-		commit, err := env.r.GetCommitByTitle(env.test.fixCommit)
+		commit, err := env.r.GetCommitByTitle(env.test.fixCommit, time.Time{})
 		if err != nil {
 			return ret, err
 		}
@@ -101,7 +102,7 @@ func (env *testEnv) Test(numVMs int, reproSyz, reproOpts, reproC []byte, collect
 
 	introduced := true
 	if env.test.introduced != "" {
-		commit, err := env.r.GetCommitByTitle(env.test.introduced)
+		commit, err := env.r.GetCommitByTitle(env.test.introduced, time.Time{})
 		if err != nil {
 			return ret, err
 		}
@@ -118,6 +119,7 @@ func (env *testEnv) Test(numVMs int, reproSyz, reproOpts, reproC []byte, collect
 		}
 		return ret, nil
 	}
+	// Zero-value results represent VMs where the test completed without a crash.
 	ret = make([]instance.EnvTestResult, numVMs)
 	if env.test.injectSyzFailure {
 		ret[0] = instance.EnvTestResult{
@@ -155,8 +157,7 @@ func (env *testEnv) headCommit() int {
 	return int(commit)
 }
 
-func createTestRepo(t *testing.T) string {
-	baseDir := t.TempDir()
+func createTestRepo(t *testing.T, baseDir string) string {
 	repo := vcs.CreateTestRepo(t, baseDir, "")
 	if !repo.SupportsBisection() {
 		t.Skip("bisection is unsupported by git (probably too old version)")
@@ -209,7 +210,7 @@ func testBisection(t *testing.T, baseDir string, test BisectionTest) {
 	} else {
 		r.SwitchCommit("master")
 	}
-	sc, err := r.GetCommitByTitle(fmt.Sprint(test.startCommit))
+	sc, err := r.GetCommitByTitle(fmt.Sprint(test.startCommit), time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -741,7 +742,7 @@ func TestBisectionResults(t *testing.T) {
 				select {
 				case repoDir = <-repoCache:
 				default:
-					repoDir = createTestRepo(tt)
+					repoDir = createTestRepo(t, tt.TempDir())
 				}
 				defer func() {
 					repoCache <- repoDir

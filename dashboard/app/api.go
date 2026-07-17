@@ -62,10 +62,13 @@ var apiHandlers = map[string]APIHandler{
 	"save_discussion":       globalHandler(apiSaveDiscussion),
 	"create_upload_url":     globalHandler(apiCreateUploadURL),
 	"send_email":            globalHandler(apiSendEmail),
+	"ai_report_command":     globalHandler(apiAIReportCommand),
+	"ai_poll_report":        globalHandler(apiAIPollReport),
+	"ai_confirm_report":     globalHandler(apiAIConfirmReport),
 	"ai_job_poll":           globalHandler(apiAIJobPoll),
 	"ai_job_done":           globalHandler(apiAIJobDone),
 	"ai_trajectory_log":     globalHandler(apiAITrajectoryLog),
-	"save_coverage":         gcsPayloadHandler(apiSaveCoverage),
+	"save_coverage":         gcsPayloadHandler(globalPayloadHandler(apiSaveCoverage)),
 	"upload_build":          nsHandler(apiUploadBuild),
 	"builder_poll":          nsHandler(apiBuilderPoll),
 	"report_build_error":    nsHandler(apiReportBuildError),
@@ -218,6 +221,17 @@ func gcsPayloadHandler(handler APIHandler) APIHandler {
 		// We don't guarantee all the data will be read - let's ignore.
 		defer gz.Close()
 		return handler(ctx, gz)
+	}
+}
+
+func globalPayloadHandler(handler APIHandler) APIHandler {
+	return func(ctx context.Context, payload io.Reader) (any, error) {
+		ns := apiContext(ctx).ns
+		if ns != "" {
+			return nil, fmt.Errorf("must not be called within a namespace")
+		}
+		apiContext(ctx).nsChecked = true
+		return handler(ctx, payload)
 	}
 }
 
@@ -1796,7 +1810,6 @@ func recordEmergencyStop(ctx context.Context) error {
 // Share crash logs for non-reproduced bugs with syz-managers.
 // In future, this can also take care of repro exchange between instances
 // in the place of syz-hub.
-
 func apiReproTaskDone(ctx context.Context, ns string, req *dashapi.ReproTaskDoneReq) (any, error) {
 	taskKey := db.NewKey(ctx, "ReproTask", "", req.ReqID, nil)
 	task := new(ReproTask)

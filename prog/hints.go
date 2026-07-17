@@ -22,6 +22,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"maps"
 	"slices"
 	"sync"
 
@@ -75,7 +76,7 @@ func (m CompMap) Len() int {
 	return count
 }
 
-// InplaceIntersect() only leaves the value pairs that are also present in other.
+// InplaceIntersect only leaves the value pairs that are also present in other.
 func (m CompMap) InplaceIntersect(other CompMap) {
 	for val1, nested := range m {
 		for val2, pcs := range nested {
@@ -94,7 +95,7 @@ func (m CompMap) InplaceIntersect(other CompMap) {
 	}
 }
 
-// Mutates the program using the comparison operands stored in compMaps.
+// MutateWithHints mutates the program using the comparison operands stored in compMaps.
 // For each of the mutants executes the exec callback.
 // The callback must return whether we should continue substitution (true)
 // or abort the process (false).
@@ -374,11 +375,7 @@ func shrinkExpand(v uint64, compMap CompMap, bitsize uint64, image bool) []uint6
 	if replacers == nil {
 		return nil
 	}
-	res := make([]uint64, 0, len(replacers))
-	for v := range replacers {
-		res = append(res, v)
-	}
-	slices.Sort(res)
+	res := slices.Sorted(maps.Keys(replacers))
 	return res
 }
 

@@ -102,8 +102,7 @@ func MakeBootError(err error, output []byte) error {
 		// was collected, but turned out to be empty.
 		output = []byte("<empty boot output>")
 	}
-	var verboseError *osutil.VerboseError
-	if errors.As(err, &verboseError) {
+	if verboseError, ok := errors.AsType[*osutil.VerboseError](err); ok {
 		return BootError{verboseError.Error(), append(verboseError.Output, output...)}
 	}
 	return BootError{err.Error(), output}
@@ -113,12 +112,12 @@ func (err BootError) Error() string {
 	return fmt.Sprintf("%v\n%s", err.Title, err.Output)
 }
 
-func (err BootError) BootError() (string, []byte) {
+func (err BootError) Details() (string, []byte) {
 	return err.Title, err.Output
 }
 
-// By default, all Pool.Create() errors are related to infrastructure problems.
-// InfraError is to be used when we want to also attach output to the title.
+// InfraError is used when we want to attach console output to the error title.
+// By default, all Pool.Create() errors are treated as infrastructure problems.
 type InfraError struct {
 	Title  string
 	Output []byte
@@ -128,7 +127,7 @@ func (err InfraError) Error() string {
 	return fmt.Sprintf("%v\n%s", err.Title, err.Output)
 }
 
-func (err InfraError) InfraError() (string, []byte) {
+func (err InfraError) Details() (string, []byte) {
 	return err.Title, err.Output
 }
 
@@ -152,8 +151,9 @@ type ctorFunc func(env *Env) (Pool, error)
 
 var (
 	// Close to interrupt all pending operations in all VMs.
-	Shutdown   = make(chan struct{})
-	ErrTimeout = errors.New("timeout")
+	Shutdown     = make(chan struct{})
+	ErrTimeout   = errors.New("timeout")
+	ErrPreempted = errors.New("instance is preempted")
 
 	Types = make(map[string]Type)
 )
@@ -170,11 +170,11 @@ func (cc CmdCloser) Close() error {
 var WaitForOutputTimeout = 10 * time.Second
 
 type MultiplexConfig struct {
-	Console     io.Closer
-	Close       <-chan bool
-	Debug       bool
-	Scale       time.Duration
-	IgnoreError func(err error) bool
+	Console         io.Closer
+	Close           <-chan bool
+	Debug           bool
+	Scale           time.Duration
+	PreemptionError func(err error) bool
 }
 
 func Multiplex(ctx context.Context, cmd *exec.Cmd, merger *OutputMerger, config MultiplexConfig) (
@@ -206,8 +206,8 @@ func Multiplex(ctx context.Context, cmd *exec.Cmd, merger *OutputMerger, config 
 				// If the command exited successfully, we got EOF error from merger.
 				// But in this case no error has happened and the EOF is expected.
 				err = nil
-			} else if config.IgnoreError != nil && config.IgnoreError(err) {
-				err = ErrTimeout
+			} else if config.PreemptionError != nil && config.PreemptionError(err) {
+				err = ErrPreempted
 			}
 			// Once the command has failed, we might want to let the full console
 			// output accumulate before we abort the console connection too.
@@ -281,8 +281,7 @@ func UnusedTCPPort() int {
 		// Although we exclude ports <1024 in RandomPort(), it's still possible that we can face a restricted port.
 		var opErr *net.OpError
 		if errors.As(err, &opErr) && opErr.Op == "listen" {
-			var syscallErr *os.SyscallError
-			if errors.As(opErr.Err, &syscallErr) {
+			if syscallErr, ok := errors.AsType[*os.SyscallError](opErr.Err); ok {
 				if errors.Is(syscallErr.Err, syscall.EADDRINUSE) || errors.Is(syscallErr.Err, syscall.EACCES) {
 					continue
 				}
@@ -292,7 +291,7 @@ func UnusedTCPPort() int {
 	}
 }
 
-// Escapes double quotes(and nested double quote escapes). Ignores any other escapes.
+// EscapeDoubleQuotes escapes double quotes (and nested double quote escapes). Ignores any other escapes.
 // Reference: https://www.gnu.org/software/bash/manual/html_node/Double-Quotes.html
 func EscapeDoubleQuotes(inp string) string {
 	var ret strings.Builder

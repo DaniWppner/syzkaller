@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/google/syzkaller/pkg/tool"
@@ -47,7 +48,6 @@ func checkCommentSpace() {
 }
 
 //No space.			// want "Use either //<one-or-more-spaces>comment or //<one-or-more-tabs>comment format for comments"
-
 func funcArgsGood(a, b int) (int, int) {
 	return 0, 0
 }
@@ -249,5 +249,98 @@ func whileStyleLoops() {
 	l := 0
 	for l <= 10 {
 		l++
+	}
+}
+
+func mapKeysExtraction() {
+	m := make(map[string]int)
+	var keys []string
+	for k := range m { // want "Use maps.Keys and slices.Sort instead of a manual loop"
+		keys = append(keys, k)
+	}
+	sort.Strings(keys) // want "Use slices.Sort instead of sort.Strings"
+}
+
+func mapKeysExtractionNoSort() {
+	m := make(map[string]int)
+	var keys []string
+	for k := range m {
+		keys = append(keys, k)
+	}
+}
+
+func stringsCut() {
+	s := "foo/bar"
+	if pos := strings.Index(s, "/"); pos != -1 { // want "Use strings.Cut instead of strings.Index/IndexByte and manual slicing"
+		_ = s[:pos]
+	}
+	if pos := strings.IndexByte(s, '/'); pos != -1 { // want "Use strings.Cut instead of strings.Index/IndexByte and manual slicing"
+		_ = s[:pos]
+	}
+	if pos := strings.Index(s, "/"); pos != -1 {
+		// Just use pos, not for slicing.
+		_ = pos
+	}
+}
+
+// Missing empty lines between declarations.
+func missingEmptyLine1() {
+}
+func missingEmptyLine2() { // want "Keep one empty line between top-level declarations"
+}
+type MissingEmptyLineStruct struct { // want "Keep one empty line between top-level declarations"
+}
+
+// Comment for func 3
+func missingEmptyLine3() {
+}
+
+// Single-line functions can be grouped.
+func grouped1() {}
+func grouped2() {}
+func grouped3() {}
+
+func multiLineGrouped() {
+}
+func grouped4() {} // want "Keep one empty line between top-level declarations"
+
+func grouped5() {}
+func multiLineGrouped2() { // want "Keep one empty line between top-level declarations"
+}
+
+func twoEmptyLines1() {}
+
+
+func twoEmptyLines2() {} // want "Keep one empty line between top-level declarations"
+
+type groupedType1 struct {
+}
+
+// Stand-alone comment that is not groupedType2 Doc.
+
+type groupedType2 struct {
+}
+
+// Declarations of different types shouldn't be grouped.
+func groupedFunc() {}
+type groupedType struct{} // want "Keep one empty line between top-level declarations"
+const groupedConst = 1 // want "Keep one empty line between top-level declarations"
+
+type StructLayout struct {
+	A int
+	B int
+	C int
+}
+
+func testStructLayout() {
+	_ = StructLayout{A: 1, B: 2, C: 3}
+	_ = StructLayout{ // want "multi-line struct initialization must have one field per line"
+		A: 1, B: 2,
+		C: 3,
+	}
+	_ = StructLayout{
+		A: 1,
+		B: 2,
+		C: 3,
 	}
 }

@@ -1,16 +1,20 @@
 // Copyright 2024 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package api defines the core data types, client interfaces, and request/response structures
+// used for communication between components and workflow steps.
 package api
 
 import "time"
 
-// The output passed to other workflow steps.
+// TriageResult is the output passed to other workflow steps.
 type TriageResult struct {
 	// If set, ignore the patch series completely.
 	SkipReason string `json:"skip_reason"`
 	// Fuzzing configuration to try (NULL if nothing).
 	Targets []*TestTarget `json:"targets"`
+	// Aflow Trajectory.
+	Trajectory []byte `json:"trajectory,omitempty"`
 }
 
 // TestTarget groups the testing tasks that share the same base/patched builds.
@@ -38,15 +42,18 @@ const (
 // FuzzConfig represents a set of parameters passed to the fuzz step.
 // The triage step aggregates multiple KernelFuzzConfig to construct FuzzConfig.
 type FuzzConfig struct {
-	Focus      []string `json:"focus" yaml:"focus"`
-	CorpusURLs []string `json:"corpus_urls" yaml:"corpus_urls"`
+	Focus []string `json:"focus" yaml:"focus"`
+	// TODO: this is temporarily here. We should do it at the beginning of the fuzzing step,
+	// where we do have the built binary and can extract exact symbol names / PC symbols.
+	FocusSymbols []string `json:"focus_symbols" yaml:"focus_symbols"`
+	CorpusURLs   []string `json:"corpus_urls" yaml:"corpus_urls"`
 	// Don't expect kernel coverage for the patched area.
 	SkipCoverCheck bool `json:"skip_cover_check" yaml:"skip_cover_check"`
 	// Only report the bugs that match the regexp.
 	BugTitleRe string `json:"bug_title_re" yaml:"bug_title_re"`
 }
 
-// The triage step of the workflow will request these from controller.
+// Tree represents a git tree. The triage step of the workflow will request these from controller.
 type Tree struct {
 	Name       string   `json:"name" yaml:"name"` // Primary key.
 	URL        string   `json:"URL" yaml:"URL"`
@@ -73,13 +80,14 @@ type FuzzTriageTarget struct {
 }
 
 type BuildRequest struct {
-	Arch       string `json:"arch"`
-	TreeName   string `json:"tree_name"`
-	TreeURL    string `json:"tree_url"`
-	CommitHash string `json:"commit_hash"`
-	ConfigName string `json:"config_name"` // These are known to both the triage and build steps.
-	SeriesID   string `json:"series_id"`
-	JobID      string `json:"job_id,omitempty"`
+	Arch          string   `json:"arch"`
+	TreeName      string   `json:"tree_name"`
+	TreeURL       string   `json:"tree_url"`
+	CommitHash    string   `json:"commit_hash"`
+	ConfigName    string   `json:"config_name"` // These are known to both the triage and build steps.
+	EnableConfigs []string `json:"enable_configs,omitempty"`
+	SeriesID      string   `json:"series_id"`
+	JobID         string   `json:"job_id,omitempty"`
 }
 
 // BuildResult is returned from the build workflow step.
@@ -185,9 +193,19 @@ type SeriesPatch struct {
 }
 
 type NewSession struct {
-	ExtID string   `json:"ext_id"`
-	Tags  []string `json:"tags"`
+	ExtID         string      `json:"ext_id"`
+	Tags          []string    `json:"tags"`
+	DirectRequest bool        `json:"direct_request"`
+	ReportLevel   ReportLevel `json:"report_level,omitempty"`
 }
+
+type ReportLevel string
+
+const (
+	ReportLevelAll  ReportLevel = "all"
+	ReportLevelBugs ReportLevel = "bugs"
+	ReportLevelNone ReportLevel = "none"
+)
 
 type ReportType string
 
@@ -274,6 +292,9 @@ type Job struct {
 }
 
 type SessionInfo struct {
-	Series *Series `json:"series"`
-	Job    *Job    `json:"job,omitempty"`
+	Series              *Series `json:"series"`
+	Job                 *Job    `json:"job,omitempty"`
+	Direct              bool    `json:"direct"`
+	TriageLogURI        string  `json:"triage_log_uri,omitempty"`
+	TriageTrajectoryURI string  `json:"triage_trajectory_uri,omitempty"`
 }

@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -224,11 +225,11 @@ func (bug *Bug) hasUserSubsystems() bool {
 	return bug.HasUserLabel(SubsystemLabel)
 }
 
+// Bug202304 is a legacy struct used for bug conversion.
 // Initially, subsystem labels were stored as Tags.Subsystems, but over time
 // it turned out that we'd better store all labels together.
 // Let's keep this conversion code until "Tags" are removed from all bugs.
 // Then it can be removed.
-
 type Bug202304 struct {
 	Tags BugTags202304
 }
@@ -483,6 +484,12 @@ type DiscussionMessage struct {
 // ReportingState holds dynamic info associated with reporting.
 type ReportingState struct {
 	Entries []ReportingStateEntry
+	Emails  EmailState
+}
+
+type EmailState struct {
+	Count int
+	Time  time.Time
 }
 
 type ReportingStateEntry struct {
@@ -549,6 +556,7 @@ func (s *SubsystemReportStats) toDashapi() dashapi.BugListReportStats {
 	}
 }
 
+// SubsystemReportStage represents a subsystem report stage.
 // There can be at most two stages.
 // One has Moderation=true, the other one has Moderation=false.
 type SubsystemReportStage struct {
@@ -678,6 +686,7 @@ const (
 	textError        = "Error"
 	textReproLog     = "ReproLog"
 	textFsckLog      = "FsckLog"
+	textJobComment   = "JobComment"
 )
 
 const (
@@ -1033,6 +1042,7 @@ func (bug *Bug) dashapiStatus() (dashapi.BugStatus, error) {
 	return status, nil
 }
 
+// EmergencyStop represents an emergency stop entity.
 // If an entity of type EmergencyStop exists, syzbot's operation is paused until
 // a support engineer deletes it from the DB.
 type EmergencyStop struct {
@@ -1102,12 +1112,7 @@ func timeDate(t time.Time) int {
 }
 
 func stringInList(list []string, str string) bool {
-	for _, s := range list {
-		if s == str {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(list, str)
 }
 
 func stringListsIntersect(a, b []string) bool {

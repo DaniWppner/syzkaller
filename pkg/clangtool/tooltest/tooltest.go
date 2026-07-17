@@ -1,6 +1,7 @@
 // Copyright 2025 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package tooltest provides testing helpers for validating clang tool functionality.
 package tooltest
 
 import (
@@ -86,10 +87,13 @@ func ForEachTestFile(t *testing.T, tool string, fn func(t *testing.T, cfg *clang
 func forEachTestFile(t *testing.T, dir string, fn func(t *testing.T, file string)) {
 	var files []string
 	err := filepath.WalkDir(osutil.Abs(dir), func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
 		if d.Name()[0] != '.' && filepath.Ext(d.Name()) == ".c" {
 			files = append(files, path)
 		}
-		return err
+		return nil
 	})
 	if err != nil {
 		t.Fatal(err)

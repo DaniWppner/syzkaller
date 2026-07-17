@@ -111,9 +111,17 @@ func (sf *SeriesFetcher) Update(ctx context.Context, from time.Time) error {
 
 	var emails []*lore.Email
 	idToReader := map[string]lore.EmailReader{}
+	cfg, err := app.Config()
+	if err != nil {
+		return fmt.Errorf("failed to fetch the config: %w", err)
+	}
 	for _, item := range list {
 		// TODO: this could be done in several threads.
-		email, err := item.Parse(nil, nil)
+		rawBody, err := item.Read()
+		if err != nil {
+			return fmt.Errorf("failed to read email %s: %w", item.Hash, err)
+		}
+		email, err := lore.Parse(rawBody, nil, nil)
 		if err != nil {
 			log.Printf("failed to parse email: %v", err)
 			continue
@@ -130,7 +138,7 @@ func (sf *SeriesFetcher) Update(ctx context.Context, from time.Time) error {
 		if *flagVerbose {
 			logSeries(series)
 		}
-		err := sf.handleSeries(ctx, series, idToReader)
+		err := sf.handleSeries(ctx, cfg, series, idToReader)
 		if err != nil {
 			app.Errorf("failed to save the series: %v", err)
 		}
@@ -138,13 +146,19 @@ func (sf *SeriesFetcher) Update(ctx context.Context, from time.Time) error {
 	return nil
 }
 
-func (sf *SeriesFetcher) handleSeries(ctx context.Context, series *lore.Series,
+func (sf *SeriesFetcher) handleSeries(ctx context.Context, cfg *app.AppConfig, series *lore.Series,
 	idToReader map[string]lore.EmailReader) error {
 	if series.Corrupted != "" {
 		log.Printf("skipping %s because of %q", series.MessageID, series.Corrupted)
 		return nil
 	}
 	first := series.Patches[0]
+	reportLevel := api.ReportLevelAll
+	if first.OwnEmail {
+		// If another bot instance reads the same mailing list, we don't want to
+		// spam it back. So we still fuzz the series, but don't report the results.
+		reportLevel = api.ReportLevelNone
+	}
 	date := first.Date
 	if date.IsZero() || date.After(time.Now()) {
 		// We cannot fully trust dates from the mailing list as some of them are very weird, e.g.
@@ -188,8 +202,21 @@ func (sf *SeriesFetcher) handleSeries(ctx context.Context, series *lore.Series,
 		log.Printf("series %s already exists in the DB", series.MessageID)
 		return nil
 	}
+	var directRequest bool
+	if cfg.DirectList != "" {
+		canonicalDirect := email.CanonicalEmail(cfg.DirectList)
+		for _, addr := range first.RawCc {
+			if email.CanonicalEmail(addr) == canonicalDirect {
+				directRequest = true
+				break
+			}
+		}
+	}
+
 	_, err = sf.client.UploadSession(ctx, &api.NewSession{
-		ExtID: series.MessageID,
+		ExtID:         series.MessageID,
+		DirectRequest: directRequest,
+		ReportLevel:   reportLevel,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to request a fuzzing session: %w", err)
@@ -228,10 +255,8 @@ func logSeries(series *lore.Series) {
 	}
 }
 
+var sanitizeNameRe = regexp.MustCompile("[^a-zA-Z0-9]+")
+
 func sanitizeName(str string) string {
-	reg, err := regexp.Compile("[^a-zA-Z0-9]+")
-	if err != nil {
-		return ""
-	}
-	return reg.ReplaceAllString(str, "")
+	return sanitizeNameRe.ReplaceAllString(str, "")
 }

@@ -194,7 +194,7 @@ func TestParseOptionsCanned(t *testing.T) {
 
 func allOptionsSingle(OS string) []Options {
 	var opts []Options
-	fields := reflect.TypeOf(Options{}).NumField()
+	fields := reflect.TypeFor[Options]().NumField()
 	for i := range fields {
 		// Because of constraints on options, we need some defaults
 		// (e.g. no collide without threaded).
@@ -212,7 +212,7 @@ func allOptionsSingle(OS string) []Options {
 
 func allOptionsPermutations(OS string) []Options {
 	opts := []Options{{}}
-	fields := reflect.TypeOf(Options{}).NumField()
+	fields := reflect.TypeFor[Options]().NumField()
 	for i := range fields {
 		var newOpts []Options
 		for _, opt := range opts {
@@ -284,101 +284,4 @@ func enumerateField(OS string, opt Options, field int) []Options {
 		}
 	}
 	return checked
-}
-
-func TestParseFeaturesFlags(t *testing.T) {
-	tests := []struct {
-		Enable   string
-		Disable  string
-		Default  bool
-		Features map[string]bool
-	}{
-		{"none", "none", true, map[string]bool{
-			"tun":         true,
-			"net_dev":     true,
-			"net_reset":   true,
-			"cgroups":     true,
-			"binfmt_misc": true,
-			"close_fds":   true,
-			"devlink_pci": true,
-			"nic_vf":      true,
-			"usb":         true,
-			"vhci":        true,
-			"wifi":        true,
-			"ieee802154":  true,
-			"sysctl":      true,
-			"swap":        true,
-		}},
-		{"none", "none", false, map[string]bool{}},
-		{"all", "none", true, map[string]bool{
-			"tun":         true,
-			"net_dev":     true,
-			"net_reset":   true,
-			"cgroups":     true,
-			"binfmt_misc": true,
-			"close_fds":   true,
-			"devlink_pci": true,
-			"nic_vf":      true,
-			"usb":         true,
-			"vhci":        true,
-			"wifi":        true,
-			"ieee802154":  true,
-			"sysctl":      true,
-			"swap":        true,
-		}},
-		{"", "none", true, map[string]bool{}},
-		{"none", "all", true, map[string]bool{}},
-		{"none", "", true, map[string]bool{
-			"tun":         true,
-			"net_dev":     true,
-			"net_reset":   true,
-			"cgroups":     true,
-			"binfmt_misc": true,
-			"close_fds":   true,
-			"devlink_pci": true,
-			"nic_vf":      true,
-			"usb":         true,
-			"vhci":        true,
-			"wifi":        true,
-			"ieee802154":  true,
-			"sysctl":      true,
-			"swap":        true,
-		}},
-		{"tun,net_dev", "none", true, map[string]bool{
-			"tun":     true,
-			"net_dev": true,
-		}},
-		{"none", "cgroups,net_dev", true, map[string]bool{
-			"tun":         true,
-			"net_reset":   true,
-			"binfmt_misc": true,
-			"close_fds":   true,
-			"devlink_pci": true,
-			"nic_vf":      true,
-			"usb":         true,
-			"vhci":        true,
-			"wifi":        true,
-			"ieee802154":  true,
-			"sysctl":      true,
-			"swap":        true,
-		}},
-		{"close_fds", "none", true, map[string]bool{
-			"close_fds": true,
-		}},
-		{"swap", "none", true, map[string]bool{
-			"swap": true,
-		}},
-	}
-	for i, test := range tests {
-		features, err := ParseFeaturesFlags(test.Enable, test.Disable, test.Default)
-		if err != nil {
-			t.Fatalf("failed to parse features flags: %v", err)
-		}
-		for name, feature := range features {
-			if feature.Enabled != test.Features[name] {
-				t.Fatalf("test #%v: invalid value for feature flag %s: got %v, want %v",
-					i, name, feature.Enabled, test.Features[name])
-			}
-		}
-	}
 }

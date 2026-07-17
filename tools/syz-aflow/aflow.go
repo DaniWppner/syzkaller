@@ -12,11 +12,14 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 
 	"github.com/google/syzkaller/pkg/aflow"
+	"github.com/google/syzkaller/pkg/aflow/backend"
 	_ "github.com/google/syzkaller/pkg/aflow/flow"
 	"github.com/google/syzkaller/pkg/aflow/trajectory"
 	aflowhtml "github.com/google/syzkaller/pkg/aflow/trajectory/html"
@@ -31,12 +34,15 @@ func main() {
 		flagInput       = flag.String("input", "", "input json file with workflow arguments")
 		flagWorkdir     = flag.String("workdir", "", "directory for kernel checkout, kernel builds, etc")
 		flagModel       = flag.String("model", "", "use this LLM model, if empty use default models")
+		flagProvider    = flag.String("provider", "gemini", "LLM provider to use (gemini, vertex)")
 		flagCacheSize   = flag.String("cache-size", "10GB", "max cache size (e.g. 100MB, 5GB, 1TB)")
 		flagDownloadBug = flag.String("download-bug", "", "extid or id of a bug to download from the dashboard"+
 			" and save into -input file")
 		flagAuth = flag.Bool("auth", false, "use gcloud auth token for downloading bugs (set it up with"+
 			" gcloud auth application-default login)")
-		flagHTML = flag.String("html", "", "write execution trajectory into this local HTML file in real-time")
+		flagHTML   = flag.String("html", "", "write execution trajectory into this local HTML file in real-time")
+		flagOutput = flag.String("output", "", "save final workflow output to this JSON file")
+		flagDebug  = flag.Bool("debug", false, "enable runner debug logging")
 	)
 	defer tool.Init()()
 	if *flagDownloadBug != "" {
@@ -67,24 +73,30 @@ func main() {
 		tool.Fail(err)
 	}
 	if err := run(context.Background(), RunArgs{
-		Model:     *flagModel,
-		FlowName:  *flagFlow,
-		InputFile: *flagInput,
-		Workdir:   *flagWorkdir,
-		HTMLFile:  *flagHTML,
-		CacheSize: cacheSize,
+		Provider:   *flagProvider,
+		Model:      *flagModel,
+		FlowName:   *flagFlow,
+		InputFile:  *flagInput,
+		Workdir:    *flagWorkdir,
+		HTMLFile:   *flagHTML,
+		OutputFile: *flagOutput,
+		CacheSize:  cacheSize,
+		Debug:      *flagDebug,
 	}); err != nil {
 		tool.Failf("%v", osutil.VerboseMessage(err))
 	}
 }
 
 type RunArgs struct {
-	Model     string
-	FlowName  string
-	InputFile string
-	Workdir   string
-	HTMLFile  string
-	CacheSize uint64
+	Provider   string
+	Model      string
+	FlowName   string
+	InputFile  string
+	Workdir    string
+	HTMLFile   string
+	OutputFile string
+	CacheSize  uint64
+	Debug      bool
 }
 
 func run(ctx context.Context, args RunArgs) error {
@@ -130,8 +142,32 @@ func run(ctx context.Context, args RunArgs) error {
 		return nil
 	}
 
-	_, err = flow.Execute(ctx, args.Model, args.Workdir, inputs, cache, onEventFunc)
-	return err
+	var provider backend.Provider
+	factory, ok := providers[args.Provider]
+	if !ok {
+		supported := slices.Sorted(maps.Keys(providers))
+		return fmt.Errorf("unknown provider %q (supported: %v)", args.Provider, supported)
+	}
+	provider, err = factory(ctx, args.Model)
+	if err != nil {
+		return err
+	}
+	defer provider.Close()
+
+	output, err := flow.Execute(ctx, provider, args.Workdir, args.Debug, inputs, cache, onEventFunc)
+	if err != nil {
+		return err
+	}
+	if args.OutputFile != "" {
+		data, err := json.MarshalIndent(output, "", "\t")
+		if err != nil {
+			return fmt.Errorf("failed to marshal output: %w", err)
+		}
+		if err := osutil.WriteFile(args.OutputFile, data); err != nil {
+			return fmt.Errorf("failed to save output: %w", err)
+		}
+	}
+	return nil
 }
 
 func downloadBug(id, inputFile, token string) error {

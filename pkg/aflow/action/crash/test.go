@@ -17,6 +17,7 @@ import (
 	"github.com/google/syzkaller/pkg/aflow/action/kernel"
 	"github.com/google/syzkaller/pkg/hash"
 	"github.com/google/syzkaller/pkg/osutil"
+	"github.com/google/syzkaller/sys/targets"
 )
 
 // TestPatch action does an in-tree kernel build in KernelScratchSrc dir,
@@ -27,6 +28,9 @@ import (
 var TestPatch = aflow.NewFuncAction("test-patch", testPatch)
 
 type testArgs struct {
+	AgentName        string
+	TargetOS         string
+	TargetArch       string
 	Syzkaller        string
 	Image            string
 	Type             string
@@ -69,39 +73,62 @@ func testPatch(ctx *aflow.Context, args testArgs) (testResult, error) {
 	type Cached struct {
 		TestError string
 	}
-	cached, err := aflow.CacheObject(ctx, "patch-test", desc, func() (Cached, error) {
-		var res Cached
-		if err := kernel.BuildKernel(args.KernelScratchSrc, args.KernelScratchSrc, args.KernelConfig, false); err != nil {
-			res.TestError = fmt.Sprintf("Building the kernel failed with %v", err)
-			return res, nil
+	cached, _, err := aflow.CacheObject(ctx, "patch-test", desc, func() (Cached, error) {
+		for _, fn := range []func(ctx *aflow.Context, args testArgs) (string, error){
+			testPatchBuild,
+			testPatchRepro,
+		} {
+			testError, err := fn(ctx, args)
+			if err != nil || testError != "" {
+				return Cached{testError}, err
+			}
 		}
-		workdir, err := ctx.TempDir()
-		if err != nil {
-			return res, err
-		}
-		reproduceArgs := ReproduceArgs{
-			Syzkaller:    args.Syzkaller,
-			Image:        args.Image,
-			Type:         args.Type,
-			VM:           args.VM,
-			ReproOpts:    args.ReproOpts,
-			ReproSyz:     args.ReproSyz,
-			ReproC:       args.ReproC,
-			KernelSrc:    args.KernelScratchSrc,
-			KernelObj:    args.KernelScratchSrc,
-			KernelCommit: args.KernelCommit,
-			KernelConfig: args.KernelConfig,
-		}
-		testRes, err := RunTest(reproduceArgs, workdir, false)
-		if testRes.Report != nil {
-			res.TestError = string(testRes.Report.Report)
-		} else {
-			res.TestError = testRes.BootError
-		}
-		return res, err
+		return Cached{}, nil
 	})
 	res.TestError = cached.TestError
 	return res, err
+}
+
+func testPatchBuild(ctx *aflow.Context, args testArgs) (string, error) {
+	if err := kernel.BuildKernel(args.KernelScratchSrc, args.KernelScratchSrc,
+		args.KernelConfig, args.TargetOS, args.TargetArch, false); err != nil {
+		// TODO: should distinguish between infra errors, and patch compilation errors.
+		return fmt.Sprintf("Building the kernel failed with: %v", err), nil
+	}
+	return "", nil
+}
+
+func testPatchRepro(ctx *aflow.Context, args testArgs) (string, error) {
+	if args.TargetOS != targets.Linux {
+		return "", aflow.FlowError(fmt.Errorf("can only run on the Linux kernel"))
+	}
+	workdir, err := ctx.TempDir()
+	if err != nil {
+		return "", err
+	}
+	reproduceArgs := ReproduceArgs{
+		AgentName:    args.AgentName,
+		TargetArch:   args.TargetArch,
+		Syzkaller:    args.Syzkaller,
+		Image:        args.Image,
+		Type:         args.Type,
+		VM:           args.VM,
+		ReproOpts:    args.ReproOpts,
+		ReproSyz:     args.ReproSyz,
+		ReproC:       args.ReproC,
+		KernelSrc:    args.KernelScratchSrc,
+		KernelObj:    args.KernelScratchSrc,
+		KernelCommit: args.KernelCommit,
+		KernelConfig: args.KernelConfig,
+	}
+	testRes, err := RunTest(reproduceArgs, workdir, false)
+	if err != nil {
+		return "", err
+	}
+	if testRes.Report != nil {
+		return string(testRes.Report.Report), nil
+	}
+	return testRes.BootError, nil
 }
 
 func currentDiff(repo string) (string, error) {

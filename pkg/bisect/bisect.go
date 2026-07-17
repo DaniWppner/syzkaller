@@ -1,6 +1,7 @@
 // Copyright 2018 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package bisect automates bisection of kernel commit histories to identify bug-introducing commits.
 package bisect
 
 import (
@@ -384,7 +385,7 @@ func (env *env) identifyRewrittenCommit() (string, error) {
 			"commit %v not reachable in branch '%v' and no commit title available",
 			cfg.Kernel.Commit, cfg.Kernel.Branch)
 	}
-	commit, err := env.repo.GetCommitByTitle(cfg.Kernel.CommitTitle)
+	commit, err := env.repo.GetCommitByTitle(cfg.Kernel.CommitTitle, time.Time{})
 	if err != nil {
 		return cfg.Kernel.Commit, err
 	}
@@ -656,12 +657,10 @@ func (env *env) test() (*testResult, error) {
 	}
 	if err != nil {
 		errInfo := fmt.Sprintf("failed building %v: ", current.Hash)
-		var verr *osutil.VerboseError
-		var kerr *build.KernelError
-		if errors.As(err, &verr) {
+		if verr, ok := errors.AsType[*osutil.VerboseError](err); ok {
 			errInfo += verr.Error()
 			env.saveDebugFile(current.Hash, 0, verr.Output)
-		} else if errors.As(err, &kerr) {
+		} else if kerr, ok := errors.AsType[*build.KernelError](err); ok {
 			errInfo += string(kerr.Report)
 			env.saveDebugFile(current.Hash, 0, kerr.Output)
 		} else {

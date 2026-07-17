@@ -1,6 +1,7 @@
 // Copyright 2018 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package html provides HTML formatting and template execution helpers for the dashboard UI.
 package html
 
 import (
@@ -8,6 +9,7 @@ import (
 	"html/template"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	texttemplate "text/template"
 	"time"
@@ -30,9 +32,13 @@ var globSearchPath = func() string {
 }()
 
 // SetGlobSearchPath overrides the default path where syzkaller looks for templates.
-// Used externally - do not remove.
 func SetGlobSearchPath(path string) {
 	globSearchPath = path
+}
+
+func init() {
+	// Used externally - do not remove.
+	runtime.KeepAlive(SetGlobSearchPath)
 }
 
 func CreateGlob(glob string) *template.Template {

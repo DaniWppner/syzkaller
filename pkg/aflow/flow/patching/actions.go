@@ -14,19 +14,17 @@ import (
 	"github.com/google/syzkaller/pkg/aflow"
 	"github.com/google/syzkaller/pkg/aflow/action/kernel"
 	"github.com/google/syzkaller/pkg/aflow/ai"
-	"github.com/google/syzkaller/pkg/csource"
 	"github.com/google/syzkaller/pkg/email"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/vcs"
-	"github.com/google/syzkaller/prog"
 )
 
 var baseCommitPicker = aflow.NewFuncAction("base-commit-picker", pickBaseCommit)
 
 type baseCommitArgs struct {
-	// Can be used to override the selected base commit (for manual testing).
-	FixedBaseCommit string
-	FixedRepository string
+	BaseRepository string
+	BaseBranch     string
+	BaseCommit     string
 }
 
 type baseCommitResult struct {
@@ -36,86 +34,52 @@ type baseCommitResult struct {
 }
 
 func pickBaseCommit(ctx *aflow.Context, args baseCommitArgs) (baseCommitResult, error) {
-	// Currently we use the latest RC of the mainline tree as the base.
-	// This is a reasonable choice overall in lots of cases, and it enables good caching
-	// of all artifacts (we need to rebuild them only approx every week).
-	// Potentially we can use subsystem trees for few important, well-maintained subsystems
-	// (mm, net, etc). However, it will work poorly for all subsystems. First, there is no
-	// machine-usable mapping of subsystems to repo/branch; second, lots of them are poorly
-	// maintained (can be much older than latest RC); third, it will make artifact caching
-	// much worse.
-	// In the future we ought to support automated rebasing of patches to requested trees/commits.
-	// We need it anyway, but it will also alleviate imperfect base commit picking.
-	const (
-		baseRepo   = "git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
-		baseBranch = "master"
-	)
-
-	res := baseCommitResult{
-		KernelRepo:   baseRepo,
-		KernelBranch: baseBranch,
-		KernelCommit: args.FixedBaseCommit,
-	}
-	if args.FixedRepository != "" {
-		res.KernelRepo = args.FixedRepository
-	}
-	if args.FixedBaseCommit != "" {
-		return res, nil
-	}
-
+	commit := ""
 	err := kernel.UseLinuxRepo(ctx, func(_ string, repo vcs.Repo) error {
-		head, err := repo.Poll(baseRepo, baseBranch)
+		head, err := repo.CheckoutBranch(args.BaseRepository, args.BaseBranch)
 		if err != nil {
 			return err
 		}
-		tag, err := repo.ReleaseTag(head.Hash)
-		if err != nil {
-			return err
+		switch args.BaseCommit {
+		case "HEAD":
+			commit = head.Hash
+		case "RC":
+			// FetchTags is called to force fetch the tags.
+			// See the discussion at https://github.com/google/syzkaller/pull/7385.
+			if err := repo.FetchTags(args.BaseRepository); err != nil {
+				return fmt.Errorf("failed to fetch tags: %w", err)
+			}
+			tag, err := repo.ReleaseTag(head.Hash)
+			if err != nil {
+				return err
+			}
+			com, err := repo.SwitchCommit(tag)
+			if err != nil {
+				return err
+			}
+			commit = com.Hash
+		default:
+			com, err := repo.SwitchCommit(args.BaseCommit)
+			if err != nil {
+				return err
+			}
+			commit = com.Hash
 		}
-		com, err := repo.SwitchCommit(tag)
-		if err != nil {
-			return err
-		}
-		res.KernelCommit = com.Hash
 		return err
 	})
-	return res, err
-}
-
-var syzlangToC = aflow.NewFuncAction("syzlang-to-c", syzlangToCFunc)
-
-type syzlangToCArgs struct {
-	ReproSyz string
-}
-
-type syzlangToCResult struct {
-	SimplifiedCRepro string
-}
-
-func syzlangToCFunc(ctx *aflow.Context, args syzlangToCArgs) (syzlangToCResult, error) {
-	if args.ReproSyz == "" {
-		return syzlangToCResult{}, errors.New("syz repro is missing")
-	}
-	pt, err := prog.GetTarget("linux", "amd64")
-	if err != nil {
-		return syzlangToCResult{}, fmt.Errorf("failed to get target linux/amd64: %w", err)
-	}
-	p, err := pt.Deserialize([]byte(args.ReproSyz), prog.NonStrict)
-	if err != nil {
-		return syzlangToCResult{}, fmt.Errorf("failed to parse syz repro: %w", err)
-	}
-	cData, err := csource.WriteLLM(p)
-	if err != nil {
-		return syzlangToCResult{}, fmt.Errorf("failed to generate simplified C repro: %w", err)
-	}
-	return syzlangToCResult{SimplifiedCRepro: string(cData)}, nil
+	return baseCommitResult{
+		KernelRepo:   args.BaseRepository,
+		KernelBranch: args.BaseBranch,
+		KernelCommit: commit,
+	}, err
 }
 
 var getMaintainers = aflow.NewFuncAction("get-maintainers", maintainers)
 
 type maintainersArgs struct {
-	KernelSrc string
-	PatchDiff string
+	KernelCommit string
+	PatchDiff    string
+	Fixes        ai.FixesTag
 }
 
 type maintainersResult struct {
@@ -124,23 +88,47 @@ type maintainersResult struct {
 
 func maintainers(ctx *aflow.Context, args maintainersArgs) (maintainersResult, error) {
 	res := maintainersResult{}
-	// See #1441 re --git-min-percent.
-	script := filepath.Join(args.KernelSrc, "scripts/get_maintainer.pl")
-	cmd := exec.Command(script, "--git-min-percent=15")
-	cmd.Dir = args.KernelSrc
-	cmd.Stdin = strings.NewReader(args.PatchDiff)
-	output, err := osutil.Run(time.Minute, cmd)
-	if err != nil {
-		return res, err
-	}
-	for _, recipient := range vcs.ParseMaintainersLinux(output) {
-		res.Recipients = append(res.Recipients, ai.Recipient{
-			Name:  recipient.Address.Name,
-			Email: recipient.Address.Address,
-			To:    recipient.Type == vcs.To,
-		})
-	}
-	return res, nil
+	// get_maintainer.pl needs a non-shallow checkout, so we use the global one.
+	err := kernel.UseLinuxRepo(ctx, func(kernelRepoDir string, repo vcs.Repo) error {
+		if _, err := repo.SwitchCommit(args.KernelCommit); err != nil {
+			return err
+		}
+		// See #1441 re --git-min-percent.
+		script := filepath.Join(kernelRepoDir, "scripts/get_maintainer.pl")
+		cmd := exec.Command(script, "--git-min-percent=15")
+		cmd.Dir = kernelRepoDir
+		cmd.Stdin = strings.NewReader(args.PatchDiff)
+		output, err := osutil.Run(time.Minute, cmd)
+		if err != nil {
+			return err
+		}
+		for _, recipient := range vcs.ParseMaintainersLinux(output) {
+			res.Recipients = append(res.Recipients, ai.Recipient{
+				Name:  recipient.Address.Name,
+				Email: recipient.Address.Address,
+				To:    recipient.Type == vcs.To,
+			})
+		}
+		if args.Fixes.Hash != "" && args.Fixes.AuthorEmail != "" {
+			found := false
+			canonicalFixesEmail := email.CanonicalEmail(args.Fixes.AuthorEmail)
+			for i, rec := range res.Recipients {
+				if email.CanonicalEmail(rec.Email) == canonicalFixesEmail {
+					res.Recipients[i].To = true
+					found = true
+				}
+			}
+			if !found {
+				res.Recipients = append(res.Recipients, ai.Recipient{
+					Name:  args.Fixes.AuthorName,
+					Email: args.Fixes.AuthorEmail,
+					To:    true,
+				})
+			}
+		}
+		return nil
+	})
+	return res, err
 }
 
 var getRecentCommits = aflow.NewFuncAction("get-recent-commits", recentCommits)
@@ -167,7 +155,8 @@ func recentCommits(ctx *aflow.Context, args recentCommitsArgs) (recentCommitsRes
 	// are shallow checkouts that don't have history.
 	err := kernel.UseLinuxRepo(ctx, func(kernelRepoDir string, _ vcs.Repo) error {
 		gitArgs := append([]string{"log", "--format=%s", "--no-merges", "-n", "20", args.KernelCommit}, files...)
-		output, err := osutil.RunCmd(10*time.Minute, kernelRepoDir, "git", gitArgs...)
+		git := vcs.Git{Dir: kernelRepoDir, Sandbox: true}
+		output, err := git.Run(gitArgs...)
 		if err != nil {
 			return aflow.FlowError(err)
 		}
@@ -177,18 +166,37 @@ func recentCommits(ctx *aflow.Context, args recentCommitsArgs) (recentCommitsRes
 	return res, err
 }
 
-var formatPatchDescription = aflow.NewFuncAction("format-patch-description", formatDescription)
+var applyGitPatch = aflow.NewFuncAction("apply-git-patch", applyGitPatchFunc)
 
-type formatDescriptionArgs struct {
-	PatchDescriptionRaw string
+var forwardPatchDiff = aflow.NewFuncAction("forward-patch-diff", func(ctx *aflow.Context, args struct {
+	PreviousPatchDiff string
+}) (struct {
+	PatchDiff string
+}, error) {
+	return struct{ PatchDiff string }{PatchDiff: args.PreviousPatchDiff}, nil
+})
+
+type applyGitPatchArgs struct {
+	KernelScratchSrc string
+	PatchHistory     []ai.PatchHistoryEntry
 }
 
-type formatDescriptionResult struct {
-	PatchDescription string
-}
+func applyGitPatchFunc(ctx *aflow.Context, args applyGitPatchArgs) (struct{}, error) {
+	if len(args.PatchHistory) == 0 {
+		return struct{}{}, aflow.FlowError(fmt.Errorf("PatchHistory is empty"))
+	}
+	latest := args.PatchHistory[len(args.PatchHistory)-1]
+	if latest.Diff == "" {
+		return struct{}{}, nil
+	}
 
-func formatDescription(ctx *aflow.Context, args formatDescriptionArgs) (formatDescriptionResult, error) {
-	return formatDescriptionResult{
-		PatchDescription: email.WordWrap(args.PatchDescriptionRaw, 72),
-	}, nil
+	// Apply the diff.
+	cmd := exec.Command("git", "apply")
+	cmd.Dir = args.KernelScratchSrc
+	cmd.Stdin = strings.NewReader(latest.Diff)
+	if _, err := osutil.Run(time.Minute, cmd); err != nil {
+		return struct{}{}, aflow.FlowError(fmt.Errorf("failed to apply previous patch: %w", err))
+	}
+
+	return struct{}{}, nil
 }

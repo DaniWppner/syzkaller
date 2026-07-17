@@ -1,6 +1,7 @@
 // Copyright 2024 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package corpus manages syzkaller test program corpora, signal tracking, and corpus minimization.
 package corpus
 
 import (
@@ -86,8 +87,9 @@ func NewFocusedCorpus(ctx context.Context, updates chan<- NewItemEvent, areas []
 	return corpus
 }
 
-// It may happen that a single program is relevant because of several
-// sysalls. In that case, there will be several ItemUpdate entities.
+// ItemUpdate represents an update to a corpus item.
+// A single program may be relevant for multiple syscalls, resulting in multiple
+// ItemUpdate entities.
 type ItemUpdate struct {
 	Call     int
 	RawCover []uint64

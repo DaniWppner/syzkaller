@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/mail"
 	"regexp"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -34,6 +35,9 @@ type Repo interface {
 	// CheckoutCommit checkouts the specified repository on the specified commit.
 	CheckoutCommit(repo, commit string) (*Commit, error)
 
+	// FetchTags forces the fetching of tags from the specified remote repository.
+	FetchTags(repo string) error
+
 	// SwitchCommit checkouts the specified commit without fetching.
 	SwitchCommit(commit string) (*Commit, error)
 
@@ -44,11 +48,15 @@ type Repo interface {
 	// GetCommitByTitle finds commit info by the title. If the commit is not found, nil is returned.
 	// Remote is not fetched and only commits reachable from the checked out HEAD are searched
 	// (e.g. do CheckoutBranch before).
-	GetCommitByTitle(title string) (*Commit, error)
+	// The search is limited to commits starting from the 'since' time. If 'since' is the zero
+	// value, a default limit of 5 years is used.
+	GetCommitByTitle(title string, since time.Time) (*Commit, error)
 
 	// GetCommitsByTitles is a batch version of GetCommitByTitle.
 	// Returns list of commits and titles of commits that are not found.
-	GetCommitsByTitles(titles []string) ([]*Commit, []string, error)
+	// The search is limited to commits starting from the 'since' time. If 'since' is the zero
+	// value, a default limit of 5 years is used.
+	GetCommitsByTitles(titles []string, since time.Time) ([]*Commit, []string, error)
 
 	// ExtractFixTagsFromCommits extracts fixing tags for bugs from git log.
 	// Given email = "user@domain.com", it searches for tags of the form "user+tag@domain.com"
@@ -79,6 +87,12 @@ type Repo interface {
 
 	// PushCommit is used to store commit in remote repo.
 	PushCommit(repo, commit string) error
+
+	// cherryPick cherry-picks the given commit without committing it.
+	cherryPick(commit string) error
+
+	// fetchRemote fetches the specified commit from the given remote repo.
+	fetchRemote(repo, commit string) error
 }
 
 // Bisecter may be optionally implemented by Repo.
@@ -233,17 +247,17 @@ func NewLKMLRepo(dir string) Repo {
 }
 
 func Patch(dir string, patch []byte) error {
-	// Do --dry-run first to not mess with partially consistent state.
-	cmd := osutil.Command("patch", "-p1", "--force", "--ignore-whitespace", "--dry-run")
+	// Do --check first to not mess with partially consistent state.
+	args := []string{"apply", "-p1", "--ignore-whitespace", "--check", "-"}
+	cmd := osutil.Command("git", args...)
 	if err := osutil.Sandbox(cmd, true, true); err != nil {
 		return err
 	}
 	cmd.Stdin = bytes.NewReader(patch)
 	cmd.Dir = dir
 	if output, err := cmd.CombinedOutput(); err != nil {
-		// If it reverses clean, then it's already applied
-		// (seems to be the easiest way to detect it).
-		cmd = osutil.Command("patch", "-p1", "--force", "--ignore-whitespace", "--reverse", "--dry-run")
+		// If it reverses clean, then it's already applied.
+		cmd = osutil.Command("git", "apply", "-p1", "--ignore-whitespace", "--reverse", "--check", "-")
 		if err := osutil.Sandbox(cmd, true, true); err != nil {
 			return err
 		}
@@ -255,7 +269,8 @@ func Patch(dir string, patch []byte) error {
 		return fmt.Errorf("failed to apply patch:\n%s", output)
 	}
 	// Now apply for real.
-	cmd = osutil.Command("patch", "-p1", "--force", "--ignore-whitespace")
+	args = []string{"apply", "-p1", "--ignore-whitespace", "-"}
+	cmd = osutil.Command("git", args...)
 	if err := osutil.Sandbox(cmd, true, true); err != nil {
 		return err
 	}
@@ -369,9 +384,13 @@ func CommitLink(url, hash string) string {
 	return link(url, hash, "", 0, 0)
 }
 
-// Used externally - do not remove.
 func TreeLink(url, hash string) string {
 	return link(url, hash, "", 0, 1)
+}
+
+func init() {
+	// Used externally - do not remove.
+	runtime.KeepAlive(TreeLink)
 }
 
 func LogLink(url, hash string) string {

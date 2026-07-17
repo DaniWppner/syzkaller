@@ -1,6 +1,7 @@
 // Copyright 2019 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package bhyve implements Bhyve virtual machine management for FreeBSD targets.
 package bhyve
 
 import (
@@ -11,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -32,9 +34,10 @@ type Config struct {
 	Bridge  string `json:"bridge"`  // name of network bridge device, optional
 	Count   int    `json:"count"`   // number of VMs to use
 	CPU     int    `json:"cpu"`     // number of VM vCPU
-	HostIP  string `json:"hostip"`  // VM host IP address
+	HostIP  string `json:"hostip"`  // VM host IP address, optional
 	Mem     string `json:"mem"`     // amount of VM memory
-	Dataset string `json:"dataset"` // ZFS dataset containing VM image
+	Dataset string `json:"dataset"` // ZFS dataset containing VM image, optional
+	BootRom string `json:"bootrom"` // path to UEFI bootrom, optional
 }
 
 type Pool struct {
@@ -95,39 +98,51 @@ func (pool *Pool) Create(_ context.Context, workdir string, index int) (vmimpl.I
 		vmName: fmt.Sprintf("syzkaller-%v-%v", pool.env.Name, index),
 	}
 
-	dataset := inst.cfg.Dataset
-	mountpoint, err := osutil.RunCmd(time.Minute, "", "zfs", "get", "-H", "-o", "value", "mountpoint", dataset)
-	if err != nil {
-		return nil, err
-	}
+	if inst.cfg.Dataset != "" {
+		dataset := inst.cfg.Dataset
+		mountpoint, err := osutil.RunCmd(time.Minute, "", "zfs", "get", "-H", "-o", "value", "mountpoint", dataset)
+		if err != nil {
+			return nil, err
+		}
 
-	snapshot := fmt.Sprintf("%v@bhyve-%v", dataset, inst.vmName)
-	clone := fmt.Sprintf("%v/bhyve-%v", dataset, inst.vmName)
+		snapshot := fmt.Sprintf("%v@bhyve-%v", dataset, inst.vmName)
+		clone := fmt.Sprintf("%v/bhyve-%v", dataset, inst.vmName)
 
-	prefix := strings.TrimSuffix(string(mountpoint), "\n") + "/"
-	image := strings.TrimPrefix(pool.env.Image, prefix)
-	if image == pool.env.Image {
-		return nil, fmt.Errorf("image file %v not contained in dataset %v", image, prefix)
-	}
-	inst.image = prefix + fmt.Sprintf("bhyve-%v", inst.vmName) + "/" + image
+		prefix := strings.TrimSuffix(string(mountpoint), "\n") + "/"
+		image := strings.TrimPrefix(pool.env.Image, prefix)
+		if image == pool.env.Image {
+			return nil, fmt.Errorf("image file %v not contained in dataset %v", image, prefix)
+		}
+		inst.image = prefix + fmt.Sprintf("bhyve-%v", inst.vmName) + "/" + image
 
-	// Stop the instance from a previous run in case it's still running.
-	osutil.RunCmd(time.Minute, "", "bhyvectl", "--destroy", fmt.Sprintf("--vm=%v", inst.vmName))
-	// Destroy a lingering snapshot and clone.
-	osutil.RunCmd(time.Minute, "", "zfs", "destroy", "-R", snapshot)
+		// Stop the instance from a previous run in case it's still running.
+		osutil.RunCmd(time.Minute, "", "bhyvectl", "--destroy", fmt.Sprintf("--vm=%v", inst.vmName))
+		// Destroy a lingering snapshot and clone.
+		osutil.RunCmd(time.Minute, "", "zfs", "destroy", "-R", snapshot)
 
-	// Create a snapshot of the data set containing the VM image.
-	// bhyve will use a clone of the snapshot, which gets recreated every time the VM
-	// is restarted. This is all to work around bhyve's current lack of an
-	// image snapshot facility.
-	if _, err := osutil.RunCmd(time.Minute, "", "zfs", "snapshot", snapshot); err != nil {
-		inst.Close()
-		return nil, err
-	}
-	inst.snapshot = snapshot
-	if _, err := osutil.RunCmd(time.Minute, "", "zfs", "clone", snapshot, clone); err != nil {
-		inst.Close()
-		return nil, err
+		// Create a snapshot of the data set containing the VM image.
+		// bhyve will use a clone of the snapshot, which gets recreated every time the VM
+		// is restarted. This is all to work around bhyve's current lack of an
+		// image snapshot facility.
+		if _, err := osutil.RunCmd(time.Minute, "", "zfs", "snapshot", snapshot); err != nil {
+			inst.Close()
+			return nil, err
+		}
+		inst.snapshot = snapshot
+		if _, err := osutil.RunCmd(time.Minute, "", "zfs", "clone", snapshot, clone); err != nil {
+			inst.Close()
+			return nil, err
+		}
+	} else {
+		inst.image = filepath.Join(workdir, filepath.Base(pool.env.Image)+fmt.Sprintf("-%v", inst.vmName))
+		// Use cp(1) here to help ensure that the image file gets
+		// copied using copy_file_range(2), which will leverage block
+		// cloning on ZFS.
+		_, err := osutil.RunCmd(time.Minute, "", "cp", "-f", pool.env.Image, inst.image)
+		if err != nil {
+			inst.Close()
+			return nil, err
+		}
 	}
 
 	if inst.cfg.Bridge != "" {
@@ -152,21 +167,8 @@ func (pool *Pool) Create(_ context.Context, workdir string, index int) (vmimpl.I
 }
 
 func (inst *instance) Boot() error {
-	loaderArgs := []string{
-		"-c", "stdio",
-		"-m", inst.cfg.Mem,
-		"-d", inst.image,
-		"-e", "autoboot_delay=0",
-		inst.vmName,
-	}
-
 	// Stop the instance from the previous run in case it's still running.
 	osutil.RunCmd(time.Minute, "", "bhyvectl", "--destroy", fmt.Sprintf("--vm=%v", inst.vmName))
-
-	_, err := osutil.RunCmd(time.Minute, "", "bhyveload", loaderArgs...)
-	if err != nil {
-		return err
-	}
 
 	netdev := ""
 	if inst.tapdev != "" {
@@ -187,6 +189,22 @@ func (inst *instance) Boot() error {
 		"-s", fmt.Sprintf("3:0,virtio-blk,%v", inst.image),
 		"-l", "com1,stdio",
 		inst.vmName,
+	}
+
+	if inst.cfg.BootRom == "" {
+		loaderArgs := []string{
+			"-c", "stdio",
+			"-m", inst.cfg.Mem,
+			"-d", inst.image,
+			"-e", "autoboot_delay=0",
+			inst.vmName,
+		}
+		_, err := osutil.RunCmd(time.Minute, "", "bhyveload", loaderArgs...)
+		if err != nil {
+			return err
+		}
+	} else {
+		bhyveArgs = append([]string{"-M", "-l", fmt.Sprintf("bootrom,%v", inst.cfg.BootRom)}, bhyveArgs...)
 	}
 
 	outr, outw, err := osutil.LongPipe()
@@ -351,7 +369,7 @@ func (inst *instance) Run(ctx context.Context, command string) (
 	} else {
 		sshargs = vmimpl.SSHArgs(inst.debug, inst.Key, inst.Port, false)
 	}
-	args := append(sshargs, inst.User+"@"+inst.Addr, command)
+	args := append(slices.Clone(sshargs), inst.User+"@"+inst.Addr, command)
 	if inst.debug {
 		log.Logf(0, "running command: ssh %#v", args)
 	}

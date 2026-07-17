@@ -1,5 +1,6 @@
 // Copyright 2025 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+
 package kfuzztest
 
 import (
@@ -9,8 +10,7 @@ import (
 	"strings"
 )
 
-// Extractor's job is to extract all information relevant to KFuzzTest from a
-// VMlinux binary.
+// Extractor extracts all information relevant to KFuzzTest from a vmlinux binary.
 type Extractor struct {
 	// Path to the `vmlinux` being parsed.
 	vmlinuxPath string

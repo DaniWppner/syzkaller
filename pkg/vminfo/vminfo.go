@@ -114,7 +114,7 @@ func (checker *Checker) Run(ctx context.Context, files []*flatrpc.FileInfo, feat
 	return enabled, disabled, features, err
 }
 
-// Implementation of the queue.Source interface.
+// Next implements the queue.Source interface.
 func (checker *Checker) Next() *queue.Request {
 	return checker.source.Next()
 }
@@ -164,9 +164,7 @@ func (files filesystem) ReadDir(dir string) []string {
 			continue
 		}
 		name := file.Name[len(dir)+1:]
-		if slash := strings.Index(name, "/"); slash != -1 {
-			name = name[:slash]
-		}
+		name, _, _ = strings.Cut(name, "/")
 		if dedup[name] {
 			continue
 		}

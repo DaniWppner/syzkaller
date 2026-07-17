@@ -1,6 +1,7 @@
 // Copyright 2026 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package repro provides workflows for reproducing kernel crashes from bug descriptions.
 package repro
 
 import (
@@ -12,13 +13,16 @@ import (
 	"github.com/google/syzkaller/pkg/aflow/action/crash"
 	"github.com/google/syzkaller/pkg/aflow/action/kernel"
 	"github.com/google/syzkaller/pkg/aflow/ai"
+	"github.com/google/syzkaller/pkg/aflow/flow/common"
 	"github.com/google/syzkaller/pkg/aflow/tool/codesearcher"
-	"github.com/google/syzkaller/pkg/aflow/tool/grepper"
 	"github.com/google/syzkaller/pkg/aflow/tool/syzlang"
 	"github.com/google/syzkaller/prog"
 )
 
 type ReproInputs struct {
+	AgentName    string
+	TargetOS     string
+	TargetArch   string
 	BugTitle     string
 	CrashReport  string
 	KernelRepo   string
@@ -28,6 +32,7 @@ type ReproInputs struct {
 	Type         string
 	VM           json.RawMessage
 	Syzkaller    string
+	StraceBin    string
 }
 
 func init() {
@@ -41,6 +46,7 @@ func init() {
 				"DocProgramSyntax":             docs.ProgramSyntax,
 				"DocSyscallDescriptionsSyntax": docs.SyscallDescriptionsSyntax,
 				"ReproC":                       "", // is needed by crash.Reproduce
+				"NeedStrace":                   false,
 			},
 			Root: aflow.Pipeline(
 				kernel.Checkout,
@@ -54,11 +60,10 @@ func init() {
 						CandidateReproSyz string `jsonschema:"Valid syzkaller reproducer program without triple backticks."`
 					}](),
 					Tools: aflow.Tools(
+						common.CodeAccessTools,
 						syzlang.ReadDescription,
 						syzlang.Reproduce,
 						syzlang.Coverage,
-						codesearcher.Tools,
-						grepper.Tool,
 					),
 					TaskType:    aflow.FormalReasoningTask,
 					Instruction: reproInstruction,
@@ -70,6 +75,9 @@ func init() {
 					args struct {
 						BugTitle           string
 						ReproducedBugTitle string
+						// This is an unused output of crash.Reproduce.
+						// TODO: figure out how to handle such outputs better.
+						ReproducedFaultInjection string
 					}) (struct{ Reproduced bool }, error) {
 					return struct{ Reproduced bool }{args.BugTitle == args.ReproducedBugTitle}, nil
 				}),
@@ -81,9 +89,6 @@ func init() {
 const reproInstruction = `
 You are an expert in the Linux kernel fuzzing. Your goal is to write a syzkaller program to trigger a specific bug.
 
-Don't make assumptions about the kernel source code, use the provided codesearch tools
-to examine the kernel code instead.
-
 Document about syzkaller program syntax:
 ===
 {{.DocProgramSyntax}}
@@ -93,7 +98,7 @@ Document about syzlang system call descriptions syntax:
 ===
 {{.DocSyscallDescriptionsSyntax}}
 ===
-`
+` + common.InstructionDontMakeAssumptionsAboutSourceCode
 
 const reproPrompt = `
 Bug title: {{.BugTitle}}

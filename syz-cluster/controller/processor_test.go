@@ -26,11 +26,9 @@ func TestProcessor(t *testing.T) {
 	// Start the loop.
 	var wg sync.WaitGroup
 	ctx2, cancel := context.WithCancel(ctx)
-	wg.Add(1)
-	go func() {
+	wg.Go(func() {
 		processor.Loop(ctx2)
-		wg.Done()
-	}()
+	})
 
 	// Add some series.
 	var allSeries []*api.Series
@@ -87,11 +85,9 @@ func TestFinishRunningSteps(t *testing.T) {
 	// Start the loop.
 	var wg sync.WaitGroup
 	ctx2, cancel := context.WithCancel(ctx)
-	wg.Add(1)
-	go func() {
+	wg.Go(func() {
 		processor.Loop(ctx2)
-		wg.Done()
-	}()
+	})
 
 	series := &api.Series{
 		ExtID: "ext-id",
@@ -153,33 +149,39 @@ func awaitFinishedSessions(t *testing.T, seriesRepo *db.SeriesRepository, wantFi
 
 type mockedWorkflows struct {
 	workflow.MockService
-	finish  chan struct{}
-	created map[string]struct{}
+	finish   chan struct{}
+	created  map[string]struct{}
+	finished map[string]struct{}
+	mu       sync.Mutex
 }
 
 func newMockedWorkflows() *mockedWorkflows {
 	obj := mockedWorkflows{
-		finish:  make(chan struct{}),
-		created: make(map[string]struct{}),
+		finish:   make(chan struct{}, 100),
+		created:  make(map[string]struct{}),
+		finished: make(map[string]struct{}),
 	}
 	obj.PollDelayValue = time.Millisecond
 	obj.OnStart = func(id string) error {
+		obj.mu.Lock()
+		defer obj.mu.Unlock()
 		obj.created[id] = struct{}{}
 		return nil
 	}
 	obj.OnStatus = func(id string) (workflow.Status, []byte, error) {
-		_, ok := obj.created[id]
-		if !ok {
+		obj.mu.Lock()
+		defer obj.mu.Unlock()
+		if _, ok := obj.created[id]; !ok {
 			return workflow.StatusNotFound, nil, nil
 		}
-		finished := false
+		if _, ok := obj.finished[id]; ok {
+			return workflow.StatusFinished, nil, nil
+		}
 		select {
 		case <-obj.finish:
-			finished = true
-		default:
-		}
-		if finished {
+			obj.finished[id] = struct{}{}
 			return workflow.StatusFinished, nil, nil
+		default:
 		}
 		return workflow.StatusRunning, nil, nil
 	}

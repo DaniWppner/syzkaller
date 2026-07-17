@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/syzkaller/pkg/config"
@@ -33,6 +34,7 @@ import (
 	"github.com/google/syzkaller/pkg/report"
 	"github.com/google/syzkaller/sys/targets"
 	"github.com/google/syzkaller/vm/vmimpl"
+	"google.golang.org/api/googleapi"
 )
 
 func init() {
@@ -70,7 +72,8 @@ type Pool struct {
 	env            *vmimpl.Env
 	cfg            *Config
 	GCE            *gce.Context
-	consoleReadCmd string // optional: command to read non-standard kernel console
+	consoleReadCmd string   // optional: command to read non-standard kernel console
+	alreadyCreated sync.Map // Tracks the first creation per instance.
 }
 
 type instance struct {
@@ -79,12 +82,14 @@ type instance struct {
 	GCE   *gce.Context
 	debug bool
 	name  string
+	zone  string
 	vmimpl.SSHOptions
 	gceKey         string // per-instance private ssh key associated with the instance
 	closed         chan bool
 	consolew       io.WriteCloser
 	consoleReadCmd string // optional: command to read non-standard kernel console
 	timeouts       targets.Timeouts
+	preempted      bool
 }
 
 func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
@@ -193,10 +198,6 @@ func (pool *Pool) Create(_ context.Context, workdir string, index int) (vmimpl.I
 		return nil, fmt.Errorf("failed to read file: %w", err)
 	}
 
-	log.Logf(0, "deleting instance: %v", name)
-	if err := pool.GCE.DeleteInstance(name, true); err != nil {
-		return nil, err
-	}
 	log.Logf(0, "creating instance: %v", name)
 	instCfg := &gce.InstanceConfig{
 		Name:                 name,
@@ -210,7 +211,22 @@ func (pool *Pool) Create(_ context.Context, workdir string, index int) (vmimpl.I
 		NicType:              pool.cfg.NicType,
 		VMRunningTime:        pool.env.Timeouts.VMRunningTime,
 	}
-	ip, err := pool.GCE.CreateInstance(instCfg)
+	// In case the manager crashed, we might attempt creation in a different zone than the original VM, and the creation
+	// will not fail. The VM should eventually be deleted anyway, unless it's configured to run forever.
+	// If that's the case, attempt deletion first.
+	if instCfg.VMRunningTime == 0 {
+		if _, loaded := pool.alreadyCreated.LoadOrStore(index, true); !loaded {
+			pool.GCE.DeleteInstanceAcrossZones(name, true)
+		}
+	}
+	ip, zone, err := pool.GCE.CreateInstance(instCfg)
+	var apiErr *googleapi.Error
+	if errors.As(err, &apiErr) && apiErr.Code == 409 {
+		log.Logf(0, "deleting existing instance %v at zone %v due to conflict: %v", name, zone, err)
+		if err = pool.GCE.DeleteInstance(name, zone, true); err == nil {
+			ip, zone, err = pool.GCE.CreateInstance(instCfg)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -218,7 +234,7 @@ func (pool *Pool) Create(_ context.Context, workdir string, index int) (vmimpl.I
 	ok := false
 	defer func() {
 		if !ok {
-			pool.GCE.DeleteInstance(name, true)
+			pool.GCE.DeleteInstance(name, zone, true)
 		}
 	}()
 	sshKey := pool.env.SSHKey
@@ -235,6 +251,7 @@ func (pool *Pool) Create(_ context.Context, workdir string, index int) (vmimpl.I
 		debug: pool.env.Debug,
 		GCE:   pool.GCE,
 		name:  name,
+		zone:  zone,
 		SSHOptions: vmimpl.SSHOptions{
 			Addr: ip,
 			Port: 22,
@@ -262,7 +279,10 @@ func (pool *Pool) Create(_ context.Context, workdir string, index int) (vmimpl.I
 
 func (inst *instance) Close() error {
 	close(inst.closed)
-	err := inst.GCE.DeleteInstance(inst.name, false)
+	var err error
+	if !inst.preempted {
+		err = inst.GCE.DeleteInstance(inst.name, inst.zone, true)
+	}
 	if inst.consolew != nil {
 		err2 := inst.consolew.Close()
 		if err == nil {
@@ -277,7 +297,11 @@ func (inst *instance) Forward(port int) (string, error) {
 }
 
 func (inst *instance) Copy(hostSrc string) (string, error) {
-	vmDst := "./" + filepath.Base(hostSrc)
+	vmDstDir := filepath.Join("./", inst.env.Name)
+	if _, err := inst.ssh("mkdir", "-p", vmDstDir); err != nil {
+		return "", err
+	}
+	vmDst := filepath.Join(vmDstDir, filepath.Base(hostSrc))
 	err := vmimpl.SCP(hostSrc, vmDst, vmimpl.SCPOptions{
 		Debug:         inst.debug,
 		Key:           inst.Key,
@@ -289,6 +313,12 @@ func (inst *instance) Copy(hostSrc string) (string, error) {
 		VerboseOutput: true,
 	})
 	if err != nil {
+		// Passing context.Background will make it uninterruptible, but the other option is to modify the Copy interface
+		// across all vm implementations to accept a context parameter.
+		// TODO: pass context to Copy
+		if inst.hasBeenPreempted(context.Background()) {
+			return "", vmimpl.ErrPreempted
+		}
 		return "", err
 	}
 	return vmDst, nil
@@ -379,21 +409,22 @@ func (inst *instance) Run(ctx context.Context, command string) (
 		Close:   inst.closed,
 		Debug:   inst.debug,
 		Scale:   inst.timeouts.Scale,
-		IgnoreError: func(err error) bool {
+		PreemptionError: func(err error) bool {
 			var mergeError *vmimpl.MergerError
 			if errors.As(err, &mergeError) && mergeError.R == conRpipe {
 				// Console connection must never fail. If it does, it's either
 				// instance preemption or a GCE bug. In either case, not a kernel bug.
 				log.Logf(0, "%v: gce console connection failed with %v", inst.name, mergeError.Err)
-				return true
+				inst.preempted = true
 			} else {
 				// Check if the instance was terminated due to preemption or host maintenance.
-				// vmimpl.Multiplex() already adds a delay, so we've already waited enough
-				// to let GCE VM status updates propagate.
-				if !inst.GCE.IsInstanceRunning(inst.name) {
+				if inst.hasBeenPreempted(ctx) {
 					log.Logf(0, "%v: ssh exited but instance is not running", inst.name)
-					return true
 				}
+			}
+			if inst.preempted {
+				inst.GCE.ReportPreemption(inst.zone)
+				return true
 			}
 			return false
 		},
@@ -435,6 +466,17 @@ func waitForConsoleConnect(merger *vmimpl.OutputMerger) error {
 	}
 }
 
+func (inst *instance) hasBeenPreempted(ctx context.Context) bool {
+	wait := 10 * time.Second
+	select {
+	case <-time.After(wait):
+	case <-ctx.Done():
+		return false
+	}
+	inst.preempted = !inst.GCE.IsInstanceRunning(inst.name, inst.zone)
+	return inst.preempted
+}
+
 func (inst *instance) Diagnose(rep *report.Report) ([]byte, bool) {
 	switch inst.env.OS {
 	case targets.Linux:
@@ -474,7 +516,7 @@ func (inst *instance) serialPortArgs(replay bool) []string {
 		replayArg = ".replay-lines=10000"
 	}
 	conAddr := fmt.Sprintf("%v.%v.%v.%s.port=1%s@%v-ssh-serialport.googleapis.com",
-		inst.GCE.ProjectID, inst.GCE.ZoneID, inst.name, user, replayArg, inst.GCE.RegionID)
+		inst.GCE.ProjectID, inst.zone, inst.name, user, replayArg, inst.GCE.RegionID)
 	conArgs := append(vmimpl.SSHArgs(inst.debug, key, 9600, false), conAddr)
 	// TODO(blackgnezdo): Remove this once ssh-serialport.googleapis.com stops using
 	// host key algorithm: ssh-rsa.

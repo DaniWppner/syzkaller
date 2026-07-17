@@ -1,6 +1,7 @@
 // Copyright 2024 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package clangtool provides utilities for building and invoking clang-based code analysis tools.
 package clangtool
 
 import (
@@ -63,7 +64,7 @@ func Run[Output any, OutputPtr OutputDataPtr[Output]](cfg *Config) (OutputPtr, e
 	for range runtime.NumCPU() {
 		go func() {
 			for file := range files {
-				out, err := runTool[Output, OutputPtr](cfg, dbFile, file)
+				out, err := runTool[Output, OutputPtr](cfg, file)
 				results <- &result{out, err}
 			}
 		}()
@@ -153,22 +154,27 @@ func (v *Verifier) LineRange(file string, start, end int) {
 	}
 }
 
-func runTool[Output any, OutputPtr OutputDataPtr[Output]](cfg *Config, dbFile, file string) (OutputPtr, error) {
+func runTool[Output any, OutputPtr OutputDataPtr[Output]](cfg *Config, file string) (OutputPtr, error) {
 	relFile := strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(filepath.Clean(file),
 		cfg.KernelSrc), cfg.KernelObj), "/")
 	// Suppress warning since we may build the tool on a different clang
 	// version that produces more warnings.
 	// Comments are needed for codesearch tool, but may be useful for declextract
 	// in the future if we try to parse them with LLMs.
-	cmd := exec.Command(osutil.Abs(os.Args[0]), "-p", dbFile,
+	bin := os.Args[0]
+	if strings.ContainsRune(bin, os.PathSeparator) {
+		bin = osutil.Abs(bin)
+	} else {
+		bin, _ = exec.LookPath(bin)
+	}
+	cmd := exec.Command(bin, "-p", cfg.KernelObj,
 		"--extra-arg=-w", "--extra-arg=-fparse-all-comments", file)
 	cmd.Dir = cfg.KernelObj
 	// This tells the C++ clang tool to execute in a constructor.
 	cmd.Env = append([]string{fmt.Sprintf("%v=%v", runToolEnv, cfg.Tool)}, os.Environ()...)
 	data, err := cmd.Output()
 	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
+		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
 			err = fmt.Errorf("%v: %w\n%s", relFile, err, exitErr.Stderr)
 		}
 		return nil, err

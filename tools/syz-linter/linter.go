@@ -22,6 +22,7 @@ import (
 	"go/token"
 	"go/types"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"unicode"
@@ -30,14 +31,20 @@ import (
 	"golang.org/x/tools/go/analysis/passes/atomicalign"
 	"golang.org/x/tools/go/analysis/passes/copylock"
 	"golang.org/x/tools/go/analysis/passes/deepequalerrors"
+	"golang.org/x/tools/go/analysis/passes/httpresponse"
+	"golang.org/x/tools/go/analysis/passes/modernize"
 	"golang.org/x/tools/go/analysis/passes/nilness"
 	"golang.org/x/tools/go/analysis/passes/structtag"
+	"golang.org/x/tools/go/analysis/passes/waitgroup"
 )
 
-func main() {}
+func main() {
+	// New used as a plugin, this marks it used for deadcode checker.
+	runtime.KeepAlive(New)
+}
 
 func New(conf any) ([]*analysis.Analyzer, error) {
-	return []*analysis.Analyzer{
+	return append([]*analysis.Analyzer{
 		SyzAnalyzer,
 		// Some standard analyzers that are not enabled in vet.
 		atomicalign.Analyzer,
@@ -45,7 +52,9 @@ func New(conf any) ([]*analysis.Analyzer, error) {
 		deepequalerrors.Analyzer,
 		nilness.Analyzer,
 		structtag.Analyzer,
-	}, nil
+		waitgroup.Analyzer,
+		httpresponse.Analyzer,
+	}, modernize.Suite...), nil
 }
 
 var SyzAnalyzer = &analysis.Analyzer{
@@ -74,28 +83,86 @@ func run(p *analysis.Pass) (any, error) {
 				pass.checkLogErrorFormat(n)
 				pass.checkSliceClone(n)
 				pass.checkSortUsage(n)
+			case *ast.CompositeLit:
+				pass.checkCompositeLit(n)
 			case *ast.GenDecl:
 				pass.checkVarDecl(n)
 			case *ast.IfStmt:
 				pass.checkIfStmt(n)
+				pass.checkStringsCut(n)
 			case *ast.AssignStmt:
 				pass.checkAssignStmt(n)
 			case *ast.InterfaceType:
 				pass.checkInterfaceType(n)
 			case *ast.BlockStmt:
 				pass.checkWhileStyleForLoop(n)
+				pass.checkMapKeysExtractionAndSort(n)
 			case *ast.ForStmt:
 				pass.checkRangeOverIntegers(n)
 			}
 			return true
 		})
+		commentLines := make(map[int]bool)
 		for _, group := range file.Comments {
 			for _, comment := range group.List {
+				commentLines[pass.Fset.Position(comment.Pos()).Line] = true
 				pass.checkComment(comment, stmts, len(group.List) == 1)
 			}
 		}
+		pass.checkTopLevelDecls(file, commentLines)
 	}
 	return nil, nil
+}
+
+func (pass *Pass) checkTopLevelDecls(file *ast.File, commentLines map[int]bool) {
+	isRelevantDecl := func(d ast.Decl) token.Token {
+		switch x := d.(type) {
+		case *ast.FuncDecl:
+			return token.FUNC
+		case *ast.GenDecl:
+			return x.Tok
+		}
+		return token.ILLEGAL
+	}
+
+topLoop:
+	for i := range len(file.Decls) - 1 {
+		d1, d2 := file.Decls[i], file.Decls[i+1]
+		t1, t2 := isRelevantDecl(d1), isRelevantDecl(d2)
+		if t1 == token.ILLEGAL || t2 == token.ILLEGAL {
+			continue
+		}
+
+		d1Start := pass.Fset.Position(d1.Pos()).Line
+		d1End := pass.Fset.Position(d1.End()).Line
+
+		startPos := d2.Pos()
+		switch v := d2.(type) {
+		case *ast.FuncDecl:
+			if v.Doc != nil {
+				startPos = v.Doc.Pos()
+			}
+		case *ast.GenDecl:
+			if v.Doc != nil {
+				startPos = v.Doc.Pos()
+			}
+		}
+		d2Start := pass.Fset.Position(startPos).Line
+		d2End := pass.Fset.Position(d2.End()).Line
+
+		exactlyOne := d2Start-d1End == 2
+		canBeGrouped := d1Start == d1End && d2Start == d2End && d2Start-d1End == 1 && t1 == t2
+		if exactlyOne || canBeGrouped {
+			continue
+		}
+		// Ensure the lines in between are not stand-alone comments.
+		for line := d1End + 1; line < d2Start; line++ {
+			if commentLines[line] {
+				continue topLoop
+			}
+		}
+		pass.report(d2, "Keep one empty line between top-level declarations")
+	}
 }
 
 type Pass analysis.Pass
@@ -227,13 +294,13 @@ func (pass *Pass) reportFuncArgs(fields []*ast.Field, first, last int) {
 	if first == -1 {
 		return
 	}
-	names := ""
+	var names strings.Builder
 	for _, field := range fields[first:last] {
 		for _, name := range field.Names {
-			names += ", " + name.Name
+			names.WriteString(", " + name.Name)
 		}
 	}
-	pass.report(fields[first], "Use '%v %v'", names[2:], pass.typ(fields[first].Type))
+	pass.report(fields[first], "Use '%v %v'", names.String()[2:], pass.typ(fields[first].Type))
 }
 
 func (pass *Pass) checkContextArgs(n *ast.FuncDecl) {
@@ -586,5 +653,194 @@ func (pass *Pass) checkWhileStyleForLoop(n *ast.BlockStmt) {
 			continue
 		}
 		pass.report(forStmt, "Consider using for %v := 0; %v < ...; { to scope the loop variable", ident.Name, ident.Name)
+	}
+}
+
+// checkMapKeysExtractionAndSort warns about manual loops extracting map keys followed by sort.
+func (pass *Pass) checkMapKeysExtractionAndSort(n *ast.BlockStmt) {
+	for i := range len(n.List) - 1 {
+		rangeStmt, ok := n.List[i].(*ast.RangeStmt)
+		if !ok {
+			continue
+		}
+		sliceIdent, ok := pass.isMapKeysExtraction(rangeStmt)
+		if !ok {
+			continue
+		}
+		nextStmt := n.List[i+1]
+		if pass.isSortCall(nextStmt, sliceIdent) {
+			pass.report(rangeStmt, "Use maps.Keys and slices.Sort instead of a manual loop")
+		}
+	}
+}
+
+func (pass *Pass) isMapKeysExtraction(n *ast.RangeStmt) (*ast.Ident, bool) {
+	if n.Value != nil || len(n.Body.List) != 1 {
+		return nil, false
+	}
+	assign, ok := n.Body.List[0].(*ast.AssignStmt)
+	if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
+		return nil, false
+	}
+	call, ok := assign.Rhs[0].(*ast.CallExpr)
+	if !ok || len(call.Args) != 2 {
+		return nil, false
+	}
+	fn, ok := call.Fun.(*ast.Ident)
+	if !ok || fn.Name != "append" {
+		return nil, false
+	}
+	keyIdent, ok := n.Key.(*ast.Ident)
+	if !ok {
+		return nil, false
+	}
+	argIdent, ok := call.Args[1].(*ast.Ident)
+	if !ok || argIdent.Name != keyIdent.Name {
+		return nil, false
+	}
+	lhsIdent, ok := assign.Lhs[0].(*ast.Ident)
+	if !ok {
+		return nil, false
+	}
+	appendArgIdent, ok := call.Args[0].(*ast.Ident)
+	if !ok || appendArgIdent.Name != lhsIdent.Name {
+		return nil, false
+	}
+	if typ := pass.TypesInfo.Types[n.X].Type; typ != nil {
+		if _, isMap := typ.Underlying().(*types.Map); !isMap {
+			return nil, false
+		}
+	}
+	return lhsIdent, true
+}
+
+func (pass *Pass) isSortCall(n ast.Stmt, sliceIdent *ast.Ident) bool {
+	exprStmt, ok := n.(*ast.ExprStmt)
+	if !ok {
+		return false
+	}
+	call, ok := exprStmt.X.(*ast.CallExpr)
+	if !ok || len(call.Args) != 1 {
+		return false
+	}
+	argIdent, ok := call.Args[0].(*ast.Ident)
+	if !ok || argIdent.Name != sliceIdent.Name {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	xIdent, ok := sel.X.(*ast.Ident)
+	if !ok {
+		return false
+	}
+	if xIdent.Name == "slices" && sel.Sel.Name == "Sort" {
+		return true
+	}
+	if xIdent.Name == "sort" && sel.Sel.Name == "Strings" {
+		return true
+	}
+	return false
+}
+
+// checkStringsCut warns about strings.Index usage that can be replaced with strings.Cut.
+func (pass *Pass) checkStringsCut(n *ast.IfStmt) {
+	if n.Init == nil {
+		return
+	}
+	assign, ok := n.Init.(*ast.AssignStmt)
+	if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
+		return
+	}
+	if !isStringsIndexCall(assign.Rhs[0]) {
+		return
+	}
+
+	cond, ok := n.Cond.(*ast.BinaryExpr)
+	if !ok || cond.Op != token.NEQ {
+		return
+	}
+
+	vIdent, ok := assign.Lhs[0].(*ast.Ident)
+	if !ok {
+		return
+	}
+
+	isVar := func(e ast.Expr) bool {
+		id, ok := e.(*ast.Ident)
+		return ok && id.Name == vIdent.Name
+	}
+
+	match := (isMinusOne(cond.X) && isVar(cond.Y)) || (isMinusOne(cond.Y) && isVar(cond.X))
+	if !match {
+		return
+	}
+
+	// Simple heuristic: just check if the body contains any slice expression.
+	usesSlicing := false
+	ast.Inspect(n.Body, func(node ast.Node) bool {
+		if _, ok := node.(*ast.SliceExpr); ok {
+			usesSlicing = true
+			return false
+		}
+		return true
+	})
+
+	if usesSlicing {
+		pass.report(n, "Use strings.Cut instead of strings.Index/IndexByte and manual slicing")
+	}
+}
+
+func isStringsIndexCall(n ast.Expr) bool {
+	call, ok := n.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	ident, ok := sel.X.(*ast.Ident)
+	return ok && ident.Name == "strings" && (sel.Sel.Name == "Index" || sel.Sel.Name == "IndexByte")
+}
+
+func isMinusOne(e ast.Expr) bool {
+	unary, ok := e.(*ast.UnaryExpr)
+	if !ok || unary.Op != token.SUB {
+		return false
+	}
+	lit, ok := unary.X.(*ast.BasicLit)
+	return ok && lit.Kind == token.INT && lit.Value == "1"
+}
+
+func (pass *Pass) checkCompositeLit(n *ast.CompositeLit) {
+	if len(n.Elts) <= 1 {
+		return
+	}
+
+	typ := pass.TypesInfo.TypeOf(n)
+	if typ == nil {
+		return
+	}
+	if _, ok := typ.Underlying().(*types.Struct); !ok {
+		return
+	}
+
+	lines := make(map[int]bool)
+	for _, elt := range n.Elts {
+		line := pass.Fset.Position(elt.Pos()).Line
+		lines[line] = true
+	}
+
+	startLine := pass.Fset.Position(n.Lbrace).Line
+	endLine := pass.Fset.Position(n.Rbrace).Line
+
+	if startLine == endLine {
+		return
+	}
+
+	if len(lines) < len(n.Elts) {
+		pass.report(n, "multi-line struct initialization must have one field per line")
 	}
 }

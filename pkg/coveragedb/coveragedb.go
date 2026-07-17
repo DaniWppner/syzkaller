@@ -1,6 +1,7 @@
 // Copyright 2024 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package coveragedb provides database storage and querying for historical coverage records.
 package coveragedb
 
 import (
@@ -15,13 +16,15 @@ import (
 
 	"cloud.google.com/go/civil"
 	"cloud.google.com/go/spanner"
-	"github.com/google/syzkaller/pkg/coveragedb/spannerclient"
+	pkgspanner "github.com/google/syzkaller/pkg/spanner"
 	"github.com/google/syzkaller/pkg/subsystem"
 	_ "github.com/google/syzkaller/pkg/subsystem/lists"
 	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/api/iterator"
 )
+
+const oneWeekAgo = 7 * 24 * time.Hour
 
 type HistoryRecord struct {
 	Session   string
@@ -84,13 +87,22 @@ type fileSubsystems struct {
 	Subsystems []string
 }
 
-func SaveMergeResult(ctx context.Context, client spannerclient.SpannerClient, descr *HistoryRecord, dec *json.Decoder,
+func SaveMergeResult(ctx context.Context, client *spanner.Client, descr *HistoryRecord, dec *json.Decoder,
 ) (int, error) {
 	if client == nil {
 		return 0, fmt.Errorf("nil spannerclient")
 	}
 	var rowsCreated int
 	session := uuid.New().String()
+	// Register session. We need this Apply call for referential integrity.
+	// GC will not be touching this session records.
+	_, err := client.Apply(ctx, []*spanner.Mutation{
+		spanner.Insert("sessions", []string{"session", "created"}, []any{session, time.Now()}),
+	})
+	if err != nil {
+		return 0, fmt.Errorf("failed to register session: %w", err)
+	}
+
 	var mutations []*spanner.Mutation
 
 	for {
@@ -160,23 +172,19 @@ where
 	}
 }
 
-func ReadLinesHitCount(ctx context.Context, client spannerclient.SpannerClient,
+func ReadLinesHitCount(ctx context.Context, client *spanner.Client,
 	ns, commit, file, manager string, tp TimePeriod,
 ) ([]int64, []int64, error) {
 	stmt := linesCoverageStmt(ns, file, commit, manager, tp)
 	iter := client.Single().Query(ctx, stmt)
 	defer iter.Stop()
 
-	row, err := iter.Next()
-	if err == iterator.Done {
-		return nil, nil, nil
-	}
+	r, err := pkgspanner.ReadRow[LinesCoverage](iter)
 	if err != nil {
-		return nil, nil, fmt.Errorf("iter.Next: %w", err)
+		return nil, nil, err
 	}
-	var r LinesCoverage
-	if err = row.ToStruct(&r); err != nil {
-		return nil, nil, fmt.Errorf("failed to row.ToStruct() spanner DB: %w", err)
+	if r == nil {
+		return nil, nil, nil
 	}
 	if _, err := iter.Next(); err != iterator.Done {
 		return nil, nil, fmt.Errorf("more than 1 line is available")
@@ -253,7 +261,7 @@ func getFileSubsystems(filePath string, ssMatcher *subsystem.PathMatcher, ssCach
 	return sss
 }
 
-func NsDataMerged(ctx context.Context, client spannerclient.SpannerClient, ns string,
+func NsDataMerged(ctx context.Context, client *spanner.Client, ns string,
 ) ([]TimePeriod, []int64, error) {
 	if client == nil {
 		return nil, nil, fmt.Errorf("nil spannerclient")
@@ -275,96 +283,244 @@ func NsDataMerged(ctx context.Context, client spannerclient.SpannerClient, ns st
 	defer iter.Stop()
 	var periods []TimePeriod
 	var totalRows []int64
-	for {
-		row, err := iter.Next()
-		if err == iterator.Done {
-			break
-		}
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to iter.Next() spanner DB: %w", err)
-		}
-		var r struct {
-			Days      int64
-			DateTo    civil.Date
-			TotalRows int64
-		}
-		if err = row.ToStruct(&r); err != nil {
-			return nil, nil, fmt.Errorf("failed to row.ToStruct() spanner DB: %w", err)
-		}
+	type nsDataMergedRow struct {
+		Days      int64
+		DateTo    civil.Date
+		TotalRows int64
+	}
+	rows, err := pkgspanner.ReadRows[nsDataMergedRow](iter)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, r := range rows {
 		periods = append(periods, TimePeriod{DateTo: r.DateTo, Days: int(r.Days)})
 		totalRows = append(totalRows, r.TotalRows)
 	}
 	return periods, totalRows, nil
 }
 
-// DeleteGarbage removes orphaned file entries from the database.
+type sessionRow struct {
+	Session string
+}
+
+type activeSessionRow struct {
+	Session string
+	Created time.Time
+}
+
+type orphanFinder struct {
+	// client is the Spanner client used to execute queries.
+	client *spanner.Client
+	// validSessions is the set of completed session IDs present in merge_history.
+	validSessions map[string]bool
+	// processedSessions tracks session IDs already processed to avoid duplicates and redundant lookups.
+	processedSessions map[string]bool
+	// activeSessions maps registered session IDs in the sessions table to their creation time.
+	activeSessions map[string]time.Time
+	// cutoff is the threshold time; sessions created before this time are considered expired.
+	cutoff time.Time
+	// sessionCh is the channel used to send expired session IDs to deletion workers.
+	sessionCh chan<- string
+}
+
+func (f *orphanFinder) stream(ctx context.Context, sql string) error {
+	iter := f.client.Single().Query(ctx, spanner.Statement{SQL: sql})
+	defer iter.Stop()
+	for {
+		r, err := pkgspanner.ReadRow[sessionRow](iter)
+		if err != nil {
+			return err
+		}
+		if r == nil {
+			break
+		}
+		if f.validSessions[r.Session] || f.processedSessions[r.Session] {
+			continue
+		}
+		f.processedSessions[r.Session] = true
+		created, ok := f.activeSessions[r.Session]
+		if !ok || created.Before(f.cutoff) {
+			select {
+			case f.sessionCh <- r.Session:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+	return nil
+}
+
+// DeleteGarbage cleans up orphaned database entries that are no longer associated with active merge sessions.
 //
-// It identifies files in the "files" table that are not referenced by any entries in the "merge_history" table,
-// indicating they are no longer associated with an active merge session.
+// It identifies sessions in "files" and "functions" tables that are:
+//  1. Not present in "merge_history" (i.e. they are not completed sessions).
+//  2. Either missing from "sessions" table (legacy active sessions, which are deleted immediately)
+//     or present in "sessions" table but created more than 1 week ago (failed/abandoned sessions).
 //
-// To avoid exceeding Spanner transaction limits, orphaned files are deleted in batches of 10,000.
-// Note that in case of an error during batch deletion, some files may be deleted but not counted in the total.
+// Active incomplete sessions (present in "sessions" table and created within the last week)
+// are preserved to allow ongoing uploads to complete.
 //
-// Returns the number of orphaned file entries successfully deleted.
-func DeleteGarbage(ctx context.Context, client spannerclient.SpannerClient) (int64, error) {
-	batchSize := 10_000
+// To avoid slow anti-joins in Spanner, this function fetches all valid and active sessions first,
+// then streams distinct sessions from files and functions, performing the filtering in Go.
+//
+// To avoid exceeding Spanner mutation limits, entries are deleted in batches of 10,000.
+//
+// Returns the number of deleted sessions and the total number of deleted rows.
+func DeleteGarbage(ctx context.Context, client *spanner.Client) (int64, int64, error) {
 	if client == nil {
-		return 0, fmt.Errorf("nil spannerclient")
+		return 0, 0, fmt.Errorf("nil spannerclient")
 	}
 
-	iter := client.Single().Query(ctx, spanner.Statement{
-		SQL: `SELECT session, filepath
-					FROM files
-					WHERE NOT EXISTS (
-						SELECT 1
-						FROM merge_history
-						WHERE merge_history.session = files.session
-					)`})
-	defer iter.Stop()
+	// 1. Get all valid sessions from merge_history
+	validSessions := make(map[string]bool)
+	iterHistory := client.Single().Query(ctx, spanner.Statement{
+		SQL: `SELECT DISTINCT session FROM merge_history`})
+	defer iterHistory.Stop()
+	historyRows, err := pkgspanner.ReadRows[sessionRow](iterHistory)
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, r := range historyRows {
+		validSessions[r.Session] = true
+	}
 
-	var totalDeleted atomic.Int64
-	eg, _ := errgroup.WithContext(ctx)
+	// 2. Get all active sessions from sessions
+	activeSessions := make(map[string]time.Time)
+	iterSessions := client.Single().Query(ctx, spanner.Statement{
+		SQL: `SELECT session, created FROM sessions`})
+	defer iterSessions.Stop()
+	sessionRows, err := pkgspanner.ReadRows[activeSessionRow](iterSessions)
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, r := range sessionRows {
+		activeSessions[r.Session] = r.Created
+	}
+
+	// 3. Stream distinct sessions from files and functions and feed to workers.
+	var deletedRows atomic.Int64
+	var deletedSessions atomic.Int64
+	eg, gCtx := errgroup.WithContext(ctx)
+
+	sessionCh := make(chan string)
+	const numWorkers = 10
+
+	// Spawn workers to process garbage sessions.
+	for range numWorkers {
+		eg.Go(func() error {
+			for session := range sessionCh {
+				if err := processGarbageSession(gCtx, client, session, &deletedRows); err != nil {
+					return err
+				}
+				deletedSessions.Add(1)
+			}
+			return nil
+		})
+	}
+
+	finder := &orphanFinder{
+		client:            client,
+		validSessions:     validSessions,
+		processedSessions: make(map[string]bool),
+		activeSessions:    activeSessions,
+		cutoff:            time.Now().Add(-oneWeekAgo),
+		sessionCh:         sessionCh,
+	}
+
+	eg.Go(func() error {
+		defer close(sessionCh)
+
+		if err := finder.stream(gCtx, `SELECT DISTINCT session FROM files`); err != nil {
+			return err
+		}
+
+		if err := finder.stream(gCtx, `SELECT DISTINCT session FROM functions`); err != nil {
+			return err
+		}
+		return nil
+	})
+
+	err = eg.Wait()
+	return deletedSessions.Load(), deletedRows.Load(), err
+}
+
+func processGarbageSession(ctx context.Context, client *spanner.Client, session string,
+	deletedRows *atomic.Int64) error {
+	if err := deleteGarbageTable(ctx, client, session, "files",
+		`SELECT manager, filepath FROM files WHERE session = $1`, deletedRows); err != nil {
+		return err
+	}
+	if err := deleteGarbageTable(ctx, client, session, "functions",
+		`SELECT filepath, funcname FROM functions WHERE session = $1`, deletedRows); err != nil {
+		return err
+	}
+	// Delete from sessions.
+	mutation := spanner.Delete("sessions", spanner.Key{session})
+	if _, err := client.Apply(ctx, []*spanner.Mutation{mutation}); err != nil {
+		return fmt.Errorf("failed to delete session from sessions table: %w", err)
+	}
+	return nil
+}
+
+func deleteGarbageTable(ctx context.Context, client *spanner.Client, session, table, sql string,
+	deletedRows *atomic.Int64) error {
+	// Spanner limits mutations per transaction (currently 80,000).
+	// We delete in batches of 10,000 rows to stay well below this limit
+	// (each deleted row and its index updates count as mutations)
+	// and to keep transaction overhead low.
+	batchSize := 10000
+
+	iterRows := client.Single().Query(ctx, spanner.Statement{
+		SQL:    sql,
+		Params: map[string]any{"p1": session},
+	})
+	defer iterRows.Stop()
+
 	var batch []spanner.Key
 	for {
-		row, err := iter.Next()
+		row, err := iterRows.Next()
 		if err == iterator.Done {
 			break
 		}
 		if err != nil {
-			return 0, fmt.Errorf("iter.Next: %w", err)
+			return fmt.Errorf("iterRows.Next (%s): %w", table, err)
 		}
-		var r struct {
-			Session  string
-			Filepath string
+		var keyPart1, keyPart2 string
+		if err = row.Columns(&keyPart1, &keyPart2); err != nil {
+			return fmt.Errorf("row.Columns (%s): %w", table, err)
 		}
-		if err = row.ToStruct(&r); err != nil {
-			return 0, fmt.Errorf("row.ToStruct: %w", err)
-		}
-		batch = append(batch, spanner.Key{r.Session, r.Filepath})
-		if len(batch) > batchSize {
-			goSpannerDelete(ctx, batch, eg, client, &totalDeleted)
+
+		batch = append(batch, spanner.Key{session, keyPart1, keyPart2})
+
+		if len(batch) >= batchSize {
+			if err := deleteBatch(ctx, table, batch, client, deletedRows); err != nil {
+				return err
+			}
 			batch = nil
 		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 	}
-	goSpannerDelete(ctx, batch, eg, client, &totalDeleted)
-	if err := eg.Wait(); err != nil {
-		return 0, fmt.Errorf("spanner.Delete: %w", err)
+	if len(batch) > 0 {
+		if err := deleteBatch(ctx, table, batch, client, deletedRows); err != nil {
+			return err
+		}
 	}
-	return totalDeleted.Load(), nil
+
+	return nil
 }
 
-func goSpannerDelete(ctx context.Context, batch []spanner.Key, eg *errgroup.Group, client spannerclient.SpannerClient,
-	totalDeleted *atomic.Int64) {
+func deleteBatch(ctx context.Context, table string, batch []spanner.Key, client *spanner.Client,
+	deletedRows *atomic.Int64) error {
 	ks := spanner.KeySetFromKeys(batch...)
 	ksSize := len(batch)
-	eg.Go(func() error {
-		mutation := spanner.Delete("files", ks)
-		_, err := client.Apply(ctx, []*spanner.Mutation{mutation})
-		if err == nil {
-			totalDeleted.Add(int64(ksSize))
-		}
-		return err
-	})
+	mutation := spanner.Delete(table, ks)
+	_, err := client.Apply(ctx, []*spanner.Mutation{mutation})
+	if err == nil {
+		deletedRows.Add(int64(ksSize))
+	}
+	return err
 }
 
 type FileCoverageWithDetails struct {
@@ -404,7 +560,7 @@ type SelectScope struct {
 
 // FilesCoverageStream streams information about all the line coverage.
 // It is expensive and better to be used for time insensitive operations.
-func FilesCoverageStream(ctx context.Context, client spannerclient.SpannerClient, scope *SelectScope,
+func FilesCoverageStream(ctx context.Context, client *spanner.Client, scope *SelectScope,
 ) (<-chan *FileCoverageWithLineInfo, <-chan error) {
 	iter := client.Single().Query(ctx,
 		filesCoverageWithDetailsStmt(scope, true))
@@ -424,7 +580,7 @@ func FilesCoverageStream(ctx context.Context, client spannerclient.SpannerClient
 // FilesCoverageWithDetails fetches the data directly from DB. No caching.
 // Flag onlyUnique is quite expensive.
 func FilesCoverageWithDetails(
-	ctx context.Context, client spannerclient.SpannerClient, scope *SelectScope, onlyUnique bool,
+	ctx context.Context, client *spanner.Client, scope *SelectScope, onlyUnique bool,
 ) ([]*FileCoverageWithDetails, error) {
 	var res []*FileCoverageWithDetails
 	for _, timePeriod := range scope.Periods {
@@ -500,7 +656,7 @@ where
 	return stmt
 }
 
-func readCoverage(ctx context.Context, iterManager spannerclient.RowIterator) ([]*FileCoverageWithDetails, error) {
+func readCoverage(ctx context.Context, iterManager *spanner.RowIterator) ([]*FileCoverageWithDetails, error) {
 	res := []*FileCoverageWithDetails{}
 	ch := make(chan *FileCoverageWithDetails)
 	var err error
@@ -519,7 +675,7 @@ func readCoverage(ctx context.Context, iterManager spannerclient.RowIterator) ([
 
 // Unique coverage from specific manager is more expensive to get.
 // We get unique coverage comparing manager and total coverage on the AppEngine side.
-func readCoverageUniq(full, mgr spannerclient.RowIterator,
+func readCoverageUniq(full, mgr *spanner.RowIterator,
 ) ([]*FileCoverageWithDetails, error) {
 	eg, ctx := errgroup.WithContext(context.Background())
 	fullCh := make(chan *FileCoverageWithLineInfo)
@@ -574,21 +730,17 @@ func readCoverageUniq(full, mgr spannerclient.RowIterator,
 }
 
 func readIterToChan[K FileCoverageWithLineInfo | FileCoverageWithDetails](
-	ctx context.Context, iter spannerclient.RowIterator, ch chan<- *K) error {
+	ctx context.Context, iter *spanner.RowIterator, ch chan<- *K) error {
 	for {
-		row, err := iter.Next()
-		if err == iterator.Done {
+		r, err := pkgspanner.ReadRow[K](iter)
+		if err != nil {
+			return err
+		}
+		if r == nil {
 			break
 		}
-		if err != nil {
-			return fmt.Errorf("iter.Next: %w", err)
-		}
-		var r K
-		if err = row.ToStruct(&r); err != nil {
-			return fmt.Errorf("row.ToStruct: %w", err)
-		}
 		select {
-		case ch <- &r:
+		case ch <- r:
 		case <-ctx.Done():
 			return nil
 		}
@@ -612,7 +764,7 @@ func IsComparable(fullLines, fullHitCounts, partialLines, partialHitCounts []int
 	return true
 }
 
-// Returns partial hitcounts that are the only source of the full hitcounts.
+// UniqCoverage returns partial hitcounts that are the only source of the full hitcounts.
 func UniqCoverage(fullCov, partCov map[int]int64) map[int]int64 {
 	res := maps.Clone(partCov)
 	for ln := range partCov {
@@ -624,7 +776,7 @@ func UniqCoverage(fullCov, partCov map[int]int64) map[int]int64 {
 }
 
 func RegenerateSubsystems(ctx context.Context, ns string, sss []*subsystem.Subsystem,
-	client spannerclient.SpannerClient) (int, error) {
+	client *spanner.Client) (int, error) {
 	ssMatcher := subsystem.MakePathMatcher(sss)
 	ssCache := make(map[string][]string)
 	filePaths, err := getFilePaths(ctx, ns, client)
@@ -644,7 +796,7 @@ func RegenerateSubsystems(ctx context.Context, ns string, sss []*subsystem.Subsy
 	return len(mutations), nil
 }
 
-func getFilePaths(ctx context.Context, ns string, client spannerclient.SpannerClient) ([]string, error) {
+func getFilePaths(ctx context.Context, ns string, client *spanner.Client) ([]string, error) {
 	iter := client.Single().Query(ctx, spanner.Statement{
 		// Take file names from 1 quarterly, 1 monthly and 1 daily aggregations.
 		SQL: `
@@ -671,21 +823,15 @@ order by files.filepath
 	})
 	defer iter.Stop()
 
+	type filepathRow struct {
+		Filepath string
+	}
+	rows, err := pkgspanner.ReadRows[filepathRow](iter)
+	if err != nil {
+		return nil, err
+	}
 	var res []string
-	for {
-		row, err := iter.Next()
-		if err == iterator.Done {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("iter.Next: %w", err)
-		}
-		var r struct {
-			Filepath string
-		}
-		if err = row.ToStruct(&r); err != nil {
-			return nil, fmt.Errorf("row.ToStruct: %w", err)
-		}
+	for _, r := range rows {
 		res = append(res, r.Filepath)
 	}
 	return res, nil

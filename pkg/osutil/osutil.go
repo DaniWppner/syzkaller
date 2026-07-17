@@ -1,6 +1,8 @@
 // Copyright 2017 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package osutil provides operating system utility functions for process execution,
+// file system operations, and time tracking.
 package osutil
 
 import (
@@ -35,6 +37,8 @@ func RunCmd(timeout time.Duration, dir, bin string, args ...string) ([]byte, err
 	return Run(timeout, cmd)
 }
 
+var ErrTimeout = errors.New("timedout")
+
 // Run runs cmd with the specified timeout.
 // Returns combined output. If the command fails, err includes output.
 func Run(timeout time.Duration, cmd *exec.Cmd) ([]byte, error) {
@@ -68,11 +72,10 @@ func Run(timeout time.Duration, cmd *exec.Cmd) ([]byte, error) {
 	if err != nil {
 		retErr := fmt.Errorf("failed to run %q: %w", cmd.Args, err)
 		if <-timedout {
-			retErr = fmt.Errorf("timedout after %v %q", timeout, cmd.Args)
+			retErr = fmt.Errorf("%w after %v %q", ErrTimeout, timeout, cmd.Args)
 		}
 		exitCode := cmd.ProcessState.ExitCode()
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
+		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
 			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
 				exitCode = status.ExitStatus()
 			}
@@ -91,6 +94,10 @@ func Run(timeout time.Duration, cmd *exec.Cmd) ([]byte, error) {
 func CommandContext(ctx context.Context, bin string, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, bin, args...)
 	setPdeathsig(cmd, true)
+	cmd.Cancel = func() error {
+		killPgroup(cmd)
+		return nil
+	}
 	return cmd
 }
 
@@ -102,7 +109,7 @@ func Command(bin string, args ...string) *exec.Cmd {
 	return cmd
 }
 
-// Command is similar to os/exec.Command, but also sets PDEATHSIG to SIGTERM on linux,
+// GraciousCommand is similar to os/exec.Command, but also sets PDEATHSIG to SIGTERM on linux,
 // i.e. the child has a chance to exit gracefully. This may be important when running
 // e.g. syz-manager. If it is killed immediately, it can leak GCE instances.
 func GraciousCommand(bin string, args ...string) *exec.Cmd {
@@ -131,11 +138,6 @@ func VerboseMessage(err error) string {
 		msg += "\n" + string(verr.Output)
 	}
 	return msg
-}
-
-func IsDir(name string) bool {
-	fileInfo, err := os.Stat(name)
-	return err == nil && fileInfo.IsDir()
 }
 
 // IsExist returns true if the file name exists.
@@ -319,7 +321,7 @@ func TempFile(prefix string) (string, error) {
 	return TempFileIn("", prefix)
 }
 
-// An extended version of TempFileIn that allows to configure
+// TempFileIn is an extended version of TempFile that allows configuring
 // the folder in which the file will be created.
 func TempFileIn(dir, prefix string) (string, error) {
 	f, err := os.CreateTemp(dir, prefix)
@@ -330,7 +332,7 @@ func TempFileIn(dir, prefix string) (string, error) {
 	return f.Name(), nil
 }
 
-// Return all files in a directory.
+// ListDir returns all files in a directory.
 func ListDir(dir string) ([]string, error) {
 	f, err := os.Open(dir)
 	if err != nil {

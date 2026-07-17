@@ -1,6 +1,7 @@
 // Copyright 2024 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package fuzzer orchestrates syzkaller fuzzing logic, corpus distribution, and signal updates.
 package fuzzer
 
 import (
@@ -12,9 +13,10 @@ import (
 	"sync"
 	"time"
 
+	pkgfeatures "github.com/google/syzkaller/pkg/vminfo/features"
+
 	"github.com/google/syzkaller/pkg/corpus"
 	"github.com/google/syzkaller/pkg/cover"
-	"github.com/google/syzkaller/pkg/csource"
 	"github.com/google/syzkaller/pkg/flatrpc"
 	"github.com/google/syzkaller/pkg/fuzzer/queue"
 	"github.com/google/syzkaller/pkg/mgrconfig"
@@ -37,7 +39,7 @@ type Fuzzer struct {
 
 	ct           *prog.ChoiceTable
 	ctProgs      int
-	ctMu         sync.Mutex // TODO: use RWLock.
+	ctMu         sync.RWMutex
 	ctRegenerate chan struct{}
 
 	execQueues
@@ -161,8 +163,10 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 
 		if len(triage) != 0 {
 			queue, stat := fuzzer.triageQueue, fuzzer.statJobsTriage
+			jobType := JobTriage
 			if flags&progCandidate > 0 {
 				queue, stat = fuzzer.triageCandidateQueue, fuzzer.statJobsTriageCandidate
+				jobType = JobCandidateTriage
 			}
 			job := &triageJob{
 				p:        req.Prog.Clone(),
@@ -172,7 +176,7 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 				calls:    triage,
 				info: &JobInfo{
 					Name:            req.Prog.String(),
-					Type:            "triage",
+					Type:            jobType,
 					ProgId:          req.Prog.GetUuid(),
 					FromFPCovOrigin: req.FromFPCovOrigin,
 				},
@@ -470,8 +474,8 @@ func (fuzzer *Fuzzer) choiceTableUpdater() {
 func (fuzzer *Fuzzer) ChoiceTable() *prog.ChoiceTable {
 	progs := fuzzer.Config.Corpus.Programs()
 
-	fuzzer.ctMu.Lock()
-	defer fuzzer.ctMu.Unlock()
+	fuzzer.ctMu.RLock()
+	defer fuzzer.ctMu.RUnlock()
 
 	// There were no deep ideas nor any calculations behind these numbers.
 	regenerateEveryProgs := 333
@@ -523,10 +527,11 @@ func setFlags(execFlags flatrpc.ExecFlag) flatrpc.ExecOpts {
 	}
 }
 
+// DefaultExecOpts returns default execution options.
 // TODO: This method belongs better to pkg/flatrpc, but we currently end up
 // having a cyclic dependency error.
 func DefaultExecOpts(cfg *mgrconfig.Config, features flatrpc.Feature, debug bool) flatrpc.ExecOpts {
-	env := csource.FeaturesToFlags(features, nil)
+	env := pkgfeatures.FeaturesToFlags(features, nil)
 	if debug {
 		env |= flatrpc.ExecEnvDebug
 	}

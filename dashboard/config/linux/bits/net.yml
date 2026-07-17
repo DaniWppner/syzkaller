@@ -125,7 +125,8 @@ config:
  - NF_CONNTRACK_SANE
  - NF_CONNTRACK_SIP
  - NF_CONNTRACK_TFTP
- - NF_CT_PROTO_UDPLITE
+ # Removed in 84dee05d9d618 "netfilter: conntrack: remove UDP-Lite conntrack support".
+ - NF_CT_PROTO_UDPLITE: [-v7.1]
  - NF_CT_NETLINK
  - NF_CT_NETLINK_TIMEOUT
  - NF_CT_NETLINK_HELPER
@@ -443,8 +444,8 @@ config:
  - NLMON
  - NET_VRF
  - VSOCKMON: [-onlynet]
- - E100: [-s390]
- - E1000E: [-s390]
+ - E100: [-s390, -arm64_gce]
+ - E1000E: [-s390, -arm64_gce]
  - NET_VENDOR_GOOGLE
  - NET_VENDOR_3COM: n
  - NET_VENDOR_ADAPTEC: n
@@ -521,7 +522,7 @@ config:
  - INFINIBAND_USER_MAD
  - INFINIBAND_USER_ACCESS
  - INFINIBAND_ADDR_TRANS
- - MLX4_INFINIBAND
+ - MLX4_INFINIBAND: [-arm64_gce]
  - INFINIBAND_USNIC: n
  - INFINIBAND_RDMAVT: n
  - INFINIBAND_OPA_VNIC: n

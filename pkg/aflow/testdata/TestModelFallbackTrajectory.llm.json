@@ -1,0 +1,41 @@
+[
+	{
+		"Model": "model1",
+		"Config": {
+			"systemInstruction": {
+				"parts": [
+					{
+						"text": "Instruction"
+					}
+				],
+				"role": "user"
+			},
+			"temperature": 0.3,
+			"thinkingLevel": 3,
+			"includeThoughts": true
+		},
+		"Request": [
+			{
+				"parts": [
+					{
+						"text": "Prompt"
+					}
+				],
+				"role": "user"
+			}
+		]
+	},
+	{
+		"Model": "model2",
+		"Request": [
+			{
+				"parts": [
+					{
+						"text": "Prompt"
+					}
+				],
+				"role": "user"
+			}
+		]
+	}
+]

@@ -6,12 +6,14 @@ package main
 import (
 	"context"
 	"fmt"
-	"net"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/google/syzkaller/pkg/execbackend"
 	"github.com/google/syzkaller/pkg/flatrpc"
 	"github.com/google/syzkaller/pkg/fuzzer"
 	"github.com/google/syzkaller/pkg/fuzzer/queue"
@@ -54,7 +56,7 @@ type Kernel struct {
 	reporter        *report.Reporter
 	queueConfigured bool
 
-	serv      rpcserver.Server
+	serv      execbackend.Server
 	servStats rpcserver.Stats
 
 	pool    *vm.Dispatcher
@@ -71,6 +73,7 @@ type Kernel struct {
 // Verifier
 // =============================================================================.
 
+// RunVerifierFuzzer starts the verifier fuzzing loop.
 func (vrf *Verifier) RunVerifierFuzzer(ctx context.Context) error {
 	log.Logf(0, "starting verifier fuzzer")
 	eg, ctx := errgroup.WithContext(ctx)
@@ -218,9 +221,7 @@ func (vrf *Verifier) waitForKernelsReady(ctx context.Context) (map[*prog.Syscall
 		if idx == 0 {
 			// Initialize with first kernel's syscalls.
 			totalEnabledSyscalls = make(map[*prog.Syscall]bool)
-			for k, v := range enabledSyscalls {
-				totalEnabledSyscalls[k] = v
-			}
+			maps.Copy(totalEnabledSyscalls, enabledSyscalls)
 		} else {
 			// Intersect: keep only syscalls enabled in ALL kernels.
 			for k := range totalEnabledSyscalls {
@@ -333,13 +334,7 @@ func (vrf *Verifier) compareResults(prog *prog.Prog, responses []*queue.Result) 
 
 			// Print full program with detailed call information.
 			for callIdx, call := range prog.Calls {
-				isMismatch := false
-				for _, mc := range mismatchCalls {
-					if mc == callIdx {
-						isMismatch = true
-						break
-					}
-				}
+				isMismatch := slices.Contains(mismatchCalls, callIdx)
 
 				prefix := "   "
 				if isMismatch {
@@ -430,12 +425,10 @@ func (vrf *Verifier) createRequests(prog *prog.Prog) (map[int]*queue.Request, []
 // Kernel
 // =============================================================================.
 
+// FuzzerInstance runs a fuzzer instance on the given VM.
 func (kernel *Kernel) FuzzerInstance(ctx context.Context, inst *vm.Instance, updInfo dispatcher.UpdateInfo) {
-	index := inst.Index()
-	injectExec := make(chan bool, 10)
-	kernel.serv.CreateInstance(index, injectExec, updInfo)
-	reps, err := kernel.runInstance(ctx, inst, injectExec)
-	_, _ = kernel.serv.ShutdownInstance(index, len(reps) > 0)
+	reps, err := kernel.serv.RunRequests(ctx, inst, kernel.reporter, updInfo)
+
 	if len(reps) > 0 {
 		// Just log crashes - syz-verifier focuses on behavioral differences, not crashes.
 		select {
@@ -449,41 +442,11 @@ func (kernel *Kernel) FuzzerInstance(ctx context.Context, inst *vm.Instance, upd
 	}
 }
 
-func (kernel *Kernel) runInstance(ctx context.Context, inst *vm.Instance,
-	injectExec <-chan bool) ([]*report.Report, error) {
-	fwdAddr, err := inst.Forward(kernel.serv.Port())
-	if err != nil {
-		return nil, fmt.Errorf("failed to setup port forwarding: %w", err)
-	}
-	executorBin, err := inst.Copy(kernel.cfg.ExecutorBin)
-	if err != nil {
-		return nil, fmt.Errorf("failed to copy binary: %w", err)
-	}
-	host, port, err := net.SplitHostPort(fwdAddr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse manager's address")
-	}
-	cmd := fmt.Sprintf("%v runner %v %v %v", executorBin, inst.Index(), host, port)
-	ctxTimeout, cancel := context.WithTimeout(ctx, kernel.cfg.Timeouts.VMRunningTime)
-	defer cancel()
-	_, rep, err := inst.Run(ctxTimeout, kernel.reporter, cmd,
-		vm.WithExitCondition(vm.ExitTimeout),
-		vm.WithInjectExecuting(injectExec),
-		vm.WithEarlyFinishCb(func() {
-			// Depending on the crash type and kernel config, fuzzing may continue
-			// running for several seconds even after kernel has printed a crash report.
-			// This litters the log and we want to prevent it.
-			kernel.serv.StopFuzzing(inst.Index())
-		}),
-	)
-	return rep, err
-}
-
 func (kernel *Kernel) MachineChecked(features flatrpc.Feature,
-	enabledSyscalls map[*prog.Syscall]bool) (queue.Source, error) {
+	enabledSyscalls map[*prog.Syscall]bool) error {
 	if len(enabledSyscalls) == 0 {
 		log.Logf(0, "no syscalls enabled for kernel %s", kernel.cfg.Name)
-		return nil, nil
+		return nil
 	}
 	log.Logf(0, "kernel %s: sending enabled syscalls: %v", kernel.cfg.Name, enabledSyscalls)
 	kernel.enabledSyscalls <- enabledSyscalls
@@ -496,12 +459,13 @@ func (kernel *Kernel) MachineChecked(features flatrpc.Feature,
 	kernel.mu.Lock()
 	kernel.queueConfigured = true
 	kernel.mu.Unlock()
-	return kernel.source, nil
+	kernel.serv.SetSource(kernel.source)
+	return nil
 }
 
 func (kernel *Kernel) loop(ctx context.Context) {
 	defer log.Logf(1, "syz-verifier (%s): kernel context loop terminated", kernel.cfg.Name)
-	if err := kernel.serv.Listen(); err != nil {
+	if err := kernel.serv.Setup(); err != nil {
 		log.Fatalf("failed to start rpc server: %v", err)
 	}
 	// Respect both the caller-provided context and global shutdown.
@@ -517,7 +481,6 @@ func (kernel *Kernel) loop(ctx context.Context) {
 			log.Fatalf("%s", err)
 		}
 	}()
-	log.Logf(0, "serving rpc on tcp://%v", kernel.serv.Port())
 	kernel.pool.Loop(runCtx)
 }
 

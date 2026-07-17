@@ -34,6 +34,8 @@ var (
 	_ ConfigMinimizer = new(linux)
 )
 
+const defaultLinuxRepo = "https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux"
+
 func newLinux(dir string, opts []RepoOpt, vmType string) *linux {
 	ignoreCC := map[string]bool{
 		"stable@vger.kernel.org": true,
@@ -96,7 +98,7 @@ func (ctx *linux) PreviousReleaseTags(commit, compilerType string) ([]string, er
 
 func gitParseReleaseTags(output []byte, includeRC bool) []string {
 	var tags []string
-	for _, tag := range bytes.Split(output, []byte{'\n'}) {
+	for tag := range bytes.SplitSeq(output, []byte{'\n'}) {
 		if gitReleaseTagToInt(string(tag), includeRC) != 0 {
 			tags = append(tags, string(tag))
 		}
@@ -246,7 +248,7 @@ func (ctx *linux) getMaintainers(hash string, blame bool) Recipients {
 
 func ParseMaintainersLinux(text []byte) Recipients {
 	lines := strings.Split(string(text), "\n")
-	reRole := regexp.MustCompile(` \([^)]+\)$`)
+	reRole := regexp.MustCompile(` \([^()]*(?:\([^()]*\)[^()]*)*\)$`)
 	var mtrs Recipients
 	// LMKL is To by default, but it changes to Cc if there's also a subsystem list.
 	lkmlType := To

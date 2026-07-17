@@ -1,6 +1,7 @@
 // Copyright 2015 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package mgrconfig parses and validates configuration files for syz-manager.
 package mgrconfig
 
 import (
@@ -147,7 +148,7 @@ type Config struct {
 
 	// CovFilter used to restrict the area of the kernel visible to syzkaller.
 	// DEPRECATED! Use the FocusAreas parameter instead.
-	CovFilter CovFilterCfg `json:"cover_filter,omitempty"`
+	CovFilter CovFilterCfg `json:"cover_filter,omitzero"`
 
 	// For each prog in the corpus, remember the raw array of PCs obtained from the kernel.
 	// It can be useful for debugging syzkaller descriptions and syzkaller itself.
@@ -235,8 +236,8 @@ type Config struct {
 	Derived `json:"-"`
 }
 
-// These options are not guaranteed to be backward/forward compatible and
-// can be dropped at any moment.
+// Experimental contains options that are not guaranteed to be backward- or forward-compatible
+// and may be dropped at any moment.
 type Experimental struct {
 	// Don't let the VM state accumulate too much by restarting
 	// syz-executor before most prog executions.
@@ -282,7 +283,7 @@ type FocusArea struct {
 	// Each line of the file should be: "64-bit-pc:32-bit-weight\n".
 	// eg. "0xffffffff81000000:0x10\n"
 	// If empty, it's assumed to match the whole kernel.
-	Filter CovFilterCfg `json:"filter,omitempty"`
+	Filter CovFilterCfg `json:"filter,omitzero"`
 
 	// Weight is a positive number that determines how much focus should be put on this area.
 	Weight float64 `json:"weight"`

@@ -16,6 +16,7 @@ import (
 	"github.com/google/syzkaller/sys/targets"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	aemail "google.golang.org/appengine/v2/mail"
 )
 
 // nolint: funlen
@@ -624,6 +625,18 @@ that is the sender of the bug report (also present in the Reported-by tag).
 
 `)
 
+	// If the command was seen on a mailing list, but syzbot was not addressed, do NOT reply.
+	// Since we receive the email, it hits our endpoint, but the To header is the mailing list.
+	c.incomingEmail("syzbot@testapp.appspotmail.com", "#syz invalid",
+		EmailOptTo("test@syzkaller.com"), EmailOptSender("test@syzkaller.com"))
+	c.expectNoEmail()
+
+	// If the command was seen on a mailing list AND syzbot was explicitly addressed (without hash), we DO reply.
+	c.incomingEmail("syzbot@testapp.appspotmail.com", "#syz invalid",
+		EmailOptSender("test@syzkaller.com"), EmailOptCC([]string{"test@syzkaller.com"}))
+	reply = c.pollEmailBug()
+	assert.Contains(t, reply.Body, "I see the command but can't find the corresponding bug")
+
 	c.incomingEmail("syzbot+123@testapp.appspotmail.com", "#syz invalid")
 	reply = c.pollEmailBug()
 	c.expectEQ(reply.Body, `> #syz invalid
@@ -634,6 +647,50 @@ but the HASH does not correspond to any known bug.
 Please double check the address.
 
 `)
+
+	// If the email contains a fake bug hash, but NO commands, do not reply.
+	c.incomingEmail("syzbot+123@testapp.appspotmail.com", "Just some random discussion",
+		EmailOptFrom("user@example.com"))
+	c.expectNoEmail()
+}
+
+func TestEmailLoop(t *testing.T) {
+	c := NewCtx(t)
+	defer c.Close()
+
+	// Send an invalid command to get the error reply with HASH.
+	c.incomingEmail("syzbot+123@testapp.appspotmail.com", "#syz invalid")
+	reply := c.pollEmailBug()
+	c.expectEQ(reply.Body, `> #syz invalid
+
+I see the command but can't find the corresponding bug.
+The email is sent to  syzbot+HASH@testapp.appspotmail.com address
+but the HASH does not correspond to any known bug.
+Please double check the address.
+
+`)
+
+	// Now simulate the mailing list forwarding this reply back to us.
+	// We inject a fake command to ensure it doesn't bounce even if the parser extracts a command.
+	c.incomingEmail("syzbot@testapp.appspotmail.com", reply.Body+"\n#syz invalid",
+		EmailOptFrom("syzbot@testapp.appspotmail.com"),
+		EmailOptSender("syzkaller-upstream-moderation@googlegroups.com"))
+	c.expectNoEmail()
+
+	// Verify we don't reply to our own emails even if they have commands and wrong Bug IDs.
+	c.incomingEmail("syzbot+123@testapp.appspotmail.com", "#syz invalid",
+		EmailOptFrom("syzbot@testapp.appspotmail.com"),
+		EmailOptSender("syzkaller-upstream-moderation@googlegroups.com"))
+	c.expectNoEmail()
+
+	// A reply from a context-addressed syzbot sender is still our own email and
+	// must not trigger a new error reply from quoted commands.
+	c.incomingEmail("syzbot+123@testapp.appspotmail.com", `> #syz upstream
+
+Failed to process the command.`,
+		EmailOptFrom("syzbot+cidbb9f477452b5813@testapp.appspotmail.com"),
+		EmailOptSender("syzkaller-upstream-moderation@googlegroups.com"))
+	c.expectNoEmail()
 }
 
 func TestEmailFailedBuild(t *testing.T) {
@@ -740,6 +797,36 @@ func TestEmailUnfix(t *testing.T) {
 	// The bug should be still unfixed, since we unmarked it.
 	c.client2.ReportCrash(crash)
 	c.expectNoEmail()
+}
+
+// Test for unfix command on a bug that is already marked as fixed.
+func TestEmailUnfixFixedBug(t *testing.T) {
+	c := NewCtx(t)
+	defer c.Close()
+
+	build := testBuild(1)
+	c.client2.UploadBuild(build)
+
+	crash := testCrash(build, 1)
+	c.client2.ReportCrash(crash)
+
+	msg := c.pollEmailBug()
+
+	c.incomingEmail(msg.Sender, "#syz fix: some commit")
+	c.expectNoEmail()
+
+	build2 := testBuild(2)
+	build2.Manager = build.Manager
+	build2.Commits = []string{"some commit"}
+	c.client2.UploadBuild(build2)
+
+	// Now the bug should be fixed.
+	// Try to unfix it. It should reply with an error.
+	c.incomingEmail(msg.Sender, "#syz unfix")
+	reply := c.pollEmailBug()
+	if !strings.Contains(reply.Body, "This bug is already marked as fixed.") {
+		t.Fatalf("expected reply about bug being already fixed, got %q", reply.Body)
+	}
 }
 
 func TestEmailManagerCC(t *testing.T) {
@@ -997,9 +1084,7 @@ func TestBugFromSubjectInference(t *testing.T) {
 		EmailOptOrigFrom("test@requester.com"),
 		EmailOptFrom(mailingList), EmailOptSubject(subject),
 	)
-	syzbotReply := c.pollEmailBug()
-	c.expectNE(syzbotReply.Sender, origSender)
-	c.expectEQ(strings.Contains(syzbotReply.Body, "can't find the corresponding bug"), true)
+	c.expectNoEmail()
 
 	// Now try to test the exiting bug, but with the wrong mailing list.
 	subject = "Re: " + crashTitle
@@ -1017,7 +1102,7 @@ func TestBugFromSubjectInference(t *testing.T) {
 		EmailOptFrom(mailingList), EmailOptOrigFrom("test@requester.com"),
 		EmailOptSubject(subject),
 	)
-	syzbotReply = c.pollEmailBug()
+	syzbotReply := c.pollEmailBug()
 	c.expectEQ(syzbotReply.Sender, origSender)
 	c.expectEQ(strings.Contains(syzbotReply.Body, "This crash does not have a reproducer"), true)
 
@@ -1406,6 +1491,32 @@ Author: default@sender.com
 `)
 }
 
+func TestForwardNotDirect(t *testing.T) {
+	c := NewCtx(t)
+	defer c.Close()
+
+	client := c.makeClient(clientPublicEmail, keyPublicEmail, true)
+	c.updateReporting("access-public-email", "access-public-email-reporting1",
+		func(r Reporting) Reporting {
+			r.Config = &forwardEmailConfig
+			return r
+		})
+
+	build := testBuild(1)
+	client.UploadBuild(build)
+
+	crash := testCrash(build, 1)
+	client.ReportCrash(crash)
+
+	sender := c.pollEmailBug().Sender
+
+	// Send to one of the mailing lists, but only include the bug ID in the body.
+	c.incomingEmail("test@syzkaller.com", "Reported-by: "+sender+"\n\n#syz fix: some: commit title",
+		EmailOptCC(nil), EmailOptSubject("fix bug title"))
+
+	c.expectNoEmail()
+}
+
 func TestForwardEmailInbox(t *testing.T) {
 	c := NewCtx(t)
 	defer c.Close()
@@ -1489,4 +1600,59 @@ Author: someone@mail.com
 		require.NotNil(t, msg)
 		assert.Contains(t, msg.Body, "I see the command but can't find the corresponding bug")
 	})
+}
+
+func TestEmailIndirectCommandIgnored(t *testing.T) {
+	c := NewCtx(t)
+	defer c.Close()
+
+	build := testBuild(1)
+	c.client2.UploadBuild(build)
+
+	crash := testCrash(build, 1)
+	c.client2.ReportCrash(crash)
+
+	msg := c.pollEmailBug()
+
+	// Simulate an email that is NOT addressed directly to syzbot, but contains
+	// a Reported-by tag (which provides the Bug ID) and a command.
+	// We expect the command to be ignored (no reply from syzbot).
+	body := "Some text\n\nReported-by: " + msg.Sender + "\n\n#syz upstream"
+	c.incomingEmail("patch-bot@kernel.org", body,
+		EmailOptFrom("someone@kernel.org"),
+		EmailOptCC([]string{"patch-bot@kernel.org", "test@syzkaller.com"}))
+
+	// No email should be sent back.
+	c.expectNoEmail()
+}
+
+func TestEmailRateLimit(t *testing.T) {
+	MaxGlobalEmailsPerHour = 3
+	c := NewCtx(t)
+	defer c.Close()
+
+	msg := &aemail.Message{
+		Sender:  "syzbot@testapp.appspotmail.com",
+		To:      []string{"test@syzkaller.com"},
+		Subject: "Test subject",
+		Body:    "Test body",
+	}
+
+	for i := range MaxGlobalEmailsPerHour {
+		// Calling the checker directly is easier than modifying the sender mock.
+		err := checkEmailRateLimit(c.ctx, msg)
+		require.NoError(t, err, "failed to send email %d", i)
+	}
+
+	// Max + 1 should fail.
+	err := checkEmailRateLimit(c.ctx, msg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "global email rate limit exceeded")
+
+	// Advance time by 1 hour.
+	c.advanceTime(time.Hour)
+
+	// Now we should be able to send emails again.
+	err = checkEmailRateLimit(c.ctx, msg)
+	require.NoError(t, err)
 }

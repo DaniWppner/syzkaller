@@ -6,9 +6,12 @@ kind: StatefulSet
 metadata:
   name: syz-agent
   namespace: syz-agent
+  annotations:
+    ignore-check.kube-linter.io/non-existent-service-account: "Service account is defined in Terraform"
+    ignore-check.kube-linter.io/sensitive-host-mounts: "Mounting /dev is needed to access dynamically created loop devices during kernel image embedding"
 spec:
   serviceName: "syz-agent"
-  replicas: 2
+  replicas: 6
   selector:
     matchLabels:
       app: syz-agent
@@ -21,11 +24,9 @@ spec:
       containers:
       - name: syz-agent
         image: gcr.io/syzkaller/syz-agent:latest # Replace with your image.
-        command: ["/app/syz-agent"]
         args:
           - "-name=$(POD_NAME)"
           - "-config=/etc/syz-agent/config.json"
-          - "-syzkaller=/syzkaller"
         env:
           - name: POD_NAME
             valueFrom:
@@ -50,6 +51,8 @@ spec:
             mountPath: /app/workdir
           - name: dev-kvm
             mountPath: /dev/kvm
+          - name: dev
+            mountPath: /dev
       volumes:
         - name: config-volume
           configMap:
@@ -58,6 +61,10 @@ spec:
           hostPath:
             path: /dev/kvm
             type: CharDevice
+        - name: dev
+          hostPath:
+            path: /dev
+            type: Directory
   volumeClaimTemplates:
   - metadata:
       name: workdir

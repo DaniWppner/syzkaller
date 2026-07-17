@@ -7,7 +7,6 @@
 // See the following links for details and API reference:
 // https://cloud.google.com/go/getting-started/using-cloud-storage
 // https://godoc.org/cloud.google.com/go/storage
-
 package gcs
 
 import (
@@ -208,9 +207,9 @@ func (c *client) ListObjects(bucketObjectPath string) ([]*Object, error) {
 }
 
 func split(file string) (bucket, filename string, err error) {
-	pos := strings.IndexByte(file, '/')
-	if pos == -1 {
+	before, after, ok := strings.Cut(file, "/")
+	if !ok {
 		return "", "", fmt.Errorf("invalid GCS file name: %v", file)
 	}
-	return file[:pos], file[pos+1:], nil
+	return before, after, nil
 }

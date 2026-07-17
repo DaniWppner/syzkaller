@@ -1,12 +1,14 @@
 // Copyright 2021 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package gcpsecret provides utilities for retrieving secrets from GCP Secret Manager.
 package gcpsecret
 
 import (
 	"context"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 
 	"cloud.google.com/go/compute/metadata"
@@ -83,4 +85,9 @@ func Resolve(ctx context.Context, val string) (string, error) {
 		return string(data), nil
 	}
 	return val, nil
+}
+
+func init() {
+	// Used by dashboard/app configs.
+	runtime.KeepAlive(GcpSecret)
 }

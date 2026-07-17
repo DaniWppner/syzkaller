@@ -1,6 +1,7 @@
 // Copyright 2024 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package queue manages prioritized execution queues and request distribution for fuzzing targets.
 package queue
 
 import (
@@ -99,7 +100,7 @@ func (r *Request) Done(res *Result) {
 
 var ErrRequestAborted = errors.New("context closed while waiting the result")
 
-// Wait() blocks until we have the result.
+// Wait blocks until we have the result.
 func (r *Request) Wait(ctx context.Context) *Result {
 	r.initChannel()
 	select {
@@ -110,7 +111,7 @@ func (r *Request) Wait(ctx context.Context) *Result {
 	}
 }
 
-// Risky() returns true if there's a substantial risk of the input crashing the VM.
+// Risky returns true if there's a substantial risk of the input crashing the VM.
 func (r *Request) Risky() bool {
 	return r.onceCrashed
 }
@@ -205,7 +206,7 @@ func (r *Result) Stop() bool {
 	}
 }
 
-// Globs returns result of RequestTypeGlob.
+// GlobFiles returns result of RequestTypeGlob.
 func (r *Result) GlobFiles() []string {
 	out := strings.Trim(string(r.Output), "\000")
 	if out == "" {
@@ -355,7 +356,7 @@ type DynamicOrderer struct {
 	ops      *priorityQueueOps[*Request]
 }
 
-// DynamicOrder() can be used to form nested queues dynamically.
+// DynamicOrder can be used to form nested queues dynamically.
 // That is, if
 // q1 := pq.Append()
 // q2 := pq.Append()
@@ -417,7 +418,7 @@ func (ds *DynamicSourceCtl) Next() *Request {
 	return (*ds.value.Load()).Next()
 }
 
-// Deduplicator() keeps track of the previously run requests to avoid re-running them.
+// Deduplicator keeps track of the previously run requests to avoid re-running them.
 type Deduplicator struct {
 	mu     sync.Mutex
 	source Source

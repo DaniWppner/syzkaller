@@ -13,8 +13,8 @@ import (
 	"sort"
 	"strings"
 
+	"cloud.google.com/go/spanner"
 	"github.com/google/syzkaller/pkg/coveragedb"
-	"github.com/google/syzkaller/pkg/coveragedb/spannerclient"
 	_ "github.com/google/syzkaller/pkg/subsystem/lists"
 	"golang.org/x/exp/maps"
 )
@@ -147,7 +147,7 @@ func (thm *templateHeatmapRow) prepareDataFor(pageColumns []pageColumnTarget, na
 }
 
 func (thm *templateHeatmapRow) Visit(v func(string, int64, bool), path ...string) {
-	curPath := append(path, thm.Name)
+	curPath := append(slices.Clone(path), thm.Name)
 	v(strings.Join(curPath, "/"), thm.Summary, thm.IsDir)
 	for _, item := range thm.Items {
 		item.Visit(v, curPath...)
@@ -226,7 +226,7 @@ type Format struct {
 }
 
 func DoHeatMapStyleBodyJS(
-	ctx context.Context, client spannerclient.SpannerClient, scope *coveragedb.SelectScope, onlyUnique bool,
+	ctx context.Context, client *spanner.Client, scope *coveragedb.SelectScope, onlyUnique bool,
 	sss, managers []string, dataFilters Format) (template.CSS, template.HTML, template.HTML, error) {
 	covAndDates, err := coveragedb.FilesCoverageWithDetails(ctx, client, scope, onlyUnique)
 	if err != nil {
@@ -241,7 +241,7 @@ func DoHeatMapStyleBodyJS(
 }
 
 func DoSubsystemsHeatMapStyleBodyJS(
-	ctx context.Context, client spannerclient.SpannerClient, scope *coveragedb.SelectScope, onlyUnique bool,
+	ctx context.Context, client *spanner.Client, scope *coveragedb.SelectScope, onlyUnique bool,
 	sss, managers []string, format Format) (template.CSS, template.HTML, template.HTML, error) {
 	covWithDetails, err := coveragedb.FilesCoverageWithDetails(ctx, client, scope, onlyUnique)
 	if err != nil {
@@ -324,9 +324,11 @@ func abs(a int64) int64 {
 	return a
 }
 
-//go:embed templates/heatmap.html
-var templatesHeatmap string
-var templateHeatmapFuncs = template.FuncMap{
-	"approxInstr": approximateInstrumented,
-}
-var heatmapTemplate = template.Must(template.New("").Funcs(templateHeatmapFuncs).Parse(templatesHeatmap))
+var (
+	//go:embed templates/heatmap.html
+	templatesHeatmap     string
+	templateHeatmapFuncs = template.FuncMap{
+		"approxInstr": approximateInstrumented,
+	}
+	heatmapTemplate = template.Must(template.New("").Funcs(templateHeatmapFuncs).Parse(templatesHeatmap))
+)

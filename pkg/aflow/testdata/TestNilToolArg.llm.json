@@ -5,7 +5,7 @@
 			"systemInstruction": {
 				"parts": [
 					{
-						"text": "Instructions\nPrefer calling several tools at the same time to save round-trips.\n"
+						"text": "Instructions: use the provided tool swiss-knife for something.\nPrefer calling several tools at the same time to save round-trips.\n"
 					}
 				],
 				"role": "user"
@@ -15,41 +15,40 @@
 				{
 					"functionDeclarations": [
 						{
-							"description": "tool",
-							"name": "tool",
+							"description": "tool description",
+							"name": "swiss-knife",
 							"parametersJsonSchema": {
-								"additionalProperties": false,
+								"type": "object",
 								"properties": {
 									"Optional": {
-										"description": "An optional arg.",
 										"type": [
 											"null",
 											"integer"
-										]
+										],
+										"description": "An optional arg."
 									}
 								},
 								"required": [
 									"Optional"
 								],
-								"type": "object"
+								"additionalProperties": false
 							},
 							"responseJsonSchema": {
-								"additionalProperties": false,
-								"type": "object"
+								"type": "object",
+								"additionalProperties": false
 							}
 						}
 					]
 				}
 			],
-			"responseModalities": [
-				"TEXT"
-			]
+			"thinkingLevel": 3,
+			"includeThoughts": true
 		},
 		"Request": [
 			{
 				"parts": [
 					{
-						"text": "Initial Prompt"
+						"text": "Prompt"
 					}
 				],
 				"role": "user"
@@ -62,7 +61,7 @@
 			{
 				"parts": [
 					{
-						"text": "Initial Prompt"
+						"text": "Prompt"
 					}
 				],
 				"role": "user"
@@ -74,20 +73,20 @@
 							"args": {
 								"Optional": null
 							},
-							"name": "tool"
+							"name": "swiss-knife"
 						}
 					}
 				],
-				"role": "user"
+				"role": "model"
 			},
 			{
 				"parts": [
 					{
 						"functionResponse": {
-							"name": "tool",
 							"response": {
 								"error": "missing argument \"Optional\""
-							}
+							},
+							"name": "swiss-knife"
 						}
 					}
 				],

@@ -13,7 +13,7 @@ import (
 	"github.com/google/syzkaller/sys/targets"
 )
 
-// Sleep for d.
+// SleepInterruptible sleeps for d.
 // If shutdown is in progress, return false prematurely.
 func SleepInterruptible(d time.Duration) bool {
 	select {
@@ -77,7 +77,7 @@ func SSHArgsForward(debug bool, sshKey string, port, forwardPort int, systemSSHC
 }
 
 func scpArgs(debug bool, sshKey string, port int, systemSSHCfg bool) []string {
-	return sshArgs(debug, sshKey, "-P", port, 0, systemSSHCfg)
+	return append(sshArgs(debug, sshKey, "-P", port, 0, systemSSHCfg), "-O") // Default to legacy scp protocol.
 }
 
 func sshArgs(debug bool, sshKey, portArg string, port, forwardPort int, systemSSHCfg bool) []string {
@@ -130,8 +130,7 @@ func SCP(hostSrc, vmDst string, opts SCPOptions) error {
 	}
 	output, err := osutil.RunCmd(timeout, opts.Dir, "scp", args...)
 	if err != nil {
-		var verr *osutil.VerboseError
-		if errors.As(err, &verr) {
+		if verr, ok := errors.AsType[*osutil.VerboseError](err); ok {
 			log.Logf(0, "scp failed: %v\n%s", err, string(verr.Output))
 		}
 		return fmt.Errorf("scp failed: %w", err)

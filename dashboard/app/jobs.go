@@ -45,11 +45,9 @@ type testReqArgs struct {
 func handleTestRequest(ctx context.Context, args *testReqArgs) error {
 	log.Infof(ctx, "test request: bug=%s user=%q extID=%q patch=%v, repo=%q branch=%q",
 		args.bug.Title, args.user, args.extID, len(args.patch), args.repo, args.branch)
-	for _, blocked := range getConfig(ctx).EmailBlocklist {
-		if args.user == blocked {
-			return &TestRequestDeniedError{
-				fmt.Sprintf("test request from blocked user: %v", args.user),
-			}
+	if slices.Contains(getConfig(ctx).EmailBlocklist, args.user) {
+		return &TestRequestDeniedError{
+			fmt.Sprintf("test request from blocked user: %v", args.user),
 		}
 	}
 	crash, crashKey, err := findCrashForBug(ctx, args.bug)
@@ -58,7 +56,8 @@ func handleTestRequest(ctx context.Context, args *testReqArgs) error {
 	}
 	_, _, err = addTestJob(ctx, &testJobArgs{
 		testReqArgs: *args,
-		crash:       crash, crashKey: crashKey,
+		crash:       crash,
+		crashKey:    crashKey,
 	})
 	if err != nil {
 		return err
@@ -1318,7 +1317,7 @@ func createBugReportForJob(ctx context.Context, job *Job, jobKey *db.Key, config
 		PatchLink:       externalLink(ctx, textPatch, job.Patch),
 	}
 	if job.Type == JobBisectCause || job.Type == JobBisectFix {
-		rep.Maintainers = append(crash.Maintainers, kernelRepo.CC.Maintainers...)
+		rep.Maintainers = slices.Concat(crash.Maintainers, kernelRepo.CC.Maintainers)
 		rep.ExtID = bugReporting.ExtID
 		if bugReporting.CC != "" {
 			rep.CC = strings.Split(bugReporting.CC, "|")
@@ -1448,10 +1447,12 @@ type jobSorter struct {
 }
 
 func (sorter *jobSorter) Len() int { return len(sorter.jobs) }
+
 func (sorter *jobSorter) Less(i, j int) bool {
 	// Give priority to user-initiated jobs to reduce the perceived processing time.
 	return sorter.jobs[i].User != "" && sorter.jobs[j].User == ""
 }
+
 func (sorter *jobSorter) Swap(i, j int) {
 	sorter.jobs[i], sorter.jobs[j] = sorter.jobs[j], sorter.jobs[i]
 	sorter.keys[i], sorter.keys[j] = sorter.keys[j], sorter.keys[i]

@@ -28,8 +28,8 @@ type Definition struct {
 	Type     string      `json:"type,omitempty"`
 	Kind     EntityKind  `json:"kind,omitempty"`
 	IsStatic bool        `json:"is_static,omitempty"`
-	Body     LineRange   `json:"body,omitempty"`
-	Comment  LineRange   `json:"comment,omitempty"`
+	Body     LineRange   `json:"body,omitzero"`
+	Comment  LineRange   `json:"comment,omitzero"`
 	Refs     []Reference `json:"refs,omitempty"`
 	Fields   []FieldInfo `json:"fields,omitempty"`
 }
@@ -188,8 +188,8 @@ func (db *Database) Merge(other *Database, v *clangtool.Verifier) {
 		db.intern(&def.Type)
 		db.intern(&def.Body.File)
 		db.intern(&def.Comment.File)
-		for _, ref := range def.Refs {
-			db.intern(&ref.Name)
+		for i := range def.Refs {
+			db.intern(&def.Refs[i].Name)
 		}
 		for i := range def.Fields {
 			db.intern(&def.Fields[i].Name)
@@ -206,7 +206,7 @@ func (db *Database) Finalize(v *clangtool.Verifier) {
 	db.reverseCache = nil
 }
 
-// SetSoureFile attaches the source file to the entities that need it.
+// SetSourceFile attaches the source file to the entities that need it.
 // The clang tool could do it, but it looks easier to do it here.
 func (db *Database) SetSourceFile(file string, updatePath func(string) string) {
 	for _, def := range db.Definitions {

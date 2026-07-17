@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/google/syzkaller/pkg/email"
+	"github.com/google/syzkaller/pkg/email/sender"
 	"github.com/google/syzkaller/syz-cluster/pkg/api"
 	"github.com/google/syzkaller/syz-cluster/pkg/app"
 	"github.com/google/syzkaller/syz-cluster/pkg/controller"
@@ -17,8 +18,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-var testEmailConfig = emailclient.TestEmailConfig()
 
 func TestModerationReportFlow(t *testing.T) {
 	env, ctx := app.TestEnvironment(t)
@@ -31,7 +30,8 @@ func TestModerationReportFlow(t *testing.T) {
 	receivedEmail := emailServer.email()
 	assert.NotNil(t, receivedEmail, "a moderation email must be sent")
 	receivedEmail.Body = nil // for now don't validate the body
-	assert.Equal(t, &emailclient.Email{
+	testEmailConfig := emailclient.TestEmailConfig()
+	assert.Equal(t, &sender.Email{
 		To:      []string{testEmailConfig.ModerationList},
 		Cc:      []string{testEmailConfig.ArchiveList},
 		Subject: "[moderation/CI] Re: " + testSeries.Title,
@@ -57,13 +57,43 @@ func TestModerationReportFlow(t *testing.T) {
 	receivedEmail = emailServer.email()
 	assert.NotNil(t, receivedEmail, "an email must be sent upstream")
 	receivedEmail.Body = nil
-	assert.Equal(t, &emailclient.Email{
+	assert.Equal(t, &sender.Email{
 		To:        testSeries.Cc,
-		Cc:        append([]string{testEmailConfig.ArchiveList}, testEmailConfig.ReportCC...),
+		Cc:        append([]string{emailclient.TestEmailConfig().ArchiveList}, emailclient.TestEmailConfig().ReportCC...),
 		Subject:   "[name] Re: " + testSeries.Title,
 		InReplyTo: testSeries.ExtID,
 		BugID:     report.ID,
 	}, receivedEmail)
+}
+
+func TestSilentSeriesFlow(t *testing.T) {
+	env, ctx := app.TestEnvironment(t)
+	testSeries := controller.DummySeries()
+
+	client := controller.TestServer(t, env)
+	_ = controller.FakeSeriesWithFindings(t, ctx, env, client, testSeries, controller.WithReportLevel(api.ReportLevelNone))
+
+	generator := reporter.NewGenerator(env)
+	err := generator.Process(ctx, 1)
+	assert.NoError(t, err)
+
+	emailServer := makeFakeSender()
+	reporterClient := reporter.TestServer(t, env)
+	handler := &Handler{
+		reporter:       api.LKMLReporter,
+		reporterClient: reporterClient,
+		apiClient:      client,
+		emailConfig:    emailclient.TestEmailConfig(),
+		sender:         emailServer.send,
+	}
+
+	report, err := handler.PollAndReport(ctx)
+	assert.NoError(t, err)
+	assert.Nil(t, report, "report should be nil because it is silently marked as reported")
+
+	// No email should be sent.
+	receivedEmail := emailServer.email()
+	assert.Nil(t, receivedEmail, "no email must be sent for silent series")
 }
 
 func TestReportInvalidationFlow(t *testing.T) {
@@ -118,7 +148,7 @@ func TestInvalidReply(t *testing.T) {
 				},
 			},
 		})
-		assert.NoError(t, err)
+		assert.ErrorIs(t, err, ErrUnknownReport)
 		_, err = handler.PollAndReport(ctx)
 		assert.NoError(t, err)
 		// No email must be sent in reply.
@@ -143,7 +173,7 @@ func TestInvalidReply(t *testing.T) {
 		assert.NoError(t, err)
 		reply := emailServer.email()
 		assert.NotNil(t, reply)
-		assert.Equal(t, &emailclient.Email{
+		assert.Equal(t, &sender.Email{
 			To:        []string{"user@email.com"},
 			Cc:        []string{"a@a.com", "b@b.com"},
 			Subject:   "Re: Command",
@@ -166,7 +196,7 @@ syzbot-ci does not support` + " `fix:` " + `command
 				},
 			},
 		})
-		assert.NoError(t, err)
+		assert.ErrorIs(t, err, ErrOwnEmail)
 		_, err = handler.PollAndReport(ctx)
 		assert.NoError(t, err)
 		// No email must be sent in reply.
@@ -232,6 +262,7 @@ func TestSyzTestFlow(t *testing.T) {
 	require.NoError(t, err)
 
 	reportReply := emailServer.email()
+	testEmailConfig := emailclient.TestEmailConfig()
 	require.NotNil(t, reportReply, "an email must be sent with the test results")
 	assert.Equal(t, "user-reply-msg-id", reportReply.InReplyTo)
 	assert.Equal(t, []string{"user@email.com", "test-cc@email.com", "other@email.com"}, reportReply.To)
@@ -301,7 +332,7 @@ func setupHandlerTest(t *testing.T, ctx context.Context, env *app.AppEnvironment
 		reporter:       api.LKMLReporter,
 		reporterClient: reporterClient,
 		apiClient:      client,
-		emailConfig:    testEmailConfig,
+		emailConfig:    emailclient.TestEmailConfig(),
 		sender:         emailServer.send,
 	}
 
@@ -309,25 +340,63 @@ func setupHandlerTest(t *testing.T, ctx context.Context, env *app.AppEnvironment
 }
 
 type fakeSender struct {
-	ch chan *emailclient.Email
+	ch chan *sender.Email
 }
 
 func makeFakeSender() *fakeSender {
 	return &fakeSender{
-		ch: make(chan *emailclient.Email, 16),
+		ch: make(chan *sender.Email, 16),
 	}
 }
 
-func (f *fakeSender) send(ctx context.Context, e *emailclient.Email) (string, error) {
+func (f *fakeSender) send(ctx context.Context, e *sender.Email) (string, error) {
 	f.ch <- e
 	return "email-id", nil
 }
 
-func (f *fakeSender) email() *emailclient.Email {
+func (f *fakeSender) email() *sender.Email {
 	select {
 	case e := <-f.ch:
 		return e
 	default:
 		return nil
 	}
+}
+
+func TestDirectSeriesFlow(t *testing.T) {
+	env, ctx := app.TestEnvironment(t)
+	testSeries := controller.DummySeries()
+
+	client := controller.TestServer(t, env)
+	_ = controller.FakeSeriesWithFindings(t, ctx, env, client, testSeries, controller.WithDirect())
+
+	generator := reporter.NewGenerator(env)
+	err := generator.Process(ctx, 1)
+	assert.NoError(t, err)
+
+	emailServer := makeFakeSender()
+	reporterClient := reporter.TestServer(t, env)
+	handler := &Handler{
+		reporter:       api.LKMLReporter,
+		reporterClient: reporterClient,
+		apiClient:      client,
+		emailConfig:    emailclient.TestEmailConfig(),
+		sender:         emailServer.send,
+	}
+
+	report, err := handler.PollAndReport(ctx)
+	assert.NoError(t, err)
+
+	receivedEmail := emailServer.email()
+	require.NotNil(t, receivedEmail, "an email must be sent")
+	receivedEmail.Body = nil // for now don't validate the body
+	testEmailConfig := emailclient.TestEmailConfig()
+
+	assert.Equal(t, &sender.Email{
+		To:        testSeries.Cc,
+		Cc:        append([]string{testEmailConfig.ArchiveList}, testEmailConfig.ReportCC...),
+		Subject:   "[name] Re: " + testSeries.Title,
+		InReplyTo: testSeries.ExtID,
+		BugID:     report.ID,
+	}, receivedEmail)
 }

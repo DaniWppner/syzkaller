@@ -3,6 +3,18 @@
 
 # See /tools/docker/README.md for details.
 
+# Build the latest strace.
+FROM debian:trixie AS strace-builder
+RUN apt-get update && apt-get install -y -q --no-install-recommends \
+    make gcc libc6-dev git ca-certificates autoconf automake libtool
+RUN git clone https://github.com/strace/strace.git /tmp/strace && \
+    cd /tmp/strace && \
+    git checkout v7.0 && \
+    ./bootstrap && \
+    ./configure --enable-mpers=no LDFLAGS='-static -pthread' && \
+    make -j$(nproc) && \
+    mkdir -p /opt/bin && cp src/strace /opt/bin/strace
+
 FROM debian:trixie
 
 RUN apt-get update
@@ -12,7 +24,7 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
 	# Some common utilities:
 	unzip curl sudo procps psmisc nano vim git bzip2 dh-autoreconf fdisk \
 	# These are needed to build Linux kernel:
-	flex bison bc gawk dwarves cpio texinfo texi2html lzop lbzip2 \
+	flex bison bc gawk dwarves cpio texinfo texi2html lzop lbzip2 lz4 \
 	zlib1g-dev libncurses-dev libmpc-dev libssl-dev \
 	apt-transport-https curl gnupg python-is-python3 python3-legacy-cgi \
 	# Needed for building Cuttlefish images.
@@ -36,26 +48,27 @@ RUN curl https://dl.google.com/go/go1.26.0.linux-$(uname -m | sed 's/aarch64/arm
 ENV PATH /usr/local/go/bin:$PATH
 
 # Install the latest clang
+ARG CLANG_VERSION=22
 RUN apt-get install -y -q gnupg apt-transport-https
 RUN curl https://apt.llvm.org/llvm-snapshot.gpg.key | tee /usr/share/keyrings/llvm-snapshot.gpg
 # It uses SHA-1 signatures which are deprecated since 2026, so we have to use trusted=yes.
-RUN echo "deb [arch=amd64,arm64 signed-by=/usr/share/keyrings/llvm-snapshot.gpg trusted=yes] http://apt.llvm.org/trixie/ llvm-toolchain-trixie-21 main" | tee /etc/apt/sources.list.d/llvm-21.list
+RUN echo "deb [arch=amd64,arm64 signed-by=/usr/share/keyrings/llvm-snapshot.gpg trusted=yes] http://apt.llvm.org/trixie/ llvm-toolchain-trixie-${CLANG_VERSION} main" | tee /etc/apt/sources.list.d/llvm-${CLANG_VERSION}.list
 RUN apt-get update --allow-releaseinfo-change
-RUN apt-get install -y -q --no-install-recommends llvm-21 clang-21 clang-format-21 clang-tidy-21 lld-21 llvm-21-dev libclang-cpp21-dev libclang-21-dev
+RUN apt-get install -y -q --no-install-recommends llvm-${CLANG_VERSION} clang-${CLANG_VERSION} clang-format-${CLANG_VERSION} clang-tidy-${CLANG_VERSION} lld-${CLANG_VERSION} llvm-${CLANG_VERSION}-dev libclang-cpp${CLANG_VERSION}-dev libclang-${CLANG_VERSION}-dev
 RUN apt autoremove -y -q
-RUN sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-21 100
-RUN sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-21 100
-RUN sudo update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/bin/clang-tidy-21 100
-RUN sudo update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-21 100
-RUN sudo update-alternatives --install /usr/bin/ld.lld ld.lld /usr/bin/lld-21 100
-RUN sudo update-alternatives --install /usr/bin/llvm-nm llvm-nm /usr/bin/llvm-nm-21 100
-RUN sudo update-alternatives --install /usr/bin/llvm-ar llvm-ar /usr/bin/llvm-ar-21 100
-RUN sudo update-alternatives --install /usr/bin/llvm-objcopy llvm-objcopy /usr/bin/llvm-objcopy-21 100
-RUN sudo update-alternatives --install /usr/bin/llvm-objdump llvm-objdump /usr/bin/llvm-objdump-21 100
-RUN sudo update-alternatives --install /usr/bin/llvm-addr2line llvm-addr2line /usr/bin/llvm-addr2line-21 100
-RUN sudo update-alternatives --install /usr/bin/llvm-readelf llvm-readelf /usr/bin/llvm-readelf-21 100
-RUN sudo update-alternatives --install /usr/bin/llvm-strip llvm-strip /usr/bin/llvm-strip-21 100
-RUN sudo update-alternatives --install /usr/bin/llvm-link llvm-link /usr/bin/llvm-link-21 100
+RUN sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-${CLANG_VERSION} 100
+RUN sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-${CLANG_VERSION} 100
+RUN sudo update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/bin/clang-tidy-${CLANG_VERSION} 100
+RUN sudo update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-${CLANG_VERSION} 100
+RUN sudo update-alternatives --install /usr/bin/ld.lld ld.lld /usr/bin/lld-${CLANG_VERSION} 100
+RUN sudo update-alternatives --install /usr/bin/llvm-nm llvm-nm /usr/bin/llvm-nm-${CLANG_VERSION} 100
+RUN sudo update-alternatives --install /usr/bin/llvm-ar llvm-ar /usr/bin/llvm-ar-${CLANG_VERSION} 100
+RUN sudo update-alternatives --install /usr/bin/llvm-objcopy llvm-objcopy /usr/bin/llvm-objcopy-${CLANG_VERSION} 100
+RUN sudo update-alternatives --install /usr/bin/llvm-objdump llvm-objdump /usr/bin/llvm-objdump-${CLANG_VERSION} 100
+RUN sudo update-alternatives --install /usr/bin/llvm-addr2line llvm-addr2line /usr/bin/llvm-addr2line-${CLANG_VERSION} 100
+RUN sudo update-alternatives --install /usr/bin/llvm-readelf llvm-readelf /usr/bin/llvm-readelf-${CLANG_VERSION} 100
+RUN sudo update-alternatives --install /usr/bin/llvm-strip llvm-strip /usr/bin/llvm-strip-${CLANG_VERSION} 100
+RUN sudo update-alternatives --install /usr/bin/llvm-link llvm-link /usr/bin/llvm-link-${CLANG_VERSION} 100
 
 # Also install clang-15 to keep bisections alive.
 RUN echo "deb [arch=amd64,arm64 signed-by=/usr/share/keyrings/llvm-snapshot.gpg trusted=yes] http://apt.llvm.org/bookworm/ llvm-toolchain-bookworm-15 main" | sudo tee /etc/apt/sources.list.d/llvm-bookworm-15.list
@@ -90,10 +103,10 @@ RUN test "$(uname -m)" != x86_64 && exit 0 || \
 ENV RUSTUP_HOME=/usr/local/rustup
 ENV CARGO_HOME=/usr/local/cargo
 ENV PATH=/usr/local/cargo/bin:$PATH
-ENV RUST_VERSION=1.91.1
+ENV RUST_VERSION=1.96.0
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain $RUST_VERSION
 RUN rustup component add rust-src
-RUN apt-get install -y bindgen
+RUN cargo install --version 0.72.1 bindgen-cli && rm -rf /usr/local/cargo/registry/cache /usr/local/cargo/registry/src
 
 RUN apt-get install -y --no-install-recommends libdw-dev libelf-dev
 
@@ -103,6 +116,9 @@ RUN apt-get install -y -q ca-certificates \
     && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list
 RUN apt-get update && apt-get install -y google-cloud-cli
 RUN git config --system credential.'https://*.*.sourcemanager.dev'.helper gcloud.sh
+
+# Copy the custom strace build.
+COPY --from=strace-builder /opt/bin/strace /opt/bin/strace
 
 # pkg/osutil uses syzkaller user for sandboxing.
 RUN useradd --create-home syzkaller

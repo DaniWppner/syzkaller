@@ -140,20 +140,27 @@ void IndexerAstConsumer::HandleTranslationUnit(ASTContext& Context) {
   Indexer.TraverseDecl(Context.getTranslationUnitDecl());
 }
 
+static std::string normalizePath(llvm::StringRef Path) {
+  if (Path.empty())
+    return "";
+  static const std::filesystem::path Cwd = std::filesystem::current_path();
+  return std::filesystem::absolute(Path.str()).lexically_relative(Cwd).string();
+}
+
 Indexer::NamedDeclEmitter::NamedDeclEmitter(Indexer* Parent, const NamedDecl* Decl, const char* Kind,
                                             const std::string& Type, bool IsStatic)
     : Parent(Parent), Context(Parent->Context), SM(Parent->SM), Decl(Decl) {
   auto Range = Decl->getSourceRange();
-  const std::string& SourceFile = std::filesystem::relative(SM.getFilename(SM.getExpansionLoc(Range.getBegin())).str());
+  const std::string SourceFile = normalizePath(SM.getFilename(SM.getExpansionLoc(Range.getBegin())));
   int StartLine = SM.getExpansionLineNumber(Range.getBegin());
   int EndLine = SM.getExpansionLineNumber(Range.getEnd());
   std::string CommentSourceFile;
   int CommentStartLine = 0;
   int CommentEndLine = 0;
-  if (auto Comment = Context.getRawCommentForDeclNoCache(Decl)) {
+  if (auto Comment = Context.getRawCommentForAnyRedecl(Decl)) {
     const auto& begin = Comment->getBeginLoc();
     const auto& end = Comment->getEndLoc();
-    CommentSourceFile = std::filesystem::relative(SM.getFilename(SM.getExpansionLoc(begin)).str());
+    CommentSourceFile = normalizePath(SM.getFilename(SM.getExpansionLoc(begin)));
     CommentStartLine = SM.getExpansionLineNumber(begin);
     CommentEndLine = SM.getExpansionLineNumber(end);
     // Expand body range to include the comment, if they intersect.
@@ -232,6 +239,8 @@ bool Indexer::VisitDeclRefExpr(const DeclRefExpr* DeclRef) {
 }
 
 bool Indexer::TraverseVarDecl(VarDecl* Decl) {
+  ScopedState<SourceLocation> Scoped(&TypeRefingLocation, Decl->getBeginLoc());
+
   if (Decl->isFileVarDecl() && Decl->isThisDeclarationADefinition() == VarDecl::Definition) {
     // Preserves whether this variable can be referenced from other translation
     // units. A static global (internal linkage) is only referenceable within
@@ -239,9 +248,13 @@ bool Indexer::TraverseVarDecl(VarDecl* Decl) {
     // referenced from anywhere in the kernel.
     const bool IsInternalLinkage = Decl->getStorageClass() == SC_Static;
     NamedDeclEmitter Emitter(this, Decl, EntityKindGlobalVariable, Decl->getType().getAsString(), IsInternalLinkage);
+    // We must return here to trigger the base traversal before this if-block
+    // ends. Otherwise, the Emitter's destructor will run and clear the tracking
+    // context, causing references to functions inside global arrays to be
+    // silently dropped.
+    return Base::TraverseVarDecl(Decl);
   }
 
-  ScopedState<SourceLocation> Scoped(&TypeRefingLocation, Decl->getBeginLoc());
   return Base::TraverseVarDecl(Decl);
 }
 
@@ -389,7 +402,7 @@ static int Main(int argc, const char** argv) {
   return 0;
 }
 
-__attribute__((constructor(1000))) static void ctor(int argc, const char** argv) {
+__attribute__((constructor)) static void ctor(int argc, const char** argv) {
   const char* run = getenv("SYZ_RUN_CLANGTOOL");
   if (run && !strcmp(run, "codesearch"))
     exit(Main(argc, argv));

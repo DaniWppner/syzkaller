@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"cloud.google.com/go/batch/apiv1/batchpb"
 	"cloud.google.com/go/bigquery"
@@ -87,16 +88,17 @@ func batchCoverageScript(ns, repo, branch string, periods []coveragedb.TimePerio
 	if clientName == "" {
 		clientName = defaultDashboardClientName
 	}
-	script := jobInitScript + "\n"
-	script += "git clone -q --depth 1 --branch master --single-branch https://github.com/google/syzkaller\n" +
+	var script strings.Builder
+	script.WriteString(jobInitScript + "\n")
+	script.WriteString("git clone -q --depth 1 --branch master --single-branch https://github.com/google/syzkaller\n" +
 		"cd syzkaller\n" +
 		"export CI=1\n" +
-		"./tools/syz-env \""
+		"./tools/syz-env \"")
 	if syzEnvInitScript != "" {
-		script += syzEnvInitScript + "; "
+		script.WriteString(syzEnvInitScript + "; ")
 	}
 	for _, period := range periods {
-		script += "./tools/syz-bq.sh" +
+		script.WriteString("./tools/syz-bq.sh" +
 			" -w ../workdir-cover-aggregation/" +
 			" -n " + ns +
 			" -r " + repo +
@@ -104,10 +106,10 @@ func batchCoverageScript(ns, repo, branch string, periods []coveragedb.TimePerio
 			" -d " + strconv.Itoa(period.Days) +
 			" -t " + period.DateTo.String() +
 			" -c " + clientName +
-			" 2>&1; " // we don't want stderr output to be logged as errors
+			" 2>&1; ") // we don't want stderr output to be logged as errors
 	}
-	script += "\""
-	return script
+	script.WriteString("\"")
+	return script.String()
 }
 
 func nsDataAvailable(ctx context.Context, ns string) ([]coveragedb.TimePeriod, []int64, error) {
@@ -153,14 +155,15 @@ func nsDataAvailable(ctx context.Context, ns string) ([]coveragedb.TimePeriod, [
 
 func handleBatchCoverageClean(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	totalDeleted, err := coveragedb.DeleteGarbage(ctx, coverageDBClient)
+	deletedSessions, deletedRows, err := coveragedb.DeleteGarbage(ctx, coverageDBClient)
 	if err != nil {
-		errMsg := fmt.Sprintf("failed to coveragedb.DeleteGarbage: %s", err.Error())
+		errMsg := fmt.Sprintf("failed to coveragedb.DeleteGarbage after deleting %d sessions (%d rows): %s",
+			deletedSessions, deletedRows, err.Error())
 		log.Errorf(ctx, "%s", errMsg)
 		w.Write([]byte(errMsg))
 		return
 	}
-	logMsg := fmt.Sprintf("successfully deleted %d rows\n", totalDeleted)
+	logMsg := fmt.Sprintf("successfully deleted %d sessions (%d rows)\n", deletedSessions, deletedRows)
 	log.Infof(ctx, "%s", logMsg)
 	w.Write([]byte(logMsg))
 }

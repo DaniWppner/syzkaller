@@ -4,7 +4,9 @@
 package kernel
 
 import (
+	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,7 +20,7 @@ import (
 // outputs the source directory with the checkout.
 var Checkout = aflow.NewFuncAction("kernel-checkouter", checkout)
 
-// Checkout action checks out the Linux kernel on the given commit
+// CheckoutScratch action checks out the Linux kernel on the given commit
 // in a private temp dir that lives only for the duration of the workflow.
 // It's supposed to be used for code edits.
 var CheckoutScratch = aflow.NewFuncAction("kernel-scratch-checkouter", checkoutScratch)
@@ -42,10 +44,29 @@ type checkoutScratchResult struct {
 	KernelScratchSrc string
 }
 
+var kernelBackports = []vcs.BackportCommit{
+	{
+		// Required for out-of-tree builds (like building the kernel in a separate obj directory).
+		GuiltyHash: `1fb5f6b61535c24bed6f503707efc4358d3b70c3`,
+		FixHash:    `75bc03df42db6c52399d71a5d7252a12673fdce3`,
+	},
+	{
+		// Required for out-of-tree builds (like building the kernel in a separate obj directory).
+		GuiltyHash: `84a0884a373ec7efbb9d1ea0cd6ed85ed94dddb6`,
+		FixHash:    `75bc03df42db6c52399d71a5d7252a12673fdce3`,
+	},
+}
+
 func checkout(ctx *aflow.Context, args checkoutArgs) (checkoutResult, error) {
 	var res checkoutResult
+	var cacheKey strings.Builder
+	cacheKey.WriteString(args.KernelCommit)
+	for _, bp := range kernelBackports {
+		cacheKey.WriteString("-" + bp.FixHash)
+	}
+
 	err := UseLinuxRepo(ctx, func(kernelRepoDir string, repo vcs.Repo) error {
-		dir, err := ctx.Cache("src", args.KernelCommit, func(dir string) error {
+		dir, err := ctx.Cache("src", cacheKey.String(), func(dir string) error {
 			if _, err := repo.SwitchCommit(args.KernelCommit); err != nil {
 				if _, err := repo.CheckoutCommit(args.KernelRepo, args.KernelCommit); err != nil {
 					return err
@@ -66,13 +87,31 @@ func checkout(ctx *aflow.Context, args checkoutArgs) (checkoutResult, error) {
 				if ok, err := repo.Contains(badCommit); err != nil {
 					return err
 				} else if ok {
-					if _, err = osutil.RunCmd(time.Hour, kernelRepoDir,
-						"git", "revert", "--no-edit", badCommit); err != nil {
+					if _, err = runSandboxedGit(time.Minute, kernelRepoDir,
+						"-c", "user.name=aflow", "-c", "user.email=aflow@syzkaller.com",
+						"revert", "--no-edit", badCommit); err != nil {
 						return err
 					}
 				}
 			}
-			return shallowGitClone(dir, kernelRepoDir)
+			applied, err := vcs.BackportCommits(repo, kernelBackports, args.KernelRepo)
+			if err != nil {
+				return fmt.Errorf("failed to apply backports: %w", err)
+			}
+
+			// vcs.BackportCommits cherry-picks commits but leaves them uncommitted in the index/tree.
+			// We must commit them so that the subsequent shallow clone pulls the fully prepared tree.
+			if applied {
+				if _, err := runSandboxedGit(time.Minute, kernelRepoDir,
+					"-c", "user.name=aflow", "-c", "user.email=aflow@syzkaller.com",
+					"commit", "-m", "aflow: apply backports"); err != nil {
+					return fmt.Errorf("failed to commit backports: %w", err)
+				}
+			}
+			if err := shallowGitClone(dir, kernelRepoDir); err != nil {
+				return err
+			}
+			return nil
 		})
 		res.KernelSrc = dir
 		return err
@@ -89,6 +128,15 @@ func checkoutScratch(ctx *aflow.Context, args checkoutScratchArgs) (checkoutScra
 		return checkoutScratchResult{}, err
 	}
 	return checkoutScratchResult{dir}, nil
+}
+
+func runSandboxedGit(timeout time.Duration, dir string, args ...string) ([]byte, error) {
+	cmd := osutil.Command("git", args...)
+	cmd.Dir = dir
+	if err := osutil.Sandbox(cmd, true, false); err != nil {
+		return nil, fmt.Errorf("failed to sandbox git: %w", err)
+	}
+	return osutil.Run(timeout, cmd)
 }
 
 func shallowGitClone(dir, remoteDir string) error {

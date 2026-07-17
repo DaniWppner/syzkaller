@@ -1,6 +1,7 @@
 // Copyright 2015 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package qemu implements QEMU virtual machine pool management and interaction.
 package qemu
 
 import (
@@ -623,7 +624,7 @@ func handleVfioPciArg(arg string, index int) string {
 }
 
 func splitArgs(str, templateDir string, index int) (args []string) {
-	for _, arg := range strings.Split(str, " ") {
+	for arg := range strings.SplitSeq(str, " ") {
 		if arg == "" {
 			continue
 		}

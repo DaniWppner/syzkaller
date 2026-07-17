@@ -145,7 +145,23 @@ func (serv *HTTPServer) httpAction(w http.ResponseWriter, r *http.Request) {
 		serv.paused = !serv.paused
 		serv.TogglePause(serv.paused)
 	}
-	http.Redirect(w, r, r.FormValue("url"), http.StatusFound)
+	http.Redirect(w, r, localRedirectURL(r.FormValue("url")), http.StatusFound)
+}
+
+// localRedirectRe matches a same-site relative path with an optional query: a
+// single leading slash followed by an ordinary path, never "//" or "/\" that
+// browsers treat as a protocol-relative URL.
+var localRedirectRe = regexp.MustCompile(`^/[\w.-]*(\?.*)?$`)
+
+// localRedirectURL returns dest only if it is a same-site relative path,
+// otherwise "/". The action form always submits the current relative URL, so a
+// value carrying a scheme or host is an attempt to use /action as an open
+// redirector.
+func localRedirectURL(dest string) string {
+	if !localRedirectRe.MatchString(dest) {
+		return "/"
+	}
+	return dest
 }
 
 func (serv *HTTPServer) httpMain(w http.ResponseWriter, r *http.Request) {
@@ -422,20 +438,20 @@ func makeUICrashType(info *BugInfo, startTime time.Time, repros map[string]bool)
 // than the firstTitle has.
 func higherRankTooltip(firstTitle string, titlesInfo []*report.TitleFreqRank) string {
 	baseRank := report.TitlesToImpact(firstTitle)
-	res := ""
+	var res strings.Builder
 	for _, ti := range titlesInfo {
 		if ti.Rank <= baseRank {
 			continue
 		}
-		res += fmt.Sprintf("[rank %2v, freq %5.1f%%] %s\n",
+		res.WriteString(fmt.Sprintf("[rank %2v, freq %5.1f%%] %s\n",
 			ti.Rank,
 			100*float32(ti.Count)/float32(ti.Total),
-			ti.Title)
+			ti.Title))
 	}
-	if res != "" {
-		return fmt.Sprintf("[rank %2v,  originally] %s\n%s", baseRank, firstTitle, res)
+	if res.String() != "" {
+		return fmt.Sprintf("[rank %2v,  originally] %s\n%s", baseRank, firstTitle, res.String())
 	}
-	return res
+	return res.String()
 }
 
 var crashIDRe = regexp.MustCompile(`^\w+$`)
@@ -1041,14 +1057,21 @@ func (serv *HTTPServer) httpJobs(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid job id (the job has likely already finished)", http.StatusBadRequest)
 		return
 	}
-	jobType := r.FormValue("type")
+	jobType := fuzzer.JobType(r.FormValue("type"))
+
+	pageTitle := fmt.Sprintf("%s jobs", jobType)
+	if jobType == fuzzer.JobCandidateTriage {
+		pageTitle = "candidate triage jobs"
+	}
+
 	data := UIJobList{
-		UIPageHeader: serv.pageHeader(r, fmt.Sprintf("%s jobs", jobType)),
+		UIPageHeader: serv.pageHeader(r, pageTitle),
 	}
 	switch jobType {
-	case "triage":
-	case "smash":
-	case "hints":
+	case fuzzer.JobTriage:
+	case fuzzer.JobCandidateTriage:
+	case fuzzer.JobSmash:
+	case fuzzer.JobHints:
 	default:
 		http.Error(w, "unknown job type", http.StatusBadRequest)
 		return

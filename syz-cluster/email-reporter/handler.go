@@ -5,17 +5,25 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
 	"time"
 
 	"github.com/google/syzkaller/pkg/email"
+	"github.com/google/syzkaller/pkg/email/lore"
+	"github.com/google/syzkaller/pkg/email/sender"
 
 	"github.com/google/syzkaller/syz-cluster/pkg/api"
 	"github.com/google/syzkaller/syz-cluster/pkg/app"
 	"github.com/google/syzkaller/syz-cluster/pkg/emailclient"
 	"github.com/google/syzkaller/syz-cluster/pkg/report"
+)
+
+var (
+	ErrOwnEmail      = errors.New("email is from ourselves")
+	ErrUnknownReport = errors.New("cannot identify report")
 )
 
 type Handler struct {
@@ -73,7 +81,7 @@ func (h *Handler) report(ctx context.Context, rep *api.SessionReport) error {
 		// This should never be happening..
 		return fmt.Errorf("failed to render the template: %w", err)
 	}
-	toSend := &emailclient.Email{
+	toSend := &sender.Email{
 		Subject: "Re: " + rep.Series.Title, // TODO: use the original rather than the stripped title.
 		To:      rep.Series.Cc,
 		Body:    body,
@@ -107,7 +115,8 @@ func (h *Handler) report(ctx context.Context, rep *api.SessionReport) error {
 			Reporter:  h.reporter,
 		})
 		if err != nil {
-			return fmt.Errorf("failed to record the reply: %w", err)
+			return fmt.Errorf("failed to record the reply for %s: %w",
+				msgID, err)
 		}
 	}
 	return nil
@@ -117,11 +126,11 @@ func (h *Handler) report(ctx context.Context, rep *api.SessionReport) error {
 func (h *Handler) IncomingEmail(ctx context.Context, msg *email.Email) error {
 	if len(msg.BugIDs) == 0 {
 		// Unrelated email.
-		return nil
+		return ErrUnknownReport
 	}
 	if msg.OwnEmail && !strings.HasPrefix(msg.Subject, email.ForwardedPrefix) {
 		// We normally ignore our own emails, with the exception of the emails forwarded from the dashboard.
-		return nil
+		return ErrOwnEmail
 	}
 	reportID := msg.BugIDs[0]
 
@@ -171,7 +180,7 @@ func (h *Handler) IncomingEmail(ctx context.Context, msg *email.Email) error {
 	if reply == "" {
 		return nil
 	}
-	_, err := h.sender(ctx, &emailclient.Email{
+	_, err := h.sender(ctx, &sender.Email{
 		To:        []string{msg.Author},
 		Cc:        msg.Cc,
 		Subject:   "Re: " + msg.Subject,
@@ -179,4 +188,46 @@ func (h *Handler) IncomingEmail(ctx context.Context, msg *email.Email) error {
 		Body:      []byte(email.FormReply(msg, reply)),
 	})
 	return err
+}
+
+func (h *Handler) ProcessPolledEmail(ctx context.Context, polled *lore.PolledEmail) error {
+	parsed := polled.Email
+	reportID := h.stripContextPrefix(parsed.Email)
+	// Record reply for idempotency.
+	res, err := h.reporterClient.RecordReply(ctx, &api.RecordReplyReq{
+		MessageID:     parsed.MessageID,
+		ReportID:      reportID,
+		RootMessageID: polled.RootMessageID,
+		Reporter:      h.reporter,
+		Time:          parsed.Date,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to record reply: %w", err)
+	}
+	if res.ReportID == "" {
+		return ErrUnknownReport
+	} else if !res.New {
+		log.Printf("email %q: already seen, skipping", parsed.MessageID)
+		return nil
+	} else {
+		parsed.BugIDs = []string{res.ReportID}
+	}
+	return h.IncomingEmail(ctx, parsed.Email)
+}
+
+func (h *Handler) stripContextPrefix(msg *email.Email) string {
+	if h.emailConfig.Dashapi == nil || h.emailConfig.Dashapi.ContextPrefix == "" {
+		return ""
+	}
+	prefix := h.emailConfig.Dashapi.ContextPrefix
+	var reportID string
+	for i, id := range msg.BugIDs {
+		if trimmed, ok := strings.CutPrefix(id, prefix); ok {
+			msg.BugIDs[i] = trimmed
+			if reportID == "" {
+				reportID = trimmed
+			}
+		}
+	}
+	return reportID
 }

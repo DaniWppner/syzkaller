@@ -15,13 +15,14 @@ import (
 	"time"
 
 	"github.com/google/syzkaller/dashboard/dashapi"
+	"github.com/google/syzkaller/pkg/aflow/ai"
 	"github.com/google/syzkaller/pkg/email"
 	"github.com/google/syzkaller/pkg/subsystem"
 	"github.com/google/syzkaller/pkg/validator"
 	"github.com/google/syzkaller/pkg/vcs"
 )
 
-// There are multiple configurable aspects of the app (namespaces, reporting, API clients, etc).
+// GlobalConfig stores multiple configurable aspects of the app (namespaces, reporting, API clients, etc).
 // The exact config is stored in a global config variable and is read-only.
 // Also see config_stub.go.
 type GlobalConfig struct {
@@ -82,7 +83,7 @@ type PerInboxConfig struct {
 	ForwardTo []string
 }
 
-// Per-namespace config.
+// Config represents a per-namespace configuration.
 type Config struct {
 	// See GlobalConfig.AccessLevel.
 	AccessLevel AccessLevel
@@ -148,6 +149,39 @@ type Config struct {
 type AIConfig struct {
 	// Whether to upload generated patches to gerrit.
 	UploadPatchesToGerrit bool
+	Stages                []AIPatchStageConfig
+	SecurityPrio          func(*Bug, ai.AssessmentSecurityOutputs) BugPrio `json:"-"`
+
+	// Emails or domains allowed to execute external AI commands (#syz upstream, reject, etc).
+	AllowedCommandAuthors []string
+
+	// These are passed to the patching workflow, see the workflow inputs for details.
+	BaseRepository string
+	BaseBranch     string
+	BaseCommit     string
+}
+
+// AIPatchStageConfig describes a single stage in the AI patch reporting pipeline.
+type AIPatchStageConfig struct {
+	Name               string // "moderation", "public"
+	ServingIntegration string // e.g. "lore"
+	MailingList        string
+	NoParallelReports  bool
+	MergePatchCc       bool          // If true, CC people mentioned in the patch report (authors, reviewers).
+	AddressComments    bool          // If true, automatically trigger a patch iteration on new comments.
+	IterationDebounce  time.Duration // Wait time before creating a new iteration. Defaults to 30m.
+}
+
+func (cfg *AIConfig) StageIndexByName(name string) int {
+	if cfg == nil {
+		return -1
+	}
+	for i := range cfg.Stages {
+		if cfg.Stages[i].Name == name {
+			return i
+		}
+	}
+	return -1
 }
 
 type APIClient struct {
@@ -261,6 +295,10 @@ type BugListReportingConfig struct {
 	// If ModerationConfig is set, bug lists will be first sent there for human confirmation.
 	// For now, only EmailConfig is supported.
 	ModerationConfig ReportingType
+	// SkipModeration determines whether a monthly report should skip the moderation stage.
+	// If it returns true, the report skips the moderation stage (if any) and goes straight to public.
+	// If it returns false, the report goes through moderation first.
+	SkipModeration func(bugs []*Bug) bool `json:"-"`
 	// Config specifies how exactly such notifications should be delivered.
 	// For now, only EmailConfig is supported.
 	Config ReportingType
@@ -319,7 +357,7 @@ const (
 	MaxManagerPriority = 3
 )
 
-// One reporting stage.
+// Reporting represents one reporting stage.
 type Reporting struct {
 	// See GlobalConfig.AccessLevel.
 	AccessLevel AccessLevel
@@ -670,6 +708,9 @@ func checkNamespace(ns string, cfg *Config, namespaces, clientNames map[string]b
 	if cfg.Kcidb != nil {
 		checkKcidb(ns, cfg.Kcidb)
 	}
+	if cfg.AI != nil {
+		checkAIConfig(ns, cfg.AI)
+	}
 	checkKernelRepos(ns, cfg, cfg.Repos)
 	checkNamespaceReporting(ns, cfg)
 	checkSubsystems(ns, cfg)
@@ -682,6 +723,27 @@ func checkCoverageConfig(ns string, cfg *Config) {
 	}
 	if _, err := mail.ParseAddress(cfg.Coverage.EmailRegressionsTo); err != nil {
 		panic(fmt.Sprintf("bad cfg.Coverage.EmailRegressionsTo in '%s': %s", ns, err.Error()))
+	}
+}
+
+func checkAIConfig(ns string, cfg *AIConfig) {
+	stageNames := make(map[string]bool)
+	for i, stage := range cfg.Stages {
+		if stage.Name == "" {
+			panic(fmt.Sprintf("%v: AI stage name cannot be empty", ns))
+		}
+		if stageNames[stage.Name] {
+			panic(fmt.Sprintf("%v: duplicate AI stage name %q", ns, stage.Name))
+		}
+		stageNames[stage.Name] = true
+		if stage.IterationDebounce == 0 {
+			cfg.Stages[i].IterationDebounce = 30 * time.Minute
+		}
+	}
+	if cfg.SecurityPrio == nil {
+		cfg.SecurityPrio = func(*Bug, ai.AssessmentSecurityOutputs) BugPrio {
+			return "" // don't apply any security labels
+		}
 	}
 }
 
@@ -860,7 +922,7 @@ func checkManager(ns, name string, mgr ConfigManager) {
 	if mgr.ObsoletingMinPeriod != 0 && mgr.ObsoletingMinPeriod < 24*time.Hour {
 		panic(fmt.Sprintf("manager %v/%v obsoleting: too low MinPeriod", ns, name))
 	}
-	if mgr.Priority < MinManagerPriority && mgr.Priority > MaxManagerPriority {
+	if mgr.Priority < MinManagerPriority || mgr.Priority > MaxManagerPriority {
 		panic(fmt.Sprintf("manager %v/%v priority is not in the [%d;%d] range",
 			ns, name, MinManagerPriority, MaxManagerPriority))
 	}

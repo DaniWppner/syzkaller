@@ -23,6 +23,7 @@ import (
 	"cloud.google.com/go/logging/logadmin"
 	"github.com/google/syzkaller/dashboard/app/aidb"
 	"github.com/google/syzkaller/dashboard/dashapi"
+	"github.com/google/syzkaller/pkg/aflow/ai"
 	"github.com/google/syzkaller/pkg/debugtracer"
 	"github.com/google/syzkaller/pkg/email"
 	"github.com/google/syzkaller/pkg/hash"
@@ -45,7 +46,7 @@ import (
 // This file contains web UI http handlers.
 
 func initHTTPHandlers() {
-	http.Handle("/", handlerWrapper(handleMain))
+	http.Handle("/{$}", handlerWrapper(handleMain))
 	http.Handle("/bug", handlerWrapper(handleBug))
 	http.Handle("/text", handlerWrapper(handleText))
 	http.Handle("/ai_job", handlerWrapper(handleAIJobPage))
@@ -61,35 +62,28 @@ func initHTTPHandlers() {
 	http.Handle("/x/bisect.txt", handlerWrapper(handleTextX(textLog)))
 	http.Handle("/x/error.txt", handlerWrapper(handleTextX(textError)))
 	http.Handle("/x/minfo.txt", handlerWrapper(handleTextX(textMachineInfo)))
-	for ns, nsConfig := range getConfig(context.Background()).Namespaces {
-		http.Handle("/"+ns, handlerWrapper(handleMain))
-		http.Handle("/"+ns+"/fixed", handlerWrapper(handleFixed))
-		http.Handle("/"+ns+"/invalid", handlerWrapper(handleInvalid))
-		http.Handle("/"+ns+"/graph/bugs", handlerWrapper(handleKernelHealthGraph))
-		http.Handle("/"+ns+"/graph/lifetimes", handlerWrapper(handleGraphLifetimes))
-		http.Handle("/"+ns+"/graph/fuzzing", handlerWrapper(handleGraphFuzzing))
-		http.Handle("/"+ns+"/graph/crashes", handlerWrapper(handleGraphCrashes))
-		http.Handle("/"+ns+"/graph/found-bugs", handlerWrapper(handleFoundBugsGraph))
-		http.Handle("/"+ns+"/graph/coverage", handlerWrapper(handleCoverageGraph))
-		http.Handle("/"+ns+"/coverage/file", handlerWrapper(handleFileCoverage))
-		http.Handle("/"+ns+"/coverage", handlerWrapper(handleCoverageHeatmap))
-		http.Handle("/"+ns+"/graph/coverage_heatmap", handleMovedPermanently("/"+ns+"/coverage"))
-		if nsConfig.Subsystems.Service != nil {
-			http.Handle("/"+ns+"/graph/coverage_subsystems_heatmap",
-				handleMovedPermanently("/"+ns+"/coverage/subsystems"))
-			http.Handle("/"+ns+"/coverage/subsystems", handlerWrapper(handleSubsystemsCoverageHeatmap))
-		}
-		http.Handle("/"+ns+"/repos", handlerWrapper(handleRepos))
-		http.Handle("/"+ns+"/bug-summaries", handlerWrapper(handleBugSummaries))
-		http.Handle("/"+ns+"/syz-dungeon", handlerWrapper(handleDungeon))
-		http.Handle("/"+ns+"/syz-dungeon/hero/{id}", handlerWrapper(handleHeroProfile))
-		http.Handle("/"+ns+"/syz-dungeon/kingdom/{id}", handlerWrapper(handleKingdomProfile))
-		http.Handle("/"+ns+"/subsystems", handlerWrapper(handleSubsystemsList))
-		http.Handle("/"+ns+"/backports", handlerWrapper(handleBackports))
-		http.Handle("/"+ns+"/s/", handlerWrapper(handleSubsystemPage))
-		http.Handle("/"+ns+"/manager/", handlerWrapper(handleManagerPage))
-		http.Handle("/"+ns+"/ai", handlerWrapper(handleAIJobsPage))
-	}
+	http.Handle("/{ns}", handlerWrapper(handleMain))
+	http.Handle("/{ns}/fixed", handlerWrapper(handleFixed))
+	http.Handle("/{ns}/invalid", handlerWrapper(handleInvalid))
+	http.Handle("/{ns}/graph/bugs", handlerWrapper(handleKernelHealthGraph))
+	http.Handle("/{ns}/graph/lifetimes", handlerWrapper(handleGraphLifetimes))
+	http.Handle("/{ns}/graph/fuzzing", handlerWrapper(handleGraphFuzzing))
+	http.Handle("/{ns}/graph/crashes", handlerWrapper(handleGraphCrashes))
+	http.Handle("/{ns}/graph/found-bugs", handlerWrapper(handleFoundBugsGraph))
+	http.Handle("/{ns}/graph/coverage", handlerWrapper(handleCoverageGraph))
+	http.Handle("/{ns}/coverage/file", handlerWrapper(handleFileCoverage))
+	http.Handle("/{ns}/coverage", handlerWrapper(handleCoverageHeatmap))
+	http.Handle("/{ns}/coverage/subsystems", handlerWrapper(handleSubsystemsCoverageHeatmap))
+	http.Handle("/{ns}/repos", handlerWrapper(handleRepos))
+	http.Handle("/{ns}/bug-summaries", handlerWrapper(handleBugSummaries))
+	http.Handle("/{ns}/syz-dungeon", handlerWrapper(handleDungeon))
+	http.Handle("/{ns}/syz-dungeon/hero/{id}", handlerWrapper(handleHeroProfile))
+	http.Handle("/{ns}/syz-dungeon/kingdom/{id}", handlerWrapper(handleKingdomProfile))
+	http.Handle("/{ns}/subsystems", handlerWrapper(handleSubsystemsList))
+	http.Handle("/{ns}/backports", handlerWrapper(handleBackports))
+	http.Handle("/{ns}/s/{subsystem...}", handlerWrapper(handleSubsystemPage))
+	http.Handle("/{ns}/manager/{manager...}", handlerWrapper(handleManagerPage))
+	http.Handle("/{ns}/ai", handlerWrapper(handleAIJobsPage))
 	http.HandleFunc("/cron/cache_update", cacheUpdate)
 	http.HandleFunc("/cron/dungeon_preheat", handleDungeonPreheat)
 	http.HandleFunc("/cron/minute_cache_update", handleMinuteCacheUpdate)
@@ -97,12 +91,6 @@ func initHTTPHandlers() {
 	http.HandleFunc("/cron/refresh_subsystems", handleRefreshSubsystems)
 	http.HandleFunc("/cron/subsystem_reports", handleSubsystemReports)
 	http.HandleFunc("/cron/update_coverdb_subsystems", handleUpdateCoverDBSubsystems)
-}
-
-func handleMovedPermanently(dest string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, dest, http.StatusMovedPermanently)
-	}
 }
 
 type uiMainPage struct {
@@ -117,6 +105,7 @@ type uiMainPage struct {
 type uiBugFilter struct {
 	Filter  *userBugFilter
 	DropURL func(string, string) string
+	SetURL  func(string, string) string
 }
 
 func makeUIBugFilter(ctx context.Context, filter *userBugFilter) *uiBugFilter {
@@ -125,6 +114,9 @@ func makeUIBugFilter(ctx context.Context, filter *userBugFilter) *uiBugFilter {
 		Filter: filter,
 		DropURL: func(name, value string) string {
 			return urlutil.DropParam(url, name, value)
+		},
+		SetURL: func(name, value string) string {
+			return urlutil.SetParam(url, name, value)
 		},
 	}
 }
@@ -310,6 +302,7 @@ type uiBugPage struct {
 	LabelGroups     []*uiBugLabelGroup
 	DebugSubsystems string
 	Bug             *uiBugDetails
+	PatchVersions   []*uiPatchVersion
 	AIWorkflows     []*uiWorkflow
 	AIJobs          []*uiAIJob
 }
@@ -392,7 +385,6 @@ type uiCommit struct {
 	Link       string
 	Author     string
 	AuthorName string
-	CC         []string
 	Date       time.Time
 }
 
@@ -496,6 +488,43 @@ type userBugFilter struct {
 	OnlyManager string // show bugs that happened ONLY on the manager
 	Labels      []string
 	NoSubsystem bool
+	WithRepro   bool
+	WithAIPatch bool
+
+	HasAI                    bool
+	BugsWithPendingAIPatches map[string]bool
+}
+
+func cachedBugIDsWithPendingPatch(ctx context.Context, ns string) ([]string, error) {
+	return cachedObjectList(ctx,
+		fmt.Sprintf("%s-ai-pending-patches", ns),
+		5*time.Minute,
+		func(ctx context.Context) ([]string, error) {
+			return aidb.LoadBugIDsWithPendingPatch(ctx, ns, []ai.WorkflowType{
+				ai.WorkflowPatching,
+				ai.WorkflowPatchIteration,
+			})
+		},
+	)
+}
+
+func (filter *userBugFilter) InitializeAI(ctx context.Context, ns string) error {
+	if filter == nil {
+		return nil
+	}
+	filter.HasAI = getNsConfig(ctx, ns).AI != nil
+	if !filter.WithAIPatch {
+		return nil
+	}
+	bugIDs, err := cachedBugIDsWithPendingPatch(ctx, ns)
+	if err != nil {
+		return err
+	}
+	filter.BugsWithPendingAIPatches = make(map[string]bool)
+	for _, id := range bugIDs {
+		filter.BugsWithPendingAIPatches[id] = true
+	}
+	return nil
 }
 
 func MakeBugFilter(r *http.Request) (*userBugFilter, error) {
@@ -507,6 +536,8 @@ func MakeBugFilter(r *http.Request) (*userBugFilter, error) {
 		Manager:     r.FormValue("manager"),
 		OnlyManager: r.FormValue("only_manager"),
 		Labels:      r.Form["label"],
+		WithRepro:   r.FormValue("with_repro") != "",
+		WithAIPatch: r.FormValue("with_ai_patch") != "",
 	}, nil
 }
 
@@ -525,9 +556,15 @@ func (filter *userBugFilter) ManagerName() string {
 	return ""
 }
 
-func (filter *userBugFilter) MatchBug(bug *Bug) bool {
+func (filter *userBugFilter) MatchBug(ctx context.Context, bug *Bug) bool {
 	if filter == nil {
 		return true
+	}
+	if filter.WithRepro && bug.ReproLevel == dashapi.ReproLevelNone {
+		return false
+	}
+	if filter.WithAIPatch && !filter.BugsWithPendingAIPatches[bug.keyHash(ctx)] {
+		return false
 	}
 	if filter.OnlyManager != "" && (len(bug.HappenedOn) != 1 || bug.HappenedOn[0] != filter.OnlyManager) {
 		return false
@@ -560,7 +597,9 @@ func (filter *userBugFilter) Any() bool {
 	if filter == nil {
 		return false
 	}
-	return len(filter.Labels) > 0 || filter.OnlyManager != "" || filter.Manager != "" || filter.NoSubsystem
+	return len(filter.Labels) > 0 || filter.OnlyManager != "" ||
+		filter.Manager != "" || filter.NoSubsystem ||
+		filter.WithRepro || filter.WithAIPatch
 }
 
 // handleMain serves main page.
@@ -573,6 +612,9 @@ func handleMain(ctx context.Context, w http.ResponseWriter, r *http.Request) err
 	filter, err := MakeBugFilter(r)
 	if err != nil {
 		return fmt.Errorf("%w: failed to parse URL parameters", ErrClientBadRequest)
+	}
+	if err := filter.InitializeAI(ctx, hdr.Namespace); err != nil {
+		return err
 	}
 	managers, err := CachedUIManagers(ctx, accessLevel, hdr.Namespace, filter)
 	if err != nil {
@@ -636,8 +678,8 @@ func handleManagerPage(ctx context.Context, w http.ResponseWriter, r *http.Reque
 		return err
 	}
 	var manager *uiManager
-	if pos := strings.Index(r.URL.Path, "/manager/"); pos != -1 {
-		manager = findManager(managers, r.URL.Path[pos+len("/manager/"):])
+	if _, managerName, ok := strings.Cut(r.URL.Path, "/manager/"); ok {
+		manager = findManager(managers, managerName)
 	}
 	if manager == nil {
 		return fmt.Errorf("%w: manager is unknown", ErrClientBadRequest)
@@ -718,10 +760,9 @@ func handleSubsystemPage(ctx context.Context, w http.ResponseWriter, r *http.Req
 		return fmt.Errorf("%w: the namespace does not have subsystems", ErrClientBadRequest)
 	}
 	var subsystem *subsystem.Subsystem
-	if pos := strings.Index(r.URL.Path, "/s/"); pos != -1 {
-		name := r.URL.Path[pos+3:]
+	if prefix, name, ok := strings.Cut(r.URL.Path, "/s/"); ok {
 		if newName := getNsConfig(ctx, hdr.Namespace).Subsystems.Redirect[name]; newName != "" {
-			http.Redirect(w, r, r.URL.Path[:pos+3]+newName, http.StatusMovedPermanently)
+			http.Redirect(w, r, prefix+"/s/"+newName, http.StatusMovedPermanently)
 			return nil
 		}
 		subsystem = service.ByName(name)
@@ -1165,6 +1206,7 @@ func handleBug(ctx context.Context, w http.ResponseWriter, r *http.Request) erro
 	}
 	var aiWorkflows []*uiWorkflow
 	var aiJobs []*uiAIJob
+	var patchVersions []*uiPatchVersion
 	if hdr.AI {
 		if hdr.AIActions {
 			aiWorkflows, err = aiBugWorkflows(ctx, bug)
@@ -1180,32 +1222,34 @@ func handleBug(ctx context.Context, w http.ResponseWriter, r *http.Request) erro
 		for _, job := range jobs {
 			aiJobs = append(aiJobs, makeUIAIJob(job))
 		}
+
+		patchVersions, err = getPatchVersions(ctx, bug, jobs, hdr.AIActions)
+		if err != nil {
+			return err
+		}
 	}
 	data := &uiBugPage{
-		Header:      hdr,
-		Now:         timeNow(ctx),
-		Sections:    sections,
-		LabelGroups: getLabelGroups(ctx, bug),
-		Crashes:     crashesTable,
-		Bug:         bugDetails,
-		AIWorkflows: aiWorkflows,
-		AIJobs:      aiJobs,
+		Header:        hdr,
+		Now:           timeNow(ctx),
+		Sections:      sections,
+		LabelGroups:   getLabelGroups(ctx, bug),
+		Crashes:       crashesTable,
+		Bug:           bugDetails,
+		PatchVersions: patchVersions,
+		AIWorkflows:   aiWorkflows,
+		AIJobs:        aiJobs,
 	}
 	if accessLevel == AccessAdmin && !bug.hasUserSubsystems() {
 		data.DebugSubsystems = urlutil.SetParam(data.Bug.Link, "debug_subsystems", "1")
 	}
 	if workflow := r.FormValue("ai-job-create"); workflow != "" {
-		if !hdr.AIActions {
-			return ErrAccess
+		if err := handleBugJobCreate(ctx, r, hdr, bug, aiWorkflows, workflow); err != nil {
+			return err
 		}
-		args, err := parseAIJobArgs(r, workflow, aiWorkflows)
-		if err != nil {
-			hdr.Message = err.Error()
-		} else {
-			if _, err := aiBugJobCreate(ctx, workflow, bug, args); err != nil {
-				return err
-			}
-			hdr.Message = fmt.Sprintf("AI workflow %v is created", workflow)
+	}
+	if reportingID := r.FormValue("ai-job-iteration"); reportingID != "" {
+		if err := handleManualIterationJob(ctx, r, hdr, reportingID); err != nil {
+			return err
 		}
 	}
 	if r.FormValue("json") == "1" {
@@ -1214,6 +1258,45 @@ func handleBug(ctx context.Context, w http.ResponseWriter, r *http.Request) erro
 	}
 
 	return serveTemplate(w, "bug.html", data)
+}
+
+func handleBugJobCreate(ctx context.Context, r *http.Request, hdr *uiHeader,
+	bug *Bug, aiWorkflows []*uiWorkflow, workflow string) error {
+	if !hdr.AIActions {
+		return ErrAccess
+	}
+	if r.Method != http.MethodPost {
+		return ErrAccess
+	}
+	args, err := parseAIJobArgs(r, workflow, aiWorkflows)
+	if err != nil {
+		hdr.Message = err.Error()
+		return nil
+	}
+	if _, err := aiBugJobCreate(ctx, workflow, bug, args); err != nil {
+		return fmt.Errorf("failed to create AI job %q: %w", workflow, err)
+	}
+	hdr.Message = fmt.Sprintf("AI workflow %v is created", workflow)
+	return nil
+}
+
+func handleManualIterationJob(ctx context.Context, r *http.Request,
+	hdr *uiHeader, reportingID string) error {
+	if !hdr.AIActions {
+		return ErrAccess
+	}
+	if r.Method != http.MethodPost {
+		return ErrAccess
+	}
+	job, err := aidb.CreatePatchIterationJob(ctx, reportingID)
+	if err != nil {
+		return fmt.Errorf("failed to create patch iteration job for %v: %w", reportingID, err)
+	} else if job == nil {
+		hdr.Message = "Iteration job is already running or in backoff."
+		return nil
+	}
+	hdr.Message = "Patch iteration job triggered successfully."
+	return nil
 }
 
 func parseAIJobArgs(r *http.Request, workflow string, aiWorkflows []*uiWorkflow) (map[string]any, error) {
@@ -1229,7 +1312,7 @@ func parseAIJobArgs(r *http.Request, workflow string, aiWorkflows []*uiWorkflow)
 		if r.FormValue("base_commit") == "" {
 			return nil, fmt.Errorf("custom base commit is empty")
 		}
-		args["FixedBaseCommit"] = r.FormValue("base_commit")
+		args["BaseCommit"] = r.FormValue("base_commit")
 	}
 	return args, nil
 }
@@ -1892,7 +1975,7 @@ func loadVisibleBugs(ctx context.Context, ns string, bugFilter *userBugFilter) (
 	}
 	var filteredBugs []*Bug
 	for _, bug := range bugs {
-		if bugFilter.MatchBug(bug) {
+		if bugFilter.MatchBug(ctx, bug) {
 			filteredBugs = append(filteredBugs, bug)
 		}
 	}
@@ -1941,7 +2024,7 @@ func fetchTerminalBugs(ctx context.Context, accessLevel AccessLevel,
 		if accessLevel < bug.sanitizeAccess(ctx, accessLevel) {
 			continue
 		}
-		if !typ.Filter.MatchBug(bug) {
+		if !typ.Filter.MatchBug(ctx, bug) {
 			continue
 		}
 		uiBug := createUIBug(ctx, bug, state, managers)
@@ -2132,13 +2215,7 @@ func createUIBug(ctx context.Context, bug *Bug, state *ReportingState, managers 
 			})
 		}
 		for _, mgr := range managers {
-			found := false
-			for _, mgr1 := range bug.PatchedOn {
-				if mgr == mgr1 {
-					found = true
-					break
-				}
-			}
+			found := slices.Contains(bug.PatchedOn, mgr)
 			if found {
 				uiBug.PatchedOn = append(uiBug.PatchedOn, mgr)
 			} else {
@@ -2645,8 +2722,8 @@ func fetchErrorLogs(ctx context.Context) ([]byte, error) {
 	}
 
 	buf := new(bytes.Buffer)
-	for i := len(lines) - 1; i >= 0; i-- {
-		buf.WriteString(lines[i])
+	for _, line := range slices.Backward(lines) {
+		buf.WriteString(line)
 		buf.WriteByte('\n')
 	}
 	return buf.Bytes(), nil
@@ -2704,4 +2781,57 @@ func bugLink(id string) string {
 		return ""
 	}
 	return "/bug?id=" + id
+}
+
+func getPatchVersions(ctx context.Context, bug *Bug, jobs []*aidb.Job, aiActions bool) ([]*uiPatchVersion, error) {
+	reportings, err := aidb.LoadBugJobReportings(ctx, bug.keyHash(ctx))
+	if err != nil {
+		return nil, err
+	}
+	jobMap := make(map[string]*aidb.Job)
+	for _, job := range jobs {
+		jobMap[job.ID] = job
+	}
+	var patchVersions []*uiPatchVersion
+	latestFound := false
+	for _, r := range reportings {
+		if !r.Version.Valid {
+			continue
+		}
+		if job, ok := jobMap[r.JobID]; ok && job.Type == ai.WorkflowPatchIteration {
+			res, err := castJobResults[ai.PatchIterationOutputs](job)
+			if err == nil && res.PatchDiff == "" {
+				// Only show iterations that produced a new patch.
+				continue
+			}
+		}
+
+		canIterate := false
+		if !latestFound {
+			latestFound = true
+			canIterate = aiActions && hasUnprocessedComments(ctx, r.ID)
+		}
+
+		patchVersions = append(patchVersions, &uiPatchVersion{
+			Version:     int(r.Version.Int64),
+			Stage:       r.Stage,
+			Reported:    r.CreatedAt,
+			Link:        r.ExternalLink(),
+			JobID:       r.JobID,
+			JobLink:     fmt.Sprintf("/ai_job?id=%s", r.JobID),
+			ReportingID: r.ID,
+			CanIterate:  canIterate,
+		})
+	}
+	return patchVersions, nil
+}
+
+func hasUnprocessedComments(ctx context.Context, reportingID string) bool {
+	comments, err := aidb.LoadJobCommentsByReporting(ctx, reportingID)
+	if err != nil {
+		return false
+	}
+	return slices.ContainsFunc(comments, func(c *aidb.JobComment) bool {
+		return !c.Processed
+	})
 }

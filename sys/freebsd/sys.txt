@@ -35,7 +35,7 @@ sf_hdtr {
 
 resource lwpid[int32]: 0, 0xffffffffffffffff
 
-sf_flags = SF_NODISKIO, SF_NOCACHE, SF_SYNC, SF_USER_READAHEAD
+sf_flags = SF_NODISKIO, SF_NOCACHE, SF_USER_READAHEAD
 sendfile(fd fd, s sock_in, offset fileoff, nbytes int64, hdtr ptr[in, sf_hdtr], sbytes ptr[out, fileoff[int64]], flags flags[sf_flags])
 
 poll(fds ptr[in, array[pollfd]], nfds len[fds], timeout int32)
@@ -100,7 +100,9 @@ setresuid(ruid uid, euid uid, suid uid)
 setresgid(rgid gid, egid gid, sgid gid)
 getresuid(ruid ptr[out, uid], euid ptr[out, uid], suid ptr[out, uid])
 getresgid(rgid ptr[out, gid], egid ptr[out, gid], sgid ptr[out, gid])
+freebsd14_getgroups(size len[list], list ptr[inout, array[gid]])
 getgroups(size len[list], list ptr[inout, array[gid]])
+freebsd14_setgroups(size len[list], list ptr[in, array[gid]])
 setgroups(size len[list], list ptr[in, array[gid]])
 getpriority(which flags[priority_which], who int32)
 setpriority(which flags[priority_which], who int32, prio int32)

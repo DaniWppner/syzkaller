@@ -6,12 +6,12 @@ package patching
 import (
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 
 	"github.com/google/syzkaller/pkg/aflow"
+	"github.com/google/syzkaller/pkg/aflow/ai"
 	"github.com/google/syzkaller/pkg/osutil"
-	"github.com/google/syzkaller/sys/targets"
+	"github.com/google/syzkaller/pkg/vcs"
 	"github.com/stretchr/testify/require"
 )
 
@@ -65,31 +65,38 @@ syz-cluster: rewrite fuzz config generation
 	}, "")
 }
 
-func TestSyzlangToC(t *testing.T) {
-	sysTarget := targets.Get("linux", "amd64")
-	if runtime.GOOS != sysTarget.BuildOS || sysTarget.BrokenCompiler != "" {
-		t.Skip("cannot build linux/amd64 on this host")
-	}
-	validProg := `r0 = openat(0xffffffffffffff9c, &AUTO='./file1\x00', 0x42, 0x1ff)
-write(r0, &AUTO="01010101", 0x4)
+func TestMaintainers(t *testing.T) {
+	dir := t.TempDir()
+	repoDir := filepath.Join(dir, "repo", "linux")
+	repo := vcs.MakeTestRepo(t, repoDir)
+	require.NoError(t, osutil.MkdirAll(filepath.Join(repoDir, "scripts")))
+
+	// Write a fake get_maintainer.pl.
+	scriptContent := `#!/bin/sh
+echo "Maintainer 1 <m1@example.com> (maintainer:SUBSYSTEM)"
+echo "Fixes Author <fixes@example.com> (reviewer:SUBSYSTEM)"
 `
-	res, err := syzlangToCFunc(nil, syzlangToCArgs{ReproSyz: validProg})
-	require.NoError(t, err)
-	require.NotEmpty(t, res.SimplifiedCRepro)
-	require.Contains(t, res.SimplifiedCRepro, "int main")
-}
+	require.NoError(t, osutil.MkdirAll(filepath.Join(repoDir, "scripts")))
+	repo.CommitChangeset("init", vcs.FileContent{
+		File:    "scripts/get_maintainer.pl",
+		Content: scriptContent,
+	})
+	repo.Git("update-index", "--chmod=+x", "scripts/get_maintainer.pl")
+	commit := repo.CommitChangeset("make executable")
 
-func TestSyzlangToC_Invalid(t *testing.T) {
-	invalidProg := `r0 = unknown_syscall(0x123)`
-	res, err := syzlangToCFunc(nil, syzlangToCArgs{ReproSyz: invalidProg})
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "failed to parse syz repro")
-	require.Empty(t, res.SimplifiedCRepro)
-}
-
-func TestSyzlangToC_Empty(t *testing.T) {
-	res, err := syzlangToCFunc(nil, syzlangToCArgs{ReproSyz: ""})
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "syz repro is missing")
-	require.Empty(t, res.SimplifiedCRepro)
+	aflow.TestAction(t, getMaintainers, dir, maintainersArgs{
+		KernelCommit: commit.Hash,
+		PatchDiff:    "fake patch diff",
+		Fixes: ai.FixesTag{
+			Hash:        "123456789",
+			Title:       "some fix",
+			AuthorName:  "Fixes Author",
+			AuthorEmail: "fixes@example.com",
+		},
+	}, maintainersResult{
+		Recipients: []ai.Recipient{
+			{Name: "Fixes Author", Email: "fixes@example.com", To: true},
+			{Name: "Maintainer 1", Email: "m1@example.com", To: true},
+		},
+	}, "")
 }

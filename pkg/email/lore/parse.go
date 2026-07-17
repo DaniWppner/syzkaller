@@ -1,6 +1,9 @@
 // Copyright 2023 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package lore provides polling and thread resolution utilities for mailing list archives.
+// The approach uses an in-memory graph of ancestors (Message-ID -> In-Reply-To)
+// to resolve the root of any email thread.
 package lore
 
 import (
@@ -165,8 +168,8 @@ func parsePatchSubject(subject string) (PatchSubject, bool) {
 	}
 	tags := strings.Fields(groups[1])
 	for _, tag := range append(tags, strings.Fields(groups[2])...) {
-		if strings.HasPrefix(tag, "v") {
-			val, err := strconv.Atoi(strings.TrimPrefix(tag, "v"))
+		if after, ok := strings.CutPrefix(tag, "v"); ok {
+			val, err := strconv.Atoi(after)
 			if err == nil {
 				ret.Version.Set(val)
 				continue

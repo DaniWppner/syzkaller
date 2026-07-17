@@ -1,6 +1,8 @@
 // Copyright 2025 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package reporter implements API handlers and background report generation processes
+// for managing and dispatching session reports and replies.
 package reporter
 
 import (
@@ -33,7 +35,6 @@ func (s *APIServer) Mux() *http.ServeMux {
 	mux.HandleFunc("/reports/{report_id}/confirm", s.confirmReport)
 	mux.HandleFunc("/reports/{report_id}/invalidate", s.invalidateReport)
 	mux.HandleFunc("/reports/record_reply", s.recordReply)
-	mux.HandleFunc("/reports/last_reply", s.lastReply)
 	mux.HandleFunc("/reports", s.nextReports)
 	return mux
 }
@@ -70,11 +71,6 @@ func (s *APIServer) recordReply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp, err := s.discussionService.RecordReply(r.Context(), req)
-	reply(w, resp, err)
-}
-
-func (s *APIServer) lastReply(w http.ResponseWriter, r *http.Request) {
-	resp, err := s.discussionService.LastReply(r.Context(), r.PathValue("reporter"))
 	reply(w, resp, err)
 }
 

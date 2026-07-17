@@ -102,7 +102,7 @@ func (f *Field) Dir(def Dir) Dir {
 
 type ArgFinder func(path []string) Arg
 
-// Special case reply of ArgFinder.
+// SquashedArgFound is a special case reply of ArgFinder.
 var SquashedArgFound = &DataArg{}
 
 type Expression interface {
@@ -223,15 +223,19 @@ func (ti Ref) DefaultArg(dir Dir) Arg                                { panic("pr
 func (ti Ref) Clone() Type                                           { panic("prog.Ref method called") }
 func (ti Ref) isDefaultArg(arg Arg) bool                             { panic("prog.Ref method called") }
 func (ti Ref) generate(r *randGen, s *state, dir Dir) (Arg, []*Call) { panic("prog.Ref method called") }
+
 func (ti Ref) mutate(r *randGen, s *state, arg Arg, ctx ArgCtx) ([]*Call, bool, bool) {
 	panic("prog.Ref method called")
 }
+
 func (ti Ref) getMutationPrio(target *Target, arg Arg, ignoreSpecial, ignoreLengths bool) (float64, bool) {
 	panic("prog.Ref method called")
 }
+
 func (ti Ref) minimize(ctx *minimizeArgsCtx, arg Arg, path string) bool {
 	panic("prog.Ref method called")
 }
+
 func (ti Ref) ref() Ref       { panic("prog.Ref method called") }
 func (ti Ref) setRef(ref Ref) { panic("prog.Ref method called") }
 
@@ -258,11 +262,8 @@ func (t *TypeCommon) Name() string {
 }
 
 func (t *TypeCommon) TemplateName() string {
-	name := t.TypeName
-	if pos := strings.IndexByte(name, '['); pos != -1 {
-		name = name[:pos]
-	}
-	return name
+	before, _, _ := strings.Cut(t.TypeName, "[")
+	return before
 }
 
 func (t *TypeCommon) Optional() bool {
@@ -394,7 +395,7 @@ func (t *IntTypeCommon) Format() BinaryFormat {
 	return t.ArgFormat
 }
 
-// Returns the size in bits for integers in binary format or 64 for string-formatted integers. The return
+// TypeBitSize returns the size in bits for integers in binary format or 64 for string-formatted integers. The return
 // value is used in computing limits and truncating other values.
 func (t *IntTypeCommon) TypeBitSize() uint64 {
 	if t.ArgFormat != FormatNative && t.ArgFormat != FormatBigEndian {

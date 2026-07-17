@@ -98,8 +98,16 @@ var localUIConfig = &GlobalConfig{
 		"upstream": {
 			DisplayTitle: "Linux",
 			AccessLevel:  AccessPublic,
-			AI:           &AIConfig{},
-			Key:          password1,
+			AI: &AIConfig{
+				BaseRepository: "git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git",
+				BaseBranch:     "master",
+				BaseCommit:     "RC",
+				Stages: []AIPatchStageConfig{
+					{Name: "moderation", ServingIntegration: "lore", MailingList: "moderation@test.com", AddressComments: true},
+					{Name: "public", ServingIntegration: "lore", MailingList: "test@syzkaller.com"},
+				},
+			},
+			Key: password1,
 			Clients: map[string]APIClient{
 				localUIClient: {Key: localUIPassword},
 			},
@@ -133,9 +141,7 @@ const (
 	localUIGlobalPassword = "localuiglobalpasswordlocaluiglobalpasswordlocaluiglobalpassword"
 )
 
-func populateLocalUIDB(t *testing.T, c *Ctx) {
-	client := c.makeClient(localUIClient, localUIPassword, true)
-	globalClient := c.makeClient(localUIGlobalClient, localUIGlobalPassword, true)
+func populateBuildsAndCrashes(t *testing.T, client *apiClient) {
 	bugTitles := []string{
 		"KASAN: slab-use-after-free Write in nr_neigh_put",
 		"KCSAN: data-race in mISDN_ioctl / mISDN_read",
@@ -174,6 +180,14 @@ func populateLocalUIDB(t *testing.T, c *Ctx) {
 			}
 		}
 	}
+}
+
+// nolint: funlen
+func populateLocalUIDB(t *testing.T, c *Ctx) {
+	client := c.makeClient(localUIClient, localUIPassword, true)
+	globalClient := c.makeClient(localUIGlobalClient, localUIGlobalPassword, true)
+
+	populateBuildsAndCrashes(t, client)
 	c.advanceTime(24 * time.Hour)
 
 	fixedBugs := []struct {
@@ -218,6 +232,7 @@ func populateLocalUIDB(t *testing.T, c *Ctx) {
 		})
 	}
 
+	var lastBugExtID string
 	for i := range 4 {
 		t.Logf("polling bugs iteration %v", i)
 		respBugs, err := globalClient.ReportingPollBugs("email")
@@ -229,6 +244,7 @@ func populateLocalUIDB(t *testing.T, c *Ctx) {
 		}
 		var fixCommits []dashapi.Commit
 		for _, rep := range respBugs.Reports {
+			lastBugExtID = rep.ID
 			isFixed := false
 			for _, bug := range fixedBugs {
 				if rep.Title == bug.Title {
@@ -310,10 +326,13 @@ func populateLocalUIDB(t *testing.T, c *Ctx) {
 			{Type: ai.WorkflowAssessmentKCSAN, Name: string(ai.WorkflowAssessmentKCSAN)},
 		},
 	})
+	jobID1 := resp.ID
+	jobID2 := c.createAIJob(lastBugExtID, string(ai.WorkflowPatching), "")
+
 	seq := 1
 	ts := c.mockedTime
 	globalClient.AITrajectoryLog(&dashapi.AITrajectoryReq{
-		JobID: resp.ID,
+		JobID: jobID1,
 		Span: &trajectory.Span{
 			Seq:      seq,
 			Nesting:  1,
@@ -331,7 +350,7 @@ func populateLocalUIDB(t *testing.T, c *Ctx) {
 		seq++
 		for llmCall := 1; llmCall <= 3; llmCall++ {
 			globalClient.AITrajectoryLog(&dashapi.AITrajectoryReq{
-				JobID: resp.ID,
+				JobID: jobID1,
 				Span: &trajectory.Span{
 					Seq:                  seq,
 					Nesting:              2,
@@ -346,7 +365,7 @@ func populateLocalUIDB(t *testing.T, c *Ctx) {
 			})
 			seq++
 			globalClient.AITrajectoryLog(&dashapi.AITrajectoryReq{
-				JobID: resp.ID,
+				JobID: jobID1,
 				Span: &trajectory.Span{
 					Seq:      seq,
 					Nesting:  2,
@@ -358,7 +377,7 @@ func populateLocalUIDB(t *testing.T, c *Ctx) {
 			})
 			seq++
 			globalClient.AITrajectoryLog(&dashapi.AITrajectoryReq{
-				JobID: resp.ID,
+				JobID: jobID1,
 				Span: &trajectory.Span{
 					Seq:      seq,
 					Nesting:  2,
@@ -371,7 +390,7 @@ func populateLocalUIDB(t *testing.T, c *Ctx) {
 			seq++
 		}
 		globalClient.AITrajectoryLog(&dashapi.AITrajectoryReq{
-			JobID: resp.ID,
+			JobID: jobID1,
 			Span: &trajectory.Span{
 				Seq:      agentSeq,
 				Nesting:  1,
@@ -383,7 +402,7 @@ func populateLocalUIDB(t *testing.T, c *Ctx) {
 		})
 	}
 	globalClient.AITrajectoryLog(&dashapi.AITrajectoryReq{
-		JobID: resp.ID,
+		JobID: jobID1,
 		Span: &trajectory.Span{
 			Seq:      0,
 			Nesting:  0,
@@ -393,12 +412,98 @@ func populateLocalUIDB(t *testing.T, c *Ctx) {
 			Finished: ts,
 		},
 	})
+
 	globalClient.AIJobDone(&dashapi.AIJobDoneReq{
-		ID: resp.ID,
+		ID: jobID1,
 		Results: map[string]any{
 			"Benign":      false,
-			"Confident":   true,
 			"Explanation": "ISO C says data races result in undefined program behavior.",
+		},
+	})
+
+	_, err = globalClient.AIJobPoll(&dashapi.AIJobPollReq{
+		AgentName:    "agent-local-ui",
+		CodeRevision: "xxx",
+		Workflows: []dashapi.AIWorkflow{
+			{Type: ai.WorkflowPatching, Name: string(ai.WorkflowPatching)},
+		},
+	})
+	require.NoError(t, err)
+
+	globalClient.AIJobDone(&dashapi.AIJobDoneReq{
+		ID: jobID2,
+		Results: map[string]any{
+			"PatchDescription": "Test Patch Subject\n\nTest Patch Body",
+			"PatchDiff":        "diff --git a/test b/test",
+		},
+	})
+
+	pollExt, err := globalClient.AIPollReport(&dashapi.PollExternalReportReq{
+		Source: dashapi.AIJobSourceLore,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, pollExt)
+	require.NotNil(t, pollExt.Result)
+
+	_ = globalClient.AIConfirmReport(&dashapi.ConfirmPublishedReq{
+		ReportID:       pollExt.Result.ID,
+		PublishedExtID: "<mock-msg-1>",
+	})
+	_, _ = globalClient.AIReportCommand(&dashapi.SendExternalCommandReq{
+		Source:       dashapi.AIJobSourceLore,
+		RootExtID:    "<mock-msg-1>",
+		MessageExtID: "<comment-1>",
+		Author:       "reviewer@example.com",
+		Comment: &dashapi.CommentCommand{
+			Body: "This is a mock comment added via client API.",
+		},
+	})
+
+	// Fast forward time to trigger iteration.
+	c.advanceTime(31 * time.Minute)
+
+	iterResp, err := globalClient.AIJobPoll(&dashapi.AIJobPollReq{
+		AgentName:    "agent-local-ui",
+		CodeRevision: "xxx",
+		Workflows: []dashapi.AIWorkflow{
+			{Type: ai.WorkflowPatchIteration, Name: string(ai.WorkflowPatchIteration)},
+		},
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, iterResp.ID)
+
+	globalClient.AIJobDone(&dashapi.AIJobDoneReq{
+		ID: iterResp.ID,
+		Results: map[string]any{
+			"PatchDescription": "Test Patch V2 Subject\n\nTest Patch V2 Body",
+			"PatchDiff":        "diff --git a/test b/test\n+v2 changes",
+			"NewChangeLog":     "Fixed reviewer comment",
+		},
+	})
+
+	pollExt2, err := globalClient.AIPollReport(&dashapi.PollExternalReportReq{
+		Source: dashapi.AIJobSourceLore,
+	})
+	require.NoError(t, err)
+	if pollExt2 != nil && pollExt2.Result != nil {
+		_ = globalClient.AIConfirmReport(&dashapi.ConfirmPublishedReq{
+			ReportID:       pollExt2.Result.ID,
+			PublishedExtID: "<mock-msg-2>",
+		})
+	}
+
+	// This should be last so that the app allows creation of all job types.
+	globalClient.AIJobPoll(&dashapi.AIJobPollReq{
+		AgentName:    "agent-local-ui",
+		CodeRevision: "xxx",
+		Workflows: []dashapi.AIWorkflow{
+			{Type: ai.WorkflowPatching, Name: string(ai.WorkflowPatching)},
+			{Type: ai.WorkflowModeration, Name: string(ai.WorkflowModeration)},
+			{Type: ai.WorkflowAssessmentKCSAN, Name: string(ai.WorkflowAssessmentKCSAN)},
+			{Type: ai.WorkflowPatchIteration, Name: string(ai.WorkflowPatchIteration)},
+			{Type: ai.WorkflowAssessmentSecurity, Name: string(ai.WorkflowAssessmentSecurity)},
+			{Type: ai.WorkflowRepro, Name: string(ai.WorkflowRepro)},
+			{Type: ai.WorkflowReproC, Name: string(ai.WorkflowReproC)},
 		},
 	})
 }

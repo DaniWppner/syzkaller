@@ -7,11 +7,16 @@ import (
 	"time"
 
 	"cloud.google.com/go/spanner"
+	"github.com/google/syzkaller/dashboard/dashapi"
 	"github.com/google/syzkaller/pkg/aflow/ai"
+	"github.com/google/syzkaller/pkg/email/lore"
 )
 
 const (
-	ActionJobReview = "JobReview"
+	ActionJobReview = "JobReview" // Outdated. Use ActionApprove/ActionReject.
+	ActionApprove   = "Approve"
+	ActionReject    = "Reject"
+	ActionUnreject  = "Unreject"
 )
 
 const (
@@ -41,24 +46,26 @@ type Agent struct {
 }
 
 type Job struct {
-	ID        string
-	Type      ai.WorkflowType
-	Workflow  string
-	Namespace string
-	BugID     spanner.NullString // set if the job related to some bug
+	ID            string
+	Type          ai.WorkflowType
+	Workflow      string
+	Namespace     string
+	BugID         spanner.NullString // set if the job related to some bug
+	ExternalBugID spanner.NullString // set if manually provided via UI
 	// Arbitrary description/link shown in the UI list of jobs.
-	Description  string
-	Link         string
-	Created      time.Time
-	Started      spanner.NullTime
-	Finished     spanner.NullTime
-	CodeRevision string // syzkaller revision, filled when the job is started
-	Error        string // for finished jobs
-	AgentName    spanner.NullString
-	Args         spanner.NullJSON
-	Results      spanner.NullJSON
-	Correct      spanner.NullBool
-	Aborted      bool
+	Description       string
+	Link              string
+	Created           time.Time
+	Started           spanner.NullTime
+	Finished          spanner.NullTime
+	CodeRevision      string // syzkaller revision, filled when the job is started
+	Error             string // for finished jobs
+	AgentName         spanner.NullString
+	Args              spanner.NullJSON
+	Results           spanner.NullJSON
+	Correct           spanner.NullBool
+	Aborted           bool
+	ParentReportingID spanner.NullString
 }
 
 type TrajectorySpan struct {
@@ -84,10 +91,51 @@ type TrajectorySpan struct {
 }
 
 type Journal struct {
-	ID      string
-	JobID   spanner.NullString
-	Date    time.Time
-	User    string
-	Action  string
-	Details spanner.NullJSON
+	ID          string
+	JobID       spanner.NullString
+	Date        time.Time
+	User        string
+	Action      string
+	Details     spanner.NullJSON
+	Error       spanner.NullString
+	SourceExtID spanner.NullString
+	Source      spanner.NullString
+	ReportingID spanner.NullString
+}
+
+type JobReporting struct {
+	ID           string
+	JobID        string
+	Stage        string
+	Source       string
+	ReportedAt   spanner.NullTime
+	UpstreamedAt spanner.NullTime
+	UpstreamedBy spanner.NullString
+	ExtID        spanner.NullString
+	Version      spanner.NullInt64
+	ExtraCcList  []string
+	CreatedAt    time.Time
+}
+
+func (r *JobReporting) ExternalLink() string {
+	if !r.ExtID.Valid || r.ExtID.StringVal == "" {
+		return ""
+	}
+	if r.Source == string(dashapi.AIJobSourceLore) {
+		return lore.LinkToThread(r.ExtID.StringVal)
+	}
+	return ""
+}
+
+type JobComment struct {
+	ID           string
+	ReportingID  string
+	ExtID        string
+	Subject      spanner.NullString
+	Author       string
+	BodyURI      string
+	Date         time.Time
+	OwnEmail     bool
+	Processed    bool
+	VerifiedDKIM bool
 }

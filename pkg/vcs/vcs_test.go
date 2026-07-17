@@ -4,11 +4,52 @@
 package vcs
 
 import (
+	"fmt"
 	"net/mail"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestPatch(t *testing.T) {
+	for _, repo := range []bool{false, true} {
+		t.Run(fmt.Sprintf("repo=%v", repo), func(t *testing.T) {
+			dir := t.TempDir()
+			if repo {
+				MakeTestRepo(t, dir)
+			}
+			file := filepath.Join(dir, "file.txt")
+			err := os.WriteFile(file, []byte("line1\nline2\n"), 0644)
+			require.NoError(t, err)
+
+			patch := []byte("--- a/file.txt\n+++ b/file.txt\n@@ -1,2 +1,3 @@\n line1\n+injected\n line2\n")
+			err = Patch(dir, patch)
+			require.NoError(t, err)
+
+			content, err := os.ReadFile(file)
+			require.NoError(t, err)
+			require.Equal(t, "line1\ninjected\nline2\n", string(content))
+
+			err = Patch(dir, patch)
+			require.ErrorContains(t, err, "patch is already applied")
+		})
+	}
+}
+
+func TestPatchForbidden(t *testing.T) {
+	dir := t.TempDir()
+	MakeTestRepo(t, dir)
+
+	// Modification of .git/ directory must be blocked.
+	patch1 := []byte("--- /dev/null\n+++ b/.git/file.txt\n@@ -0,0 +1 @@\n+injected\n")
+	require.Error(t, Patch(dir, patch1))
+
+	// Path traversal must be blocked.
+	patch2 := []byte("--- a/../file.txt\n+++ b/../file.txt\n@@ -0,0 +1 @@\n+injected\n")
+	require.Error(t, Patch(dir, patch2))
+}
 
 func TestCanonicalizeCommit(t *testing.T) {
 	tests := map[string]string{
@@ -243,28 +284,52 @@ func TestFileLink(t *testing.T) {
 	}
 }
 
-func TestParse(t *testing.T) {
-	test1 := []byte(`Foo Bar <a@email.com> (maintainer:KERNEL)
-	Foo Bar<b@email.com> (reviewer:KERNEL)
-	<somelist@list.com> (open list:FOO)
-	"Supporter Foo" <c@email.com> (supporter:KERNEL)
-	linux-kernel@vger.kernel.org (open list)`)
-	test2 := []byte(`Foo Bar <a@email.com> (maintainer:KERNEL)
-	Foo Bar<b@email.com> (reviewer:KERNEL)
-	"Supporter Foo" <c@email.com> (supporter:KERNEL)
-	linux-kernel@vger.kernel.org (open list)`)
-
-	maintainers1 := Recipients{{mail.Address{Name: "Foo Bar", Address: "a@email.com"}, To},
-		{mail.Address{Name: "Foo Bar", Address: "b@email.com"}, Cc},
-		{mail.Address{Name: "Supporter Foo", Address: "c@email.com"}, To},
-		{mail.Address{Name: "", Address: "linux-kernel@vger.kernel.org"}, Cc},
-		{mail.Address{Name: "", Address: "somelist@list.com"}, To}}
-	maintainers2 := Recipients{{mail.Address{Name: "Foo Bar", Address: "a@email.com"}, To},
-		{mail.Address{Name: "Foo Bar", Address: "b@email.com"}, Cc},
-		{mail.Address{Name: "Supporter Foo", Address: "c@email.com"}, To},
-		{mail.Address{Name: "", Address: "linux-kernel@vger.kernel.org"}, To}}
-
-	require.Equal(t, maintainers1, ParseMaintainersLinux(test1))
-	require.Equal(t, maintainers2, ParseMaintainersLinux(test2))
-	require.Equal(t, Recipients(nil), ParseMaintainersLinux([]byte("")))
+func TestParseMaintainersLinux(t *testing.T) {
+	type Test struct {
+		Input string
+		Want  Recipients
+	}
+	tests := []Test{
+		{
+			"",
+			Recipients(nil),
+		},
+		{
+			`
+Foo Bar <a@email.com> (maintainer:KERNEL)
+Foo Bar<b@email.com> (reviewer:KERNEL)
+<somelist@list.com> (open list:FOO)
+"Supporter Foo (Company)" <c@email.com> (supporter:KERNEL)
+linux-kernel@vger.kernel.org (open list)
+linux-input@vger.kernel.org (open list:INPUT (KEYBOARD, MOUSE, JOYSTICK, TOUCHSCREEN)...)
+		`,
+			Recipients{
+				{mail.Address{Name: "Foo Bar", Address: "a@email.com"}, To},
+				{mail.Address{Name: "Foo Bar", Address: "b@email.com"}, Cc},
+				{mail.Address{Name: "Supporter Foo (Company)", Address: "c@email.com"}, To},
+				{mail.Address{Name: "", Address: "linux-input@vger.kernel.org"}, To},
+				{mail.Address{Name: "", Address: "linux-kernel@vger.kernel.org"}, Cc},
+				{mail.Address{Name: "", Address: "somelist@list.com"}, To},
+			},
+		},
+		{
+			`
+Foo Bar <a@email.com> (maintainer:KERNEL)
+Foo Bar<b@email.com> (reviewer:KERNEL)
+"Supporter Foo" <c@email.com> (supporter:KERNEL)
+linux-kernel@vger.kernel.org (open list)
+			`,
+			Recipients{
+				{mail.Address{Name: "Foo Bar", Address: "a@email.com"}, To},
+				{mail.Address{Name: "Foo Bar", Address: "b@email.com"}, Cc},
+				{mail.Address{Name: "Supporter Foo", Address: "c@email.com"}, To},
+				{mail.Address{Name: "", Address: "linux-kernel@vger.kernel.org"}, To},
+			},
+		},
+	}
+	for i, test := range tests {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			require.Equal(t, test.Want, ParseMaintainersLinux([]byte(test.Input)), test.Input)
+		})
+	}
 }

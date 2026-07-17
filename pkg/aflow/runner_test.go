@@ -14,10 +14,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/syzkaller/pkg/aflow/backend"
 	"github.com/google/syzkaller/pkg/aflow/trajectory"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/stretchr/testify/require"
-	"google.golang.org/genai"
 )
 
 var flagUpdate = flag.Bool("update", false, "update golden test files to match the actual execution")
@@ -31,6 +31,7 @@ var flagUpdate = flag.Bool("update", false, "update golden test files to match t
 // If -update flag is provided, the golden testdata files are updated to match the actual execution.
 func testFlow[Inputs, Outputs any](t *testing.T, inputs map[string]any, result any, root Action,
 	llmReplies []any, consts map[string]any) {
+	setupDefaults(root)
 	flows := make(map[string]*Flow)
 	err := register[Inputs, Outputs]("test", "description", flows, []*Flow{{
 		Consts: consts,
@@ -39,35 +40,35 @@ func testFlow[Inputs, Outputs any](t *testing.T, inputs map[string]any, result a
 	require.NoError(t, err)
 	type llmRequest struct {
 		Model   string
-		Config  *genai.GenerateContentConfig `json:",omitempty"`
-		Request []*genai.Content
+		Config  *backend.GenerateConfig `json:",omitempty"`
+		Request []*backend.Message
 	}
 	var requests []llmRequest
 	var stubTime time.Time
-	var lastConfig genai.GenerateContentConfig
+	var lastConfig *backend.GenerateConfig
 	generateContentStub := false
 	stub := &stubContext{
 		timeNow: func() time.Time {
 			stubTime = stubTime.Add(time.Second)
 			return stubTime
 		},
-		generateContent: func(model string, cfg *genai.GenerateContentConfig, req []*genai.Content) (
-			*genai.GenerateContentResponse, error) {
+		generateContent: func(model string, cfg *backend.GenerateConfig, req []*backend.Message) (
+			*backend.GenerateResponse, error) {
 			// Copy config and req slices, so that future changes to these objects
 			// don't affect our stored requests.
-			var storeCfg *genai.GenerateContentConfig
-			if !reflect.DeepEqual(*cfg, lastConfig) {
+			var storeCfg *backend.GenerateConfig
+			if !reflect.DeepEqual(cfg, lastConfig) {
 				// Memorize config only if it has changed from the previous request.
 				// Most of the time it's repeated for the same agent.
-				lastConfig = *cfg
 				cfgCopy := *cfg
+				lastConfig = &cfgCopy
 				storeCfg = &cfgCopy
 			}
 			requests = append(requests, llmRequest{model, storeCfg, slices.Clone(req)})
 			require.NotEmpty(t, llmReplies, "unexpected LLM call")
 			reply := llmReplies[0]
-			if cb, ok := reply.(func(string, *genai.GenerateContentConfig, []*genai.Content) (
-				*genai.GenerateContentResponse, error)); ok {
+			if cb, ok := reply.(func(string, *backend.GenerateConfig, []*backend.Message) (
+				*backend.GenerateResponse, error)); ok {
 				generateContentStub = true
 				return cb(model, cfg, req)
 			}
@@ -75,18 +76,20 @@ func testFlow[Inputs, Outputs any](t *testing.T, inputs map[string]any, result a
 			switch reply := reply.(type) {
 			case error:
 				return nil, reply
-			case *genai.Part:
-				return &genai.GenerateContentResponse{
-					Candidates: []*genai.Candidate{{Content: &genai.Content{
-						Role:  string(genai.RoleUser),
-						Parts: []*genai.Part{reply},
-					}}}}, nil
-			case []*genai.Part:
-				return &genai.GenerateContentResponse{
-					Candidates: []*genai.Candidate{{Content: &genai.Content{
-						Role:  string(genai.RoleUser),
-						Parts: reply,
-					}}}}, nil
+			case *backend.GenerateResponse:
+				return reply, nil
+			case backend.Part:
+				return &backend.GenerateResponse{
+					Parts: []backend.Part{reply},
+				}, nil
+			case *backend.Part:
+				return &backend.GenerateResponse{
+					Parts: []backend.Part{*reply},
+				}, nil
+			case []backend.Part:
+				return &backend.GenerateResponse{
+					Parts: reply,
+				}, nil
 			default:
 				t.Fatalf("bad LLM reply type %T", reply)
 				return nil, nil
@@ -105,7 +108,7 @@ func testFlow[Inputs, Outputs any](t *testing.T, inputs map[string]any, result a
 	if inputs == nil {
 		inputs = map[string]any{}
 	}
-	got, err := flows["test"].Execute(ctx, "", workdir, inputs, cache, onEvent)
+	got, err := flows["test"].Execute(ctx, &dummyProvider{}, workdir, false, inputs, cache, onEvent)
 	switch result := result.(type) {
 	case map[string]any:
 		require.NoError(t, err)
@@ -154,4 +157,63 @@ func testRegistrationError[Inputs, Outputs any](t *testing.T, expected string, f
 	err := register[Inputs, Outputs]("test", "description", flows, []*Flow{flow})
 	require.Error(t, err)
 	require.Equal(t, expected, err.Error())
+}
+
+func setupDefaults(a Action) {
+	if a == nil {
+		return
+	}
+	switch a := a.(type) {
+	case *LLMAgent:
+		if a.Name == "" {
+			a.Name = "smarty"
+		}
+		if a.Model == "" {
+			a.Model = "model"
+		}
+		if a.TaskType == 0 {
+			a.TaskType = FormalReasoningTask
+		}
+		if a.Instruction == "" {
+			a.Instruction = "Instruction"
+		}
+		if a.Prompt == "" {
+			a.Prompt = "Prompt"
+		}
+	case *pipeline:
+		for _, sub := range a.actions {
+			setupDefaults(sub)
+		}
+	case *If:
+		setupDefaults(a.Do)
+		setupDefaults(a.Else)
+	case *DoWhile:
+		setupDefaults(a.Do)
+	case *ForEach:
+		setupDefaults(a.Do)
+	}
+}
+
+type dummyProvider struct{}
+
+func (p *dummyProvider) Client(ctx context.Context) (backend.Client, error) {
+	return nil, nil
+}
+
+func (p *dummyProvider) Models(ctx context.Context) ([]string, error) {
+	return nil, nil
+}
+
+func (p *dummyProvider) ResolveModels(category backend.ModelCategory) []string {
+	if category == "" {
+		return nil
+	}
+	if category == "fallback-pool" {
+		return []string{"model1", "model2"}
+	}
+	return []string{string(category)}
+}
+
+func (p *dummyProvider) Close() error {
+	return nil
 }

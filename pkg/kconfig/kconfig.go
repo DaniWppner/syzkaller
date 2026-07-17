@@ -63,6 +63,7 @@ const (
 	MenuChoice
 	MenuComment
 )
+
 const (
 	_ ConfigType = iota
 	TypeBool
@@ -175,6 +176,7 @@ func (kconf *KConfig) setSelectedBy() {
 	}
 }
 
+// SelectedBy returns the set of configs that select or imply the given config.
 // NOTE: the function is ignoring the "if" part of select/imply.
 func (kconf *KConfig) SelectedBy(name string) map[string]bool {
 	ret := map[string]bool{}
@@ -323,6 +325,9 @@ func (kp *kconfigParser) parseProperty(prop string) {
 	case "depends":
 		kp.MustConsume("on")
 		cur.dependsOn = exprAnd(cur.dependsOn, kp.parseExpr())
+		if kp.TryConsume("if") {
+			_ = kp.parseExpr()
+		}
 	case "visible":
 		kp.MustConsume("if")
 		cur.visibleIf = exprAnd(cur.visibleIf, kp.parseExpr())

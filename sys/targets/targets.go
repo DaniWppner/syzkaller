@@ -1,6 +1,7 @@
 // Copyright 2017 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package targets defines architecture and OS target descriptions and helpers.
 package targets
 
 import (
@@ -990,7 +991,7 @@ func (target *Target) lazyInit() {
 		}
 	}
 	target.CFlags = newCFlags
-	target.CxxFlags = append(target.CFlags, commonCxxFlags...)
+	target.CxxFlags = slices.Concat(target.CFlags, commonCxxFlags)
 	// Check that the compiler is actually functioning. It may be present, but still broken.
 	// Common for Linux distros, over time we've seen:
 	//	Error: alignment too large: 15 assumed
@@ -1058,9 +1059,9 @@ func processMergedFlags(flags []string) []string {
 			m[s] = true
 		}
 		keep := ""
-		for i := len(flags) - 1; i >= 0; i-- {
-			if m[flags[i]] {
-				keep = flags[i]
+		for _, flag := range slices.Backward(flags) {
+			if m[flag] {
+				keep = flag
 				break
 			}
 		}

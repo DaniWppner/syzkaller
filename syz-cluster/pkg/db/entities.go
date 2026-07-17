@@ -71,16 +71,19 @@ const (
 )
 
 type Session struct {
-	ID           string             `spanner:"ID"`
-	SeriesID     string             `spanner:"SeriesID"`
-	CreatedAt    time.Time          `spanner:"CreatedAt"`
-	StartedAt    spanner.NullTime   `spanner:"StartedAt"`
-	FinishedAt   spanner.NullTime   `spanner:"FinishedAt"`
-	SkipReason   spanner.NullString `spanner:"SkipReason"`
-	LogURI       string             `spanner:"LogURI"`
-	TriageLogURI string             `spanner:"TriageLogURI"`
-	Tags         []string           `spanner:"Tags"`
-	JobID        spanner.NullString `spanner:"JobID"`
+	ID                  string             `spanner:"ID"`
+	SeriesID            string             `spanner:"SeriesID"`
+	CreatedAt           time.Time          `spanner:"CreatedAt"`
+	StartedAt           spanner.NullTime   `spanner:"StartedAt"`
+	FinishedAt          spanner.NullTime   `spanner:"FinishedAt"`
+	SkipReason          spanner.NullString `spanner:"SkipReason"`
+	LogURI              string             `spanner:"LogURI"`
+	TriageLogURI        string             `spanner:"TriageLogURI"`
+	TriageTrajectoryURI spanner.NullString `spanner:"TriageTrajectoryURI"`
+	Tags                []string           `spanner:"Tags"`
+	Direct              spanner.NullBool   `spanner:"Direct"`
+	ReportLevel         spanner.NullString `spanner:"ReportLevel"`
+	JobID               spanner.NullString `spanner:"JobID"`
 	// TODO: to accept more specific fuzzing assignment,
 	// add Triager, BaseRepo, BaseCommit, Config fields.
 }
@@ -97,6 +100,7 @@ const (
 	SessionStatusStepsFailed SessionStatus = "steps_failed"
 )
 
+// Status returns the session status.
 // It could have been a calculated field in Spanner, but the Go library for Spanner currently
 // does not support read-only fields.
 func (s *Session) Status() SessionStatus {

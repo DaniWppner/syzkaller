@@ -11,6 +11,8 @@ config:
  - NO_HZ
  - HIGH_RES_TIMERS
  - POSIX_AUX_CLOCKS: [v6.17]
+ - RSEQ
+ - RSEQ_SLICE_EXTENSION: [v7.0, -arm, -arm64]
  - PREEMPT
  - IRQ_TIME_ACCOUNTING: [-riscv, -s390]
  - BSD_PROCESS_ACCT
@@ -25,8 +27,9 @@ config:
  - LOG_BUF_SHIFT: 18
  - NUMA: [-arm]
  - NUMA_EMU: [x86_64]
- - NUMA_BALANCING: [-arm, -preempt_rt]
- - NUMA_BALANCING_DEFAULT_ENABLED: [-arm, -preempt_rt]
+ # Disabled for arm/riscv due to lack of support, and for preempt_rt to avoid latency.
+ - NUMA_BALANCING: [-arm, -riscv, -preempt_rt]
+ - NUMA_BALANCING_DEFAULT_ENABLED: [-arm, -riscv, -preempt_rt]
  # Starting from v6.13, depends on !CPU_MITIGATIONS.
  - ADDRESS_MASKING: [x86_64, v6.4, -v6.12, -stable-6.6]
  - X86_USER_SHADOW_STACK: [x86_64, v6.6]
@@ -90,6 +93,8 @@ config:
  - UNUSED_SYMBOLS: n
  - BLK_DEV_ZONED
  - BLK_DEV_THROTTLING
+ - BLK_DEV_UBLK: [v6.0]
+ - BLKDEV_UBLK_LEGACY_OPCODES: [v6.4]
  - BLK_WBT
  - BLK_WBT_MQ
  - BLK_CGROUP_IOLATENCY
@@ -120,7 +125,8 @@ config:
  - ZONE_DEVICE: [-arm, -riscv, -s390]
  - DEVICE_PRIVATE: [-arm, -riscv, -s390]
  - PERCPU_STATS
- - READ_ONLY_THP_FOR_FS: [-arm, -riscv, -preempt_rt]
+ # Removed in 2dfa808bf4d7c "mm: remove READ_ONLY_THP_FOR_FS Kconfig option".
+ - READ_ONLY_THP_FOR_FS: [-arm, -riscv, -preempt_rt, -v7.1]
  - PCI
  - PCIEPORTBUS
  - HOTPLUG_PCI_PCIE
@@ -328,44 +334,6 @@ config:
  - LOGO
  - LOGO_LINUX_MONO
  - LOGO_LINUX_VGA16
- - SND
- - SOUND
- - SOUND_OSS_CORE_PRECLAIM
- - SND_DRIVERS
- - SND_PCI
- - SND_OSSEMUL
- - SND_MIXER_OSS
- - SND_PCM
- - SND_PCM_OSS
- - SND_PCM_OSS_PLUGINS
- - SND_HRTIMER
- - SND_SEQUENCER
- - SND_SEQ_DUMMY
- - SND_SEQUENCER_OSS
- - SND_DUMMY
- - SND_ALOOP
- - SND_VIRMIDI
- - SND_VIRTIO: [v5.13]
- - SND_HDA_INTEL
- - SND_HDA_HWDEP
- - SND_HDA_INPUT_BEEP
- - SND_HDA_PATCH_LOADER
- - SND_HDA_CODEC_REALTEK
- - SND_HDA_CODEC_ANALOG
- - SND_HDA_CODEC_SIGMATEL
- - SND_HDA_CODEC_VIA
- - SND_HDA_CODEC_HDMI
- - SND_HDA_CODEC_CIRRUS
- - SND_HDA_CODEC_CONEXANT
- - SND_HDA_CODEC_CA0110
- - SND_HDA_CODEC_CA0132
- - SND_HDA_CODEC_CMEDIA
- - SND_HDA_CODEC_SI3054
- # SND_HDA_INTEL is disabled by kmsan.yml because of some compatibility problems.
- - SND_HDA_PREALLOC_SIZE: [0, -kmsan]
- - SND_USB_AUDIO
- - SND_FIREWORKS: n
- - SND_FIREWIRE_TASCAM: n
  - HID_BATTERY_STRENGTH: [-s390]
  - HIDRAW: [-s390]
  - HID_HAPTIC: [v6.18]
@@ -411,11 +379,11 @@ config:
  - USB_DUMMY_HCD
  - USB_CONFIGFS
  - USB_CONFIGFS_F_FS
- - USB_CONFIGFS_F_MIDI
  - USB_CONFIGFS_SERIAL
  - USB_RAW_GADGET: [v5.5]
  - USB_FEW_INIT_RETRIES: [v5.10]
  - TYPEC
+ - PHY_GOOGLE_USB: [v6.20, -arm64_emu]
  - TYPEC_TCPM
  - TYPEC_UCSI: [-s390]
  - UCSI_ACPI: [-arm, -riscv, -s390]
@@ -432,7 +400,8 @@ config:
  - ASYNC_TX_DMA
  - SW_SYNC
  - UDMABUF
- - DMABUF_MOVE_NOTIFY: [v5.5]
+ # Removed in 609fc8766d68d "dma-buf: Always build with DMABUF_MOVE_NOTIFY".
+ - DMABUF_MOVE_NOTIFY: [v5.5, -v7.1]
  - DMABUF_HEAPS: [v5.5]
  - DMABUF_HEAPS_SYSTEM: [v5.5]
  - DMABUF_HEAPS_CMA: [v5.5]
@@ -605,7 +574,7 @@ config:
  - DAMON_DBGFS: [v5.15, -v6.9]
  - DAMON_RECLAIM: [v5.17]
  - ZSWAP_DEFAULT_ON: [v5.7]
- - SMB_SERVER: [v5.15]
+ - SMB_SERVER: [v5.15, -arm64_gce]
  - SYSFS_SYSCALL
  - PREEMPT_RT: [v6.16, preempt_rt]
 
@@ -614,3 +583,5 @@ config:
  - ELF_CORE
 
  - IO_URING_MOCK_FILE: [v6.17]
+ - IO_URING_BPF: [linux-next]
+ - FUSE_IO_URING: [linux-next]
