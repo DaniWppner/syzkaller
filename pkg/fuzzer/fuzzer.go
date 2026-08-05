@@ -231,18 +231,12 @@ type Config struct {
 	DebugFilters   map[uint64]struct{}
 }
 
-func (fuzzer *Fuzzer) logFuncPointerCoverOperationTime(p string, duration time.Duration) {
-	//fuzzer.Logf(5, "[prog-%s] function pointer calculation %f seconds", p, duration.Seconds())
-	return
-}
-
 func (fuzzer *Fuzzer) triageProgCall(p *prog.Prog, info *flatrpc.CallInfo, call int, triage *map[int]*triageCall) {
 	if info == nil {
 		return
 	}
 	prio := signalPrio(p, info, call)
-	newFuncPointerCover, rwfpc_duration := fuzzer.Cover.addRawFuncPointerCover(info.FuncStores)
-	fuzzer.logFuncPointerCoverOperationTime(p.GetUuid(), rwfpc_duration)
+	newFuncPointerCover, _ := fuzzer.Cover.addRawFuncPointerCover(info.FuncStores)
 
 	newMaxSignal := fuzzer.Cover.addRawMaxSignal(info.Signal, prio)
 	if newMaxSignal.Empty() && newFuncPointerCover.Empty() {
@@ -261,8 +255,7 @@ func (fuzzer *Fuzzer) triageProgCall(p *prog.Prog, info *flatrpc.CallInfo, call 
 	if *triage == nil {
 		*triage = make(map[int]*triageCall)
 	}
-	initialFPCover, fromRawDuration := cover.FPCoverFromRaw(info.FuncStores)
-	fuzzer.logFuncPointerCoverOperationTime(p.GetUuid(), fromRawDuration)
+	initialFPCover, _ := cover.FPCoverFromRaw(info.FuncStores)
 	(*triage)[call] = &triageCall{
 		errno:               info.Error,
 		newSignal:           newMaxSignal,
@@ -360,11 +353,9 @@ func (fuzzer *Fuzzer) startJob(stat *stat.Val, newJob job) {
 
 func (fuzzer *Fuzzer) logJobResults(jobInfo *JobInfo, jobDuration time.Duration) {
 	jobInfo.Logf("total job duration: %f seconds", jobDuration.Seconds())
+	jobInfo.Logf("%d total test case executions", jobInfo.Execs.Load())
+	jobInfo.Logf("%d new test case executions because of function pointer coverage", jobInfo.ExecBecauseFPCov.Load())
 
-	if jobInfo.ExecRequestTotal.Load() > 0 {
-		jobInfo.Logf("%d total test case executions", jobInfo.ExecRequestTotal.Load())
-		jobInfo.Logf("%d new test case executions because of function pointer coverage", jobInfo.ExecRequestBecauseOfFPCov.Load())
-	}
 	if jobInfo.ExecTimeTotal.Load() > 0 {
 		_execTime := time.Duration(jobInfo.ExecTimeTotal.Load())
 		_execTimeFPCov := time.Duration(jobInfo.ExecTimeBecauseOfFPCov.Load())
@@ -385,10 +376,6 @@ func (fuzzer *Fuzzer) logJobResults(jobInfo *JobInfo, jobDuration time.Duration)
 		jobInfo.Logf("test executions (function pointer coverage) individual durations: %s", jsonDataFPCov)
 	}
 
-	if jobInfo.FPCovCalculationsTime.Load() > 0 {
-		_fPCovCalculationsTime := time.Duration(jobInfo.FPCovCalculationsTime.Load())
-		fuzzer.logFuncPointerCoverOperationTime(jobInfo.ProgId, _fPCovCalculationsTime)
-	}
 	fuzzer.Logf(5, "%s", jobInfo.Bytes())
 
 }
