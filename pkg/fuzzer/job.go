@@ -506,16 +506,21 @@ func (job *triageJob) stopDeflake(run, needRuns int, noNewSignal bool, noNewFPCo
 		noChanceSignal := true
 		noChanceFPCov := true
 		runsLeft := deflakeMaxRuns - run
-		notEnoughRunsLeft := runsLeft < needRuns
 		for _, call := range job.calls {
-			if call.newSignal.IntersectsWith(call.signals[needRuns-runsLeft-1]) {
-				noChanceSignal = false
-			} else if intersects, _ := call.newFuncPointerCover.IntersectsWith(call.funcPointerCovers[needRuns-runsLeft-1]); intersects {
+			if runsLeft >= needRuns {
 				noChanceFPCov = false
+				noChanceSignal = false
+			} else {
+				if call.newSignal.IntersectsWith(call.signals[needRuns-runsLeft-1]) {
+					noChanceSignal = false
+				}
+				if intersects, _ := call.newFuncPointerCover.IntersectsWith(call.funcPointerCovers[needRuns-runsLeft-1]); intersects {
+					noChanceFPCov = false
+				}
 			}
 		}
-		// stop if there's not enough runs left, both criteria finished, or one finished and the other one has no chance.
-		if notEnoughRunsLeft || haveSignal && haveFPCover || noChanceSignal && noChanceFPCov ||
+		// stop if both criteria finished or one finished and the other one has no chance.
+		if haveSignal && haveFPCover || noChanceSignal && noChanceFPCov ||
 			haveFPCover && noChanceSignal || haveSignal && noChanceFPCov {
 			return 0
 		}
@@ -529,8 +534,8 @@ func (job *triageJob) stopDeflake(run, needRuns int, noNewSignal bool, noNewFPCo
 			return 2
 		}
 		panic(fmt.Sprintf(
-			"unreachable in stopDeflake.\nhaveSignal: %t haveFPCover: %t, noChanceSignal: %t, noChanceFPCov: %t, notEnoughRunsLeft: %t",
-			haveSignal, haveFPCover, noChanceSignal, noChanceFPCov, notEnoughRunsLeft))
+			"unreachable in stopDeflake.\nhaveSignal: %t haveFPCover: %t, noChanceSignal: %t, noChanceFPCov: %t",
+			haveSignal, haveFPCover, noChanceSignal, noChanceFPCov))
 	} else {
 		if run >= deflakeTotalCorpusRuns ||
 			noNewSignal && (run >= deflakeMaxCorpusRuns || run >= deflakeMinCorpusRuns && haveSignal) ||
