@@ -339,9 +339,7 @@ func (job *triageJob) doHandleCall(p *prog.Prog, call int, info *triageCall, fPC
 		}
 	}
 	job.info.Logf("added new input for #%d [%s] to the corpus with program:\n%s", call, callName, p.Serialize())
-	if !info.newStableFuncPointerCover.Empty() {
-		job.info.Logf("total cover for call #%d [%s]:\n%s", call, callName, signal.RawPreview(info.cover.Serialize()))
-	}
+	job.info.Logf("total cover for call #%d [%s]:\n%s", call, callName, signal.RawPreview(info.cover.Serialize()))
 	input := corpus.NewInput{
 		Prog:             p,
 		Call:             call,
