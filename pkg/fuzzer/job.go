@@ -47,16 +47,14 @@ type JobInfo struct {
 	// debug counter of the amount of times a testcase execution was triggered
 	// due to functionPointerCoverage and in general.
 	// This is slightly duplicate with job.info.Execs
-	ExecRequestBecauseOfFPCov atomic.Int32
-	ExecRequestTotal          atomic.Int32
+	ExecBecauseFPCov atomic.Int32
 
 	ExecTimeTotal          atomic.Int64
 	ExecTimeBecauseOfFPCov atomic.Int64
 	ExecsTimeLapses        syncTimePairArray
 	ExecsTimeLapsesFPCov   syncTimePairArray
 
-	FPCovCalculationsTime atomic.Int64
-	FromFPCovOrigin       bool
+	FromFPCovOrigin bool
 
 	syncBuffer
 }
@@ -187,6 +185,7 @@ func (job *triageJob) execute(req *queue.Request, flags ProgFlags) *queue.Result
 	job.info.ExecTimeTotal.Add(int64(execTime))
 	job.info.ExecsTimeLapses.AppendAtomic(execStart, execEnd)
 	if req.FromFPCovOrigin {
+		job.info.ExecBecauseFPCov.Add(1)
 		job.info.ExecTimeBecauseOfFPCov.Add(int64(execTime))
 		job.info.ExecsTimeLapsesFPCov.AppendAtomic(execStart, execEnd)
 	}
@@ -271,7 +270,7 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 		job.doHandleCall(pSignal, callSignal, signalInfo, false)
 	}
 
-	// analogous case for FuncPointerCover
+	// analogous case for only minimizing FuncPointerCover
 	if (minimizationSplitted || pSignal == nil) && pFPCov != nil {
 		// see above
 		fPCovInfo := new(triageCall)
@@ -285,9 +284,6 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
 }
 
 func (job *triageJob) doHandleCall(p *prog.Prog, call int, info *triageCall, fPCovOrigin bool) {
-	// Callers of doHandleCall are telling us whether we should force fPCovOrigin.
-	// But we'll also allow chidlren jobs to inherit the fPCovOrigin tag from this triage process.
-	fPCovOrigin = fPCovOrigin || job.info.FromFPCovOrigin
 	if p == nil {
 		panic(fmt.Sprintf("%s\ndoHandleCall called on nil program. call #%d, [prog-%s]", string(job.info.Bytes()), call, job.info.ProgId))
 	}
@@ -301,6 +297,9 @@ func (job *triageJob) doHandleCall(p *prog.Prog, call int, info *triageCall, fPC
 	if !job.fuzzer.Config.NewInputFilter(callName) {
 		return
 	}
+	// Reset the FromFPCovOrigin tag; don't propagate it into the children processes.
+	// Instead, tag the children as FromFPCovOrigin if during this triage
+	// the individual call was kept due to funcPointerCoverage only.
 	smashJobQueue := job.fuzzer.smashQueue
 	if fPCovOrigin {
 		smashJobQueue = job.fuzzer.fPCovSmashQueue
@@ -347,9 +346,7 @@ func (job *triageJob) doHandleCall(p *prog.Prog, call int, info *triageCall, fPC
 		}
 	}
 	job.info.Logf("added new input for #%d [%s] to the corpus with program:\n%s", call, callName, p.Serialize())
-	if !info.newStableFuncPointerCover.Empty() {
-		job.info.Logf("total cover for call #%d [%s]:\n%s", call, callName, signal.RawPreview(info.cover.Serialize()))
-	}
+	job.info.Logf("total cover for call #%d [%s]:\n%s", call, callName, signal.RawPreview(info.cover.Serialize()))
 	input := corpus.NewInput{
 		Prog:             p,
 		Call:             call,
@@ -359,10 +356,6 @@ func (job *triageJob) doHandleCall(p *prog.Prog, call int, info *triageCall, fPC
 		FuncPointerCover: info.stableFuncPointerCover,
 	}
 	job.fuzzer.Config.Corpus.Save(input)
-}
-
-func (job *triageJob) registerFuncPointerCoverOperationTime(duration time.Duration) {
-	job.info.FPCovCalculationsTime.Add(int64(duration))
 }
 
 func (job *triageJob) deflake(exec func(*queue.Request, ProgFlags) *queue.Result) (stop bool) {
@@ -386,23 +379,25 @@ func (job *triageJob) deflake(exec func(*queue.Request, ProgFlags) *queue.Result
 			totalNewSignal += len(info.newSignal)
 			totalNewFPCover += info.newFuncPointerCover.Len()
 		}
-		shouldStop, fpcovDuration := job.stopDeflake(run, needRuns,
+		shouldStop := job.stopDeflake(run, needRuns,
 			prevTotalNewSignal == totalNewSignal,
 			prevTotalNewFPCover == totalNewFPCover)
-		job.registerFuncPointerCoverOperationTime(fpcovDuration)
-		if shouldStop {
+		if shouldStop == 0 {
 			break
 		}
-		job.info.ExecRequestTotal.Add(1)
 		prevTotalNewSignal = totalNewSignal
 		prevTotalNewFPCover = totalNewFPCover
-		result := exec(&queue.Request{
+		nextRequest := &queue.Request{
 			Prog:            job.p,
 			ExecOpts:        setFlags(flatrpc.ExecFlagCollectCover | flatrpc.ExecFlagCollectSignal),
 			ReturnAllSignal: indices,
 			Avoid:           avoid,
 			Stat:            job.fuzzer.statExecTriage,
-		}, progInTriage)
+		}
+		if shouldStop == 2 {
+			nextRequest.FromFPCovOrigin = true
+		}
+		result := exec(nextRequest, progInTriage)
 		if result.Stop() {
 			return true
 		}
@@ -438,20 +433,16 @@ func (job *triageJob) deflake(exec func(*queue.Request, ProgFlags) *queue.Result
 			info.cover.Merge(res.Cover)
 			thisSignal := signal.FromRaw(res.Signal, prio)
 			// Repeat most of the existing signal logic, but with FuncPointerCover
-			fpcovStart := time.Now()
 			newFuncPointerCover, _ := job.fuzzer.Cover.addRawFuncPointerCover(res.FuncStores)
 			info.newFuncPointerCover.Merge(newFuncPointerCover)
 			thisFuncPointerCover, _ := cover.FPCoverFromRaw(res.FuncStores)
-			job.registerFuncPointerCoverOperationTime(time.Since(fpcovStart))
 			for j := needRuns - 1; j > 0; j-- {
 				intersect := info.signals[j-1].Intersection(thisSignal)
 				info.signals[j].Merge(intersect)
 				// Similar as with signal, store in position run the cumulative intersection
 				// of functionPointerCovers 0 to run
-				fpcovStart := time.Now()
 				fPCoverIntersect, _ := info.funcPointerCovers[j-1].Intersection(thisFuncPointerCover)
 				info.funcPointerCovers[j].Merge(fPCoverIntersect)
-				job.registerFuncPointerCoverOperationTime(time.Since(fpcovStart))
 			}
 			info.signals[0].Merge(thisSignal)
 		}
@@ -466,9 +457,8 @@ func (job *triageJob) deflake(exec func(*queue.Request, ProgFlags) *queue.Result
 
 		info.newStableSignal = info.newSignal.Intersection(info.stableSignal)
 		info.stableFuncPointerCover = info.funcPointerCovers[needRuns-1]
-		newStableFuncPointerCover, fpcovDuration := info.newFuncPointerCover.Intersection(info.stableFuncPointerCover)
+		newStableFuncPointerCover, _ := info.newFuncPointerCover.Intersection(info.stableFuncPointerCover)
 		info.newStableFuncPointerCover = newStableFuncPointerCover
-		job.registerFuncPointerCoverOperationTime(fpcovDuration)
 		job.info.Logf("call #%d [%s]: |stable signal|=%d, |new stable signal|=%d%s",
 			call, job.p.CallName(call), info.stableSignal.Len(), info.newStableSignal.Len(),
 			info.newStableSignal.SignalPreview())
@@ -487,10 +477,18 @@ func (job *triageJob) deflake(exec func(*queue.Request, ProgFlags) *queue.Result
 	return false
 }
 
-func (job *triageJob) stopDeflake(run, needRuns int, noNewSignal bool, noNewFPCover bool) (bool, time.Duration) {
-	var totalFPCovDuration time.Duration
+// choose whether deflake requires another exec.
+// Returns:
+//
+//		0 --> false
+//		1 --> true, because of signal and possibly FPCov
+//	 2 --> true, because of FPCov exclusively
+func (job *triageJob) stopDeflake(run, needRuns int, noNewSignal bool, noNewFPCover bool) int {
 	if job.fuzzer.Config.Snapshot {
-		return run >= needRuns+1, 0
+		if run >= needRuns+1 {
+			return 0
+		}
+		return 1
 	}
 	haveSignal := true
 	haveFPCover := true
@@ -499,8 +497,7 @@ func (job *triageJob) stopDeflake(run, needRuns int, noNewSignal bool, noNewFPCo
 		if !call.newSignal.IntersectsWith(call.signals[needRuns-1]) {
 			haveSignal = false
 		}
-		intersectsFpCov, fpcovDuration := call.newFuncPointerCover.IntersectsWith(call.funcPointerCovers[needRuns-1])
-		totalFPCovDuration += fpcovDuration
+		intersectsFpCov, _ := call.newFuncPointerCover.IntersectsWith(call.funcPointerCovers[needRuns-1])
 		if !intersectsFpCov {
 			haveFPCover = false
 		}
@@ -509,38 +506,58 @@ func (job *triageJob) stopDeflake(run, needRuns int, noNewSignal bool, noNewFPCo
 		// For fuzzing programs we stop if we already have the right deflaked signal for all calls,
 		// or there's no chance to get coverage common to needRuns for all calls.
 		if run >= deflakeMaxRuns {
-			return true, totalFPCovDuration
+			return 0
 		}
-		noChance := true
+		noChanceSignal := true
+		noChanceFPCov := true
+		runsLeft := deflakeMaxRuns - run
 		for _, call := range job.calls {
-			if left := deflakeMaxRuns - run; left >= needRuns ||
-				call.newSignal.IntersectsWith(call.signals[needRuns-left-1]) {
-				noChance = false
+			if runsLeft >= needRuns {
+				noChanceFPCov = false
+				noChanceSignal = false
 			} else {
-				intersectsFpCov, fpcovDuration := call.newFuncPointerCover.IntersectsWith(call.funcPointerCovers[needRuns-left-1])
-				totalFPCovDuration += fpcovDuration
-				if intersectsFpCov {
-					noChance = false
-					job.info.ExecRequestBecauseOfFPCov.Add(1)
+				if call.newSignal.IntersectsWith(call.signals[needRuns-runsLeft-1]) {
+					noChanceSignal = false
+				}
+				if intersects, _ := call.newFuncPointerCover.IntersectsWith(call.funcPointerCovers[needRuns-runsLeft-1]); intersects {
+					noChanceFPCov = false
 				}
 			}
 		}
-		if haveSignal || noChance {
-			return true, totalFPCovDuration
+		// stop if both criteria finished or one finished and the other one has no chance.
+		if haveSignal && haveFPCover || noChanceSignal && noChanceFPCov ||
+			haveFPCover && noChanceSignal || haveSignal && noChanceFPCov {
+			return 0
 		}
-	} else if run >= deflakeTotalCorpusRuns ||
-		noNewSignal && (run >= deflakeMaxCorpusRuns || run >= deflakeMinCorpusRuns && haveSignal) ||
-		noNewFPCover && (run >= deflakeMaxCorpusRuns || run >= deflakeMinCorpusRuns && haveFPCover) {
-		// For programs from the corpus we use a different condition b/c we want to extract
-		// as much flaky signal from them as possible. They have large coverage and run
-		// in the beginning, gathering flaky signal on them allows to grow max signal quickly
-		// and avoid lots of useless executions later. Any bit of flaky coverage discovered
-		// later will lead to triage, and if we are unlucky to conclude it's stable also
-		// to minimization+smash+hints (potentially thousands of runs).
-		// So we run them at least 5 times, or while we are still getting any new signal.
-		return true, totalFPCovDuration
+		// continue due to Signal if there's chance to get the stableSignal
+		if !noChanceSignal && !haveSignal {
+			return 1
+		}
+		// continue specifically due to FPCov if there's a chance to get stableFPCov
+		// and Signal is telling us to stop.
+		if !noChanceFPCov && (haveSignal || noChanceSignal) {
+			return 2
+		}
+		panic(fmt.Sprintf(
+			"unreachable in stopDeflake.\nhaveSignal: %t haveFPCover: %t, noChanceSignal: %t, noChanceFPCov: %t",
+			haveSignal, haveFPCover, noChanceSignal, noChanceFPCov))
+	} else {
+		if run >= deflakeTotalCorpusRuns ||
+			noNewSignal && (run >= deflakeMaxCorpusRuns || run >= deflakeMinCorpusRuns && haveSignal) ||
+			noNewFPCover && (run >= deflakeMaxCorpusRuns || run >= deflakeMinCorpusRuns && haveFPCover) {
+			// For programs from the corpus we use a different condition b/c we want to extract
+			// as much flaky signal from them as possible. They have large coverage and run
+			// in the beginning, gathering flaky signal on them allows to grow max signal quickly
+			// and avoid lots of useless executions later. Any bit of flaky coverage discovered
+			// later will lead to triage, and if we are unlucky to conclude it's stable also
+			// to minimization+smash+hints (potentially thousands of runs).
+			// So we run them at least 5 times, or while we are still getting any new signal.
+			return 0
+		}
+		// we don't really care about why we're repeating this request during corpus triage
+		return 1
 	}
-	return false, totalFPCovDuration
+	panic("unreachable in stopDeflake during triage")
 }
 
 // minimize tries to preserve both newStableSignal and newStableFuncPointerCover.
@@ -577,10 +594,8 @@ func (job *triageJob) minimize(call int, info *triageCall) ([2]*prog.Prog, [2]in
 	}
 
 	funcPointerSuccessLambda := func(mergedFPointerCover *cover.FuncPointerCover, p1 *prog.Prog, call1 int, thisFPointerCover *cover.FuncPointerCover) bool {
-		fPCovStart := time.Now()
 		mergedFPointerCover.Merge(*thisFPointerCover)
 		fPCoverIntersection, _ := info.newStableFuncPointerCover.Intersection(*mergedFPointerCover)
-		job.registerFuncPointerCoverOperationTime(time.Since(fPCovStart))
 		if fPCoverIntersection.Len() == info.newStableFuncPointerCover.Len() {
 			job.info.Logf("call #%d [%s]: minimization step (funcPointerCover) success (|calls| = %d)",
 				call, job.p.CallName(call), len(p1.Calls))
@@ -640,10 +655,8 @@ func (job *triageJob) minimize(call int, info *triageCall) ([2]*prog.Prog, [2]in
 					Stat:            job.fuzzer.statExecMinimize,
 				}
 				if doFuncPointer && !doSignal {
-					job.info.ExecRequestBecauseOfFPCov.Add(1)
 					nextRequest.FromFPCovOrigin = true
 				}
-				job.info.ExecRequestTotal.Add(1)
 				result := job.execute(&nextRequest, 0)
 				if result.Stop() {
 					stop = true
@@ -755,8 +768,7 @@ func (job *triageJob) getSignalAndCover(p *prog.Prog, info *flatrpc.ProgInfo, ca
 		return nil, nil
 	}
 	resSignal := signal.FromRaw(inf.Signal, signalPrio(p, inf, call))
-	resFPCover, fPCoverDuration := cover.FPCoverFromRaw(inf.FuncStores)
-	job.registerFuncPointerCoverOperationTime(fPCoverDuration)
+	resFPCover, _ := cover.FPCoverFromRaw(inf.FuncStores)
 	return resSignal, resFPCover
 }
 
@@ -792,9 +804,8 @@ func (job *smashJob) run(fuzzer *Fuzzer) {
 			return
 		}
 		job.info.Execs.Add(1)
-		job.info.ExecRequestTotal.Add(1)
 		if job.info.FromFPCovOrigin {
-			job.info.ExecRequestBecauseOfFPCov.Add(1)
+			job.info.ExecBecauseFPCov.Add(1)
 		}
 	}
 }
