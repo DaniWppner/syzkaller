@@ -237,7 +237,7 @@ type Config struct {
 	PatchTest      bool
 	ModeKFuzzTest  bool
 	DebugFilters   map[uint64]struct{}
-	ReportGenerator *cover.ReportGenerator
+	ReportGenerator func() (*cover.ReportGenerator, error)
 }
 
 func (fuzzer *Fuzzer) updateCoveredFunctions(newPCs []uint64) {
@@ -252,7 +252,10 @@ func (fuzzer *Fuzzer) updateCoveredFunctions(newPCs []uint64) {
 		fuzzer.coveredFunctions = make(map[string]struct{})
 	}
 	
-	rg := fuzzer.Config.ReportGenerator
+	rg, err := fuzzer.Config.ReportGenerator()
+	if err != nil || rg == nil {
+		return
+	}
 	for _, pc := range newPCs {
 		idx := sort.Search(len(rg.Symbols), func(i int) bool {
 			return pc < rg.Symbols[i].End
