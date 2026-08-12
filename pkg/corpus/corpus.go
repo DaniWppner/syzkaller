@@ -132,7 +132,7 @@ type NewItemEvent struct {
 	NewCover []uint64
 }
 
-func (corpus *Corpus) Save(inp NewInput) {
+func (corpus *Corpus) Save(inp NewInput) []uint64 {
 	progData := inp.Prog.Serialize()
 	sig := hash.String(progData)
 
@@ -203,6 +203,7 @@ func (corpus *Corpus) Save(inp NewInput) {
 		}:
 		}
 	}
+	return newCover
 }
 
 func (corpus *Corpus) applyFocusAreas(item *Item, coverDelta []uint64) {

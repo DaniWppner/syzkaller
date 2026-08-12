@@ -1174,9 +1174,15 @@ func (mgr *Manager) MachineChecked(features flatrpc.Feature,
 		mgr.corpus = corpus.NewFocusedCorpus(context.Background(),
 			corpusUpdates, mgr.coverFilters.Areas)
 		mgr.http.Corpus.Store(mgr.corpus)
+		
+		rg, err := mgr.reportGenerator.Get()
+		if err != nil {
+			log.Fatalf("failed to eagerly initialize report generator: %v", err)
+		}
 
 		rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
 		fuzzerObj := fuzzer.NewFuzzer(context.Background(), &fuzzer.Config{
+			ReportGenerator: rg,
 			Corpus:         mgr.corpus,
 			Snapshot:       mgr.cfg.Snapshot,
 			Coverage:       mgr.cfg.Cover,

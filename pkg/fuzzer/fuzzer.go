@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"runtime"
 	"slices"
+	"sort"
 	"sync"
 	"time"
 
@@ -43,6 +44,9 @@ type Fuzzer struct {
 	ctRegenerate chan struct{}
 
 	execQueues
+
+	coveredFunctionsMu sync.RWMutex
+	coveredFunctions   map[string]struct{}
 }
 
 func NewFuzzer(ctx context.Context, cfg *Config, rnd *rand.Rand,
@@ -233,6 +237,33 @@ type Config struct {
 	PatchTest      bool
 	ModeKFuzzTest  bool
 	DebugFilters   map[uint64]struct{}
+	ReportGenerator *cover.ReportGenerator
+}
+
+func (fuzzer *Fuzzer) updateCoveredFunctions(newPCs []uint64) {
+	if fuzzer.Config.ReportGenerator == nil {
+		return
+	}
+	
+	fuzzer.coveredFunctionsMu.Lock()
+	defer fuzzer.coveredFunctionsMu.Unlock()
+	
+	if fuzzer.coveredFunctions == nil {
+		fuzzer.coveredFunctions = make(map[string]struct{})
+	}
+	
+	rg := fuzzer.Config.ReportGenerator
+	for _, pc := range newPCs {
+		idx := sort.Search(len(rg.Symbols), func(i int) bool {
+			return pc < rg.Symbols[i].End
+		})
+		if idx < len(rg.Symbols) {
+			sym := rg.Symbols[idx]
+			if pc >= sym.Start && pc <= sym.End {
+				fuzzer.coveredFunctions[sym.Name] = struct{}{}
+			}
+		}
+	}
 }
 
 func (fuzzer *Fuzzer) triageProgCall(p *prog.Prog, info *flatrpc.CallInfo, call int, triage *map[int]*triageCall) {

@@ -355,7 +355,10 @@ func (job *triageJob) doHandleCall(p *prog.Prog, call int, info *triageCall, fPC
 		RawCover:         info.rawCover,
 		FuncPointerCover: info.stableFuncPointerCover,
 	}
-	job.fuzzer.Config.Corpus.Save(input)
+	newPCs := job.fuzzer.Config.Corpus.Save(input)
+	if len(newPCs) > 0 {
+		go job.fuzzer.updateCoveredFunctions(newPCs)
+	}
 }
 
 func (job *triageJob) deflake(exec func(*queue.Request, ProgFlags) *queue.Result) (stop bool) {
