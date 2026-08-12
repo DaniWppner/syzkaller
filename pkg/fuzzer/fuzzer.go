@@ -6,6 +6,7 @@ package fuzzer
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"runtime"
@@ -18,11 +19,14 @@ import (
 
 	"github.com/google/syzkaller/pkg/corpus"
 	"github.com/google/syzkaller/pkg/cover"
+	"github.com/google/syzkaller/pkg/cover/backend"
 	"github.com/google/syzkaller/pkg/flatrpc"
 	"github.com/google/syzkaller/pkg/fuzzer/queue"
+	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/signal"
 	"github.com/google/syzkaller/pkg/stat"
+	"github.com/google/syzkaller/pkg/vminfo"
 	"github.com/google/syzkaller/prog"
 )
 
@@ -256,6 +260,15 @@ func (fuzzer *Fuzzer) updateCoveredFunctions(newPCs []uint64) {
 	if err != nil || rg == nil {
 		return
 	}
+	type funcLog struct {
+		Name string `json:"name"`
+		Path string `json:"path"`
+		Line int    `json:"line"`
+	}
+	var newLogs []funcLog
+	pcsToSymbolize := make(map[*vminfo.KernelModule][]uint64)
+	pcToSym := make(map[uint64]*backend.Symbol)
+
 	for _, pc := range newPCs {
 		idx := sort.Search(len(rg.Symbols), func(i int) bool {
 			return pc < rg.Symbols[i].End
@@ -263,8 +276,49 @@ func (fuzzer *Fuzzer) updateCoveredFunctions(newPCs []uint64) {
 		if idx < len(rg.Symbols) {
 			sym := rg.Symbols[idx]
 			if pc >= sym.Start && pc <= sym.End {
-				fuzzer.coveredFunctions[sym.Name] = struct{}{}
+				if _, ok := fuzzer.coveredFunctions[sym.Name]; !ok {
+					fuzzer.coveredFunctions[sym.Name] = struct{}{}
+					
+					pcsToSymbolize[sym.Module] = append(pcsToSymbolize[sym.Module], sym.Start)
+					pcToSym[sym.Start] = sym
+				}
 			}
+		}
+	}
+	
+	if len(pcsToSymbolize) > 0 {
+		frames, err := rg.Symbolize(pcsToSymbolize)
+		if err == nil {
+			for _, frame := range frames {
+				sym := pcToSym[frame.PC]
+				if sym != nil {
+					newLogs = append(newLogs, funcLog{
+						Name: sym.Name,
+						Path: frame.Path,
+						Line: frame.StartLine,
+					})
+					delete(pcToSym, frame.PC)
+				}
+			}
+		}
+		
+		for _, sym := range pcToSym {
+			path := ""
+			if sym.Unit != nil {
+				path = sym.Unit.Path
+			}
+			newLogs = append(newLogs, funcLog{
+				Name: sym.Name,
+				Path: path,
+				Line: 0,
+			})
+		}
+	}
+	
+	if len(newLogs) > 0 {
+		data, err := json.Marshal(newLogs)
+		if err == nil {
+			log.Logf(0, "new_covered_functions: %s", string(data))
 		}
 	}
 }
