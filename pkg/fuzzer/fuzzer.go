@@ -6,12 +6,10 @@ package fuzzer
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"math/rand"
 	"runtime"
 	"slices"
-	"sort"
 	"sync"
 	"time"
 
@@ -19,13 +17,11 @@ import (
 
 	"github.com/google/syzkaller/pkg/corpus"
 	"github.com/google/syzkaller/pkg/cover"
-	"github.com/google/syzkaller/pkg/cover/backend"
 	"github.com/google/syzkaller/pkg/flatrpc"
 	"github.com/google/syzkaller/pkg/fuzzer/queue"
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/signal"
 	"github.com/google/syzkaller/pkg/stat"
-	"github.com/google/syzkaller/pkg/vminfo"
 	"github.com/google/syzkaller/prog"
 )
 
@@ -47,9 +43,6 @@ type Fuzzer struct {
 	ctRegenerate chan struct{}
 
 	execQueues
-
-	coveredFunctionsMu sync.RWMutex
-	coveredFunctions   map[uint64]struct{}
 }
 
 func NewFuzzer(ctx context.Context, cfg *Config, rnd *rand.Rand,
@@ -62,7 +55,7 @@ func NewFuzzer(ctx context.Context, cfg *Config, rnd *rand.Rand,
 	f := &Fuzzer{
 		Stats:  newStats(target),
 		Config: cfg,
-		Cover:  newCover(),
+		Cover:  newCover(cfg.ReportGenerator),
 
 		ctx:         ctx,
 		rnd:         rnd,
@@ -90,21 +83,23 @@ func (fuzzer *Fuzzer) RecommendedCalls() int {
 }
 
 type execQueues struct {
-	triageCandidateQueue *queue.DynamicOrderer
-	candidateQueue       *queue.PlainQueue
-	fPCovSmashQueue      *queue.PlainQueue
-	triageQueue          *queue.DynamicOrderer
-	smashQueue           *queue.PlainQueue
-	source               queue.Source
+	triageCandidateQueue   *queue.DynamicOrderer
+	candidateQueue         *queue.PlainQueue
+	fPCovSmashQueue        *queue.PlainQueue
+	triageQueue            *queue.DynamicOrderer
+	fPCovSmashQueueLowPrio *queue.PlainQueue
+	smashQueue             *queue.PlainQueue
+	source                 queue.Source
 }
 
 func newExecQueues(fuzzer *Fuzzer) execQueues {
 	ret := execQueues{
-		triageCandidateQueue: queue.DynamicOrder(),
-		candidateQueue:       queue.Plain(),
-		fPCovSmashQueue:      queue.Plain(),
-		triageQueue:          queue.DynamicOrder(),
-		smashQueue:           queue.Plain(),
+		triageCandidateQueue:   queue.DynamicOrder(),
+		candidateQueue:         queue.Plain(),
+		fPCovSmashQueue:        queue.Plain(),
+		triageQueue:            queue.DynamicOrder(),
+		fPCovSmashQueueLowPrio: queue.Plain(),
+		smashQueue:             queue.Plain(),
 	}
 	// Alternate smash jobs with exec/fuzz to spread attention to the wider area.
 	skipQueue := 3
@@ -120,6 +115,7 @@ func newExecQueues(fuzzer *Fuzzer) execQueues {
 		ret.candidateQueue,
 		queue.Alternate(ret.fPCovSmashQueue, skipQueue),
 		ret.triageQueue,
+		queue.Alternate(ret.fPCovSmashQueueLowPrio, skipQueue),
 		queue.Alternate(ret.smashQueue, skipQueue),
 		queue.Callback(fuzzer.genFuzz),
 	)
@@ -241,83 +237,6 @@ type Config struct {
 	ModeKFuzzTest   bool
 	DebugFilters    map[uint64]struct{}
 	ReportGenerator func() (*cover.ReportGenerator, error)
-}
-
-func (fuzzer *Fuzzer) updateCoveredFunctions(newPCs []uint64) ([]byte, error) {
-	if fuzzer.Config.ReportGenerator == nil {
-		return nil, nil
-	}
-
-	fuzzer.coveredFunctionsMu.Lock()
-	defer fuzzer.coveredFunctionsMu.Unlock()
-
-	if fuzzer.coveredFunctions == nil {
-		fuzzer.coveredFunctions = make(map[uint64]struct{})
-	}
-
-	rg, err := fuzzer.Config.ReportGenerator()
-	if err != nil {
-		return nil, err
-	}
-	type funcLog struct {
-		Name string `json:"name"`
-		Path string `json:"path"`
-		Line int    `json:"line"`
-	}
-	var newLogs []funcLog
-	pcsToSymbolize := make(map[*vminfo.KernelModule][]uint64)
-	pcToSym := make(map[uint64]*backend.Symbol)
-
-	for _, pc := range newPCs {
-		idx := sort.Search(len(rg.Symbols), func(i int) bool {
-			return pc < rg.Symbols[i].End
-		})
-		if idx < len(rg.Symbols) {
-			sym := rg.Symbols[idx]
-			if pc >= sym.Start && pc <= sym.End {
-				if _, ok := fuzzer.coveredFunctions[sym.Start]; !ok {
-					fuzzer.coveredFunctions[sym.Start] = struct{}{}
-
-					pcsToSymbolize[sym.Module] = append(pcsToSymbolize[sym.Module], sym.Start)
-					pcToSym[sym.Start] = sym
-				}
-			}
-		}
-	}
-
-	if len(pcsToSymbolize) > 0 {
-		frames, err := rg.Symbolize(pcsToSymbolize)
-		if err == nil {
-			for _, frame := range frames {
-				sym := pcToSym[frame.PC]
-				if sym != nil {
-					newLogs = append(newLogs, funcLog{
-						Name: sym.Name,
-						Path: frame.Path,
-						Line: frame.StartLine,
-					})
-					delete(pcToSym, frame.PC)
-				}
-			}
-		}
-
-		for _, sym := range pcToSym {
-			path := ""
-			if sym.Unit != nil {
-				path = sym.Unit.Path
-			}
-			newLogs = append(newLogs, funcLog{
-				Name: sym.Name,
-				Path: path,
-				Line: 0,
-			})
-		}
-	}
-
-	if len(newLogs) > 0 {
-		return json.Marshal(newLogs)
-	}
-	return nil, nil
 }
 
 func (fuzzer *Fuzzer) triageProgCall(p *prog.Prog, info *flatrpc.CallInfo, call int, triage *map[int]*triageCall) {

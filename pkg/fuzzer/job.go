@@ -302,7 +302,11 @@ func (job *triageJob) doHandleCall(p *prog.Prog, call int, info *triageCall, fPC
 	// the individual call was kept due to funcPointerCoverage only.
 	smashJobQueue := job.fuzzer.smashQueue
 	if fPCovOrigin {
-		smashJobQueue = job.fuzzer.fPCovSmashQueue
+		if job.fuzzer.Cover.HasUncoveredFuncPointers(info.newStableFuncPointerCover) {
+			smashJobQueue = job.fuzzer.fPCovSmashQueue
+		} else {
+			smashJobQueue = job.fuzzer.fPCovSmashQueueLowPrio
+		}
 	}
 	if job.flags&ProgSmashed == 0 {
 		job.fuzzer.startJob(job.fuzzer.statJobsSmash, &smashJob{
@@ -357,7 +361,7 @@ func (job *triageJob) doHandleCall(p *prog.Prog, call int, info *triageCall, fPC
 	}
 	newPCs := job.fuzzer.Config.Corpus.Save(input)
 	if len(newPCs) > 0 {
-		data, err := job.fuzzer.updateCoveredFunctions(newPCs)
+		data, err := job.fuzzer.Cover.UpdateCoveredFunctions(newPCs)
 		if err == nil && len(data) > 0 {
 			job.info.Logf("new_covered_functions: %s", string(data))
 		}
