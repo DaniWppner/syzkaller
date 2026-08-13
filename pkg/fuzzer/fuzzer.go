@@ -22,7 +22,6 @@ import (
 	"github.com/google/syzkaller/pkg/cover/backend"
 	"github.com/google/syzkaller/pkg/flatrpc"
 	"github.com/google/syzkaller/pkg/fuzzer/queue"
-	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/signal"
 	"github.com/google/syzkaller/pkg/stat"
@@ -226,39 +225,39 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
 }
 
 type Config struct {
-	Debug          bool
-	Corpus         *corpus.Corpus
-	Logf           func(level int, msg string, args ...any)
-	Snapshot       bool
-	Coverage       bool
-	FaultInjection bool
-	Comparisons    bool
-	Collide        bool
-	EnabledCalls   map[*prog.Syscall]bool
-	NoMutateCalls  map[int]bool
-	FetchRawCover  bool
-	NewInputFilter func(call string) bool
-	PatchTest      bool
-	ModeKFuzzTest  bool
-	DebugFilters   map[uint64]struct{}
+	Debug           bool
+	Corpus          *corpus.Corpus
+	Logf            func(level int, msg string, args ...any)
+	Snapshot        bool
+	Coverage        bool
+	FaultInjection  bool
+	Comparisons     bool
+	Collide         bool
+	EnabledCalls    map[*prog.Syscall]bool
+	NoMutateCalls   map[int]bool
+	FetchRawCover   bool
+	NewInputFilter  func(call string) bool
+	PatchTest       bool
+	ModeKFuzzTest   bool
+	DebugFilters    map[uint64]struct{}
 	ReportGenerator func() (*cover.ReportGenerator, error)
 }
 
-func (fuzzer *Fuzzer) updateCoveredFunctions(newPCs []uint64) {
+func (fuzzer *Fuzzer) updateCoveredFunctions(newPCs []uint64) ([]byte, error) {
 	if fuzzer.Config.ReportGenerator == nil {
-		return
+		return nil, nil
 	}
-	
+
 	fuzzer.coveredFunctionsMu.Lock()
 	defer fuzzer.coveredFunctionsMu.Unlock()
-	
+
 	if fuzzer.coveredFunctions == nil {
 		fuzzer.coveredFunctions = make(map[string]struct{})
 	}
-	
+
 	rg, err := fuzzer.Config.ReportGenerator()
-	if err != nil || rg == nil {
-		return
+	if err != nil {
+		return nil, err
 	}
 	type funcLog struct {
 		Name string `json:"name"`
@@ -278,14 +277,14 @@ func (fuzzer *Fuzzer) updateCoveredFunctions(newPCs []uint64) {
 			if pc >= sym.Start && pc <= sym.End {
 				if _, ok := fuzzer.coveredFunctions[sym.Name]; !ok {
 					fuzzer.coveredFunctions[sym.Name] = struct{}{}
-					
+
 					pcsToSymbolize[sym.Module] = append(pcsToSymbolize[sym.Module], sym.Start)
 					pcToSym[sym.Start] = sym
 				}
 			}
 		}
 	}
-	
+
 	if len(pcsToSymbolize) > 0 {
 		frames, err := rg.Symbolize(pcsToSymbolize)
 		if err == nil {
@@ -301,7 +300,7 @@ func (fuzzer *Fuzzer) updateCoveredFunctions(newPCs []uint64) {
 				}
 			}
 		}
-		
+
 		for _, sym := range pcToSym {
 			path := ""
 			if sym.Unit != nil {
@@ -314,13 +313,11 @@ func (fuzzer *Fuzzer) updateCoveredFunctions(newPCs []uint64) {
 			})
 		}
 	}
-	
+
 	if len(newLogs) > 0 {
-		data, err := json.Marshal(newLogs)
-		if err == nil {
-			log.Logf(0, "new_covered_functions: %s", string(data))
-		}
+		return json.Marshal(newLogs)
 	}
+	return nil, nil
 }
 
 func (fuzzer *Fuzzer) triageProgCall(p *prog.Prog, info *flatrpc.CallInfo, call int, triage *map[int]*triageCall) {
