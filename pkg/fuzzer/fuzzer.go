@@ -49,7 +49,7 @@ type Fuzzer struct {
 	execQueues
 
 	coveredFunctionsMu sync.RWMutex
-	coveredFunctions   map[string]struct{}
+	coveredFunctions   map[uint64]struct{}
 }
 
 func NewFuzzer(ctx context.Context, cfg *Config, rnd *rand.Rand,
@@ -252,7 +252,7 @@ func (fuzzer *Fuzzer) updateCoveredFunctions(newPCs []uint64) ([]byte, error) {
 	defer fuzzer.coveredFunctionsMu.Unlock()
 
 	if fuzzer.coveredFunctions == nil {
-		fuzzer.coveredFunctions = make(map[string]struct{})
+		fuzzer.coveredFunctions = make(map[uint64]struct{})
 	}
 
 	rg, err := fuzzer.Config.ReportGenerator()
@@ -275,8 +275,8 @@ func (fuzzer *Fuzzer) updateCoveredFunctions(newPCs []uint64) ([]byte, error) {
 		if idx < len(rg.Symbols) {
 			sym := rg.Symbols[idx]
 			if pc >= sym.Start && pc <= sym.End {
-				if _, ok := fuzzer.coveredFunctions[sym.Name]; !ok {
-					fuzzer.coveredFunctions[sym.Name] = struct{}{}
+				if _, ok := fuzzer.coveredFunctions[sym.Start]; !ok {
+					fuzzer.coveredFunctions[sym.Start] = struct{}{}
 
 					pcsToSymbolize[sym.Module] = append(pcsToSymbolize[sym.Module], sym.Start)
 					pcToSym[sym.Start] = sym
