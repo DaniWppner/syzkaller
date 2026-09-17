@@ -2,7 +2,7 @@
 # Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
 URL: https://ci.syzbot.org
-parallelWorkflows: 15
+parallelWorkflows: 20
 loreArchives:
   - netdev
   - bpf
@@ -16,12 +16,16 @@ loreArchives:
   - linux-block
   - linux-fsdevel
   - syzbot
+  - stable
 directList: syzbot@lists.linux.dev
 emailReporting:
   name: "syzbot ci"
   sender: dashapi
   supportEmail: syzkaller@googlegroups.com
   creditEmail: syzbot@syzkaller.appspotmail.com
+  # Additional bot addresses not in Dashapi or SMTP From fields.
+  extraOwnEmails:
+    - syzbot@kernel.org
   archiveList: syzbot@lists.linux.dev
   moderationList: syzkaller-upstream-moderation@googlegroups.com
   reportCc:
@@ -72,6 +76,11 @@ trees:
     branch: next
     email_lists:
       - kvm@vger.kernel.org
+  - name: kvm-x86
+    URL: https://github.com/kvm-x86/linux.git
+    branch: next
+    email_lists:
+      - kvm@vger.kernel.org
   - name: drm-next
     URL: https://gitlab.freedesktop.org/drm/kernel.git
     branch: drm-next
@@ -87,62 +96,94 @@ trees:
     branch: next
     email_lists:
       - linux-media@vger.kernel.org
+  - name: axboe
+    URL: https://kernel.googlesource.com/pub/scm/linux/kernel/git/axboe/linux.git
+    branch: for-next
+    email_lists:
+      - linux-block@vger.kernel.org
+      - io-uring@vger.kernel.org
+  - name: wireless-next
+    URL: https://kernel.googlesource.com/pub/scm/linux/kernel/git/wireless/wireless-next.git
+    branch: main
+    email_lists:
+      - linux-wireless@vger.kernel.org
+  - name: vfs
+    URL: https://kernel.googlesource.com/pub/scm/linux/kernel/git/vfs/vfs.git
+    branch: vfs.all
+    email_lists:
+      - linux-fsdevel@vger.kernel.org
   - name: torvalds
     URL: https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux
     branch: master
   - name: linux-next
     URL: https://kernel.googlesource.com/pub/scm/linux/kernel/git/next/linux-next
     branch: master
+  - name: stable
+    type: stable
+    URL: https://kernel.googlesource.com/pub/scm/linux/kernel/git/stable/linux-stable.git
+    email_lists:
+      - stable@vger.kernel.org
+
 
 fuzz_targets:
   - email_lists:
       - kvm@vger.kernel.org
+    path_regexps:
+      - "kvm|virt"
+    focus: kvm
+    corpus_url: https://storage.googleapis.com/syzkaller/corpus/ci-upstream-kasan-gce-root-corpus.db
     campaigns:
       - track: KASAN
         kernel_config: upstream-apparmor-kasan.config
-        focus: kvm
-        corpus_url: https://storage.googleapis.com/syzkaller/corpus/ci-upstream-kasan-gce-root-corpus.db
   - email_lists:
       - io-uring@vger.kernel.org
+    path_regexps:
+      - "io_uring"
+    focus: io_uring
+    corpus_url: https://storage.googleapis.com/syzkaller/corpus/ci-upstream-kasan-gce-root-corpus.db
     campaigns:
       - track: KASAN
         kernel_config: upstream-apparmor-kasan.config
-        focus: io_uring
-        corpus_url: https://storage.googleapis.com/syzkaller/corpus/ci-upstream-kasan-gce-root-corpus.db
   - email_lists:
       - bpf@vger.kernel.org
+    path_regexps:
+      - "bpf"
+    focus: bpf
+    corpus_url: https://storage.googleapis.com/syzkaller/corpus/ci-upstream-bpf-kasan-gce-corpus.db
     campaigns:
       - track: KASAN
         kernel_config: upstream-apparmor-kasan.config
-        focus: bpf
-        corpus_url: https://storage.googleapis.com/syzkaller/corpus/ci-upstream-bpf-kasan-gce-corpus.db
   - email_lists:
       - netdev@vger.kernel.org
       - netfilter-devel@vger.kernel.org
       - linux-wireless@vger.kernel.org
+    path_regexps:
+      - "^net/|^drivers/net/|include/net/"
+    focus: net
+    corpus_url: https://storage.googleapis.com/syzkaller/corpus/ci-upstream-net-kasan-gce-corpus.db
     campaigns:
       - track: KASAN
         kernel_config: upstream-apparmor-kasan.config
-        focus: net
-        corpus_url: https://storage.googleapis.com/syzkaller/corpus/ci-upstream-net-kasan-gce-corpus.db
   - email_lists:
       - linux-fsdevel@vger.kernel.org
       - linux-block@vger.kernel.org
       - linux-unionfs@vger.kernel.org
       - linux-ext4@vger.kernel.org
+    path_regexps:
+      - "^fs/|^block/|drivers/block"
+    focus: fs
+    corpus_url: https://storage.googleapis.com/syzkaller/corpus/ci2-upstream-fs-corpus.db
     campaigns:
       - track: KASAN
         kernel_config: upstream-apparmor-kasan.config
-        focus: fs
-        corpus_url: https://storage.googleapis.com/syzkaller/corpus/ci2-upstream-fs-corpus.db
   - email_lists:
       - linux-mm@kvack.org
+    corpus_url: https://storage.googleapis.com/syzkaller/corpus/ci-upstream-kasan-gce-root-corpus.db
     campaigns:
       - track: KASAN
         kernel_config: upstream-apparmor-kasan.config
-        corpus_url: https://storage.googleapis.com/syzkaller/corpus/ci-upstream-kasan-gce-root-corpus.db
         skip_cover_check: true
-  - campaigns:
+  - corpus_url: https://storage.googleapis.com/syzkaller/corpus/ci-upstream-kasan-gce-root-corpus.db
+    campaigns:
       - track: KASAN
         kernel_config: upstream-apparmor-kasan.config
-        corpus_url: https://storage.googleapis.com/syzkaller/corpus/ci-upstream-kasan-gce-root-corpus.db

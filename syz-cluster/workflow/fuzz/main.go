@@ -19,15 +19,20 @@ import (
 
 	"github.com/google/syzkaller/pkg/build"
 	"github.com/google/syzkaller/pkg/db"
+	"github.com/google/syzkaller/pkg/debugtracer"
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/manager"
 	"github.com/google/syzkaller/pkg/manager/diff"
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/osutil"
+	"github.com/google/syzkaller/pkg/report"
+	"github.com/google/syzkaller/pkg/repro"
 	"github.com/google/syzkaller/prog"
 	"github.com/google/syzkaller/syz-cluster/pkg/api"
 	"github.com/google/syzkaller/syz-cluster/pkg/app"
 	"github.com/google/syzkaller/syz-cluster/pkg/fuzzconfig"
+	"github.com/google/syzkaller/syz-cluster/pkg/triage"
+	"github.com/google/syzkaller/syz-cluster/pkg/workspace"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -39,6 +44,7 @@ var (
 	flagTime         = flag.String("time", "1h", "how long to fuzz")
 	flagWorkdir      = flag.String("workdir", "/workdir", "base workdir path")
 	flagTestName     = flag.String("test_name", "", "test name")
+	flagRepository   = flag.String("repository", "", "path to a kernel checkout")
 )
 
 func main() {
@@ -79,6 +85,7 @@ func main() {
 	}
 	log.Logf(0, "fuzzing is finished")
 	logFinalState(store)
+	triageUnreproducedFindings(ctx, config, client, store)
 	if err := reportStatus(ctx, config, client, status, store); err != nil {
 		app.Fatalf("failed to update the test: %v", err)
 	}
@@ -141,20 +148,7 @@ func run(ctx context.Context, config *api.FuzzConfig, client *api.Client,
 		return errSkipFuzzing
 	}
 	diff.PatchFocusAreas(patched, series.PatchBodies(), baseSymbols.Text, patchedSymbols.Text)
-
-	if len(config.FocusSymbols) > 0 {
-		var regexps []string
-		for _, name := range config.FocusSymbols {
-			regexps = append(regexps, fmt.Sprintf("^%s$", regexp.QuoteMeta(name)))
-		}
-		patched.Experimental.FocusAreas = append(patched.Experimental.FocusAreas, mgrconfig.FocusArea{
-			Name: "ai_focus",
-			Filter: mgrconfig.CovFilterCfg{
-				Functions: regexps,
-			},
-			Weight: 10.0,
-		})
-	}
+	setupAIFocusAreas(config, patched, series)
 
 	if len(config.CorpusURLs) > 0 {
 		err := prepareCorpus(ctx, patched.Workdir, config.CorpusURLs, patched.Target)
@@ -179,7 +173,7 @@ func run(ctx context.Context, config *api.FuzzConfig, client *api.Client,
 					app.Errorf("failed to report a base kernel crash %q: %v", title, err)
 				}
 			case bug := <-bugs:
-				err := reportFinding(groupCtx, config, client, bug)
+				err := reportFinding(groupCtx, client, bug.Report, bug.Repro, nil)
 				if err != nil {
 					app.Errorf("failed to report a finding %q: %v", bug.Report.Title, err)
 				}
@@ -347,26 +341,32 @@ func reportStatus(ctx context.Context, config *api.FuzzConfig, client *api.Clien
 	return nil
 }
 
-func reportFinding(ctx context.Context, config *api.FuzzConfig, client *api.Client, bug *diff.Bug) error {
+func reportFinding(ctx context.Context, client *api.Client,
+	crashReport *report.Report, reproResult *repro.Result,
+	aiResult *triage.AIFindingTriageResult) error {
 	finding := &api.RawFinding{
 		SessionID: *flagSession,
 		TestName:  *flagTestName,
-		Title:     bug.Report.Title,
-		Report:    bug.Report.Report,
-		Log:       bug.Report.Output,
+		Title:     crashReport.Title,
+		Report:    crashReport.Report,
+		Log:       crashReport.Output,
 	}
-	if repro := bug.Repro; repro != nil {
-		if repro.Prog != nil {
-			finding.SyzRepro = repro.Prog.Serialize()
-			finding.SyzReproOpts = repro.Opts.Serialize()
+	if reproResult != nil {
+		if reproResult.Prog != nil {
+			finding.SyzRepro = reproResult.Prog.Serialize()
+			finding.SyzReproOpts = reproResult.Opts.Serialize()
 		}
-		if repro.CRepro {
+		if reproResult.CRepro {
 			var err error
-			finding.CRepro, err = repro.CProgram()
+			finding.CRepro, err = reproResult.CProgram()
 			if err != nil {
 				app.Errorf("failed to generate C program: %v", err)
 			}
 		}
+	}
+	if aiResult != nil {
+		finding.ConfirmedByAI = aiResult.Introduced
+		finding.TriageTrajectory = aiResult.Trajectory
 	}
 	return client.UploadFinding(ctx, finding)
 }
@@ -458,8 +458,8 @@ func compressArtifacts(dir string) (io.Reader, error) {
 	var buf bytes.Buffer
 	lw := &LimitedWriter{
 		writer: &buf,
-		// Don't create an archive larger than 64MB.
-		limit: 64 * 1000 * 1000,
+		// Don't create an archive larger than 128MB.
+		limit: 128 * 1000 * 1000,
 	}
 	err := osutil.TarGzDirectory(dir, lw)
 	if err != nil {
@@ -483,4 +483,168 @@ func (lw *LimitedWriter) Write(p []byte) (n int, err error) {
 	n, err = lw.writer.Write(p)
 	lw.written += n
 	return
+}
+
+func setupAIFocusAreas(config *api.FuzzConfig, patched *mgrconfig.Config, series *api.Series) {
+	isEmptySeries := len(series.Patches) == 0
+	hasNoFocusSymbols := len(config.FocusSymbols) == 0
+	exceedsPatchLimit := series.IsStableRC() && len(series.Patches) > api.MaxRCFocusedPatches
+	if isEmptySeries || hasNoFocusSymbols || exceedsPatchLimit {
+		return
+	}
+	var regexps []string
+	for _, name := range config.FocusSymbols {
+		regexps = append(regexps, fmt.Sprintf("^%s$", regexp.QuoteMeta(name)))
+	}
+	patched.Experimental.FocusAreas = append(patched.Experimental.FocusAreas, mgrconfig.FocusArea{
+		Name: "ai_focus",
+		Filter: mgrconfig.CovFilterCfg{
+			Functions: regexps,
+		},
+		Weight: 10.0,
+	})
+}
+
+func triageUnreproducedFindings(ctx context.Context, config *api.FuzzConfig, client *api.Client,
+	store *manager.DiffFuzzerStore) {
+	if *flagRepository == "" {
+		return
+	}
+	appConfig, err := app.Config()
+	if err != nil {
+		log.Logf(0, "failed to load app config for finding triage: %v", err)
+		return
+	}
+	if appConfig.AI == nil || appConfig.AI.Empty() {
+		return
+	}
+
+	candidates := filterFindingCandidates(store.List())
+	if len(candidates) == 0 {
+		return
+	}
+
+	series, err := client.GetSessionSeries(ctx, *flagSession)
+	if err != nil || series == nil {
+		log.Logf(0, "failed to query series for AI triage: %v", err)
+		return
+	}
+	if series.IsStableRC() {
+		log.Logf(0, "skipping AI finding triage for stable RC series")
+		return
+	}
+
+	tracer := &debugtracer.GenericTracer{TraceWriter: log.VerboseWriter(0)}
+	aiClient, err := triage.NewAIClient(ctx, appConfig, tracer)
+	if err != nil {
+		log.Logf(0, "failed to initialize AI client for finding triage: %v", err)
+		return
+	}
+	defer aiClient.Close()
+
+	err = setupTriageWorkspace(config, series, tracer)
+	if err != nil {
+		log.Logf(0, "failed to prepare workspace for AI triage: %v", err)
+		return
+	}
+
+	reporter := &unreproducedReporter{
+		client:   client,
+		aiClient: aiClient,
+		store:    store,
+		series:   series,
+	}
+
+	for _, bug := range candidates {
+		if err := reporter.processFinding(ctx, bug); err != nil {
+			log.Logf(0, "failed to process unreproduced finding %q: %v", bug.Title, err)
+		}
+	}
+}
+
+func setupTriageWorkspace(config *api.FuzzConfig, series *api.Series, tracer debugtracer.DebugTracer) error {
+	ws, err := workspace.New(*flagRepository, tracer)
+	if err != nil {
+		return fmt.Errorf("failed to initialize workspace: %w", err)
+	}
+
+	if _, err := ws.Checkout(config.BaseTree, config.BaseCommit, series.PatchBodies()); err != nil {
+		return fmt.Errorf("failed to checkout and apply patches: %w", err)
+	}
+	if err := ws.CommitPatches(); err != nil {
+		return fmt.Errorf("failed to commit patches: %w", err)
+	}
+	return nil
+}
+
+type unreproducedReporter struct {
+	client   *api.Client
+	aiClient *triage.AIClient
+	store    *manager.DiffFuzzerStore
+	series   *api.Series
+}
+
+func (r *unreproducedReporter) processFinding(ctx context.Context, bug manager.DiffBug) error {
+	reportBytes, err := os.ReadFile(filepath.Join(r.store.BasePath, bug.Patched.Report))
+	if err != nil {
+		return fmt.Errorf("failed to read report: %w", err)
+	}
+
+	log.Logf(0, "evaluating unreproduced finding %q with AI", bug.Title)
+	aiResult, err := r.aiClient.EvaluateFinding(
+		ctx, r.series, string(reportBytes), *flagRepository,
+	)
+	if aiResult != nil && len(aiResult.Trajectory) > 0 {
+		r.store.SaveFile(bug.Title, "triage.html", aiResult.Trajectory)
+	}
+	if err != nil {
+		return fmt.Errorf("AI evaluation failed: %w", err)
+	}
+
+	var logBytes []byte
+	if bug.Patched.CrashLog != "" {
+		var readErr error
+		logBytes, readErr = os.ReadFile(filepath.Join(r.store.BasePath, bug.Patched.CrashLog))
+		if readErr != nil {
+			return fmt.Errorf("failed to read crash log: %w", readErr)
+		}
+	}
+
+	if aiResult.Introduced {
+		log.Logf(0, "AI confirmed unreproduced finding %q was introduced by patch series (reason: %s)",
+			bug.Title, aiResult.Reasoning)
+		err := reportFinding(ctx, r.client, &report.Report{
+			Title:  bug.Title,
+			Report: reportBytes,
+			Output: logBytes,
+		}, nil, aiResult)
+		if err != nil {
+			return fmt.Errorf("failed to upload AI-confirmed finding: %w", err)
+		}
+	} else {
+		log.Logf(0, "AI rejected unreproduced finding %q (reason: %s)", bug.Title, aiResult.Reasoning)
+		if *flagBaseBuild != "" {
+			if bErr := r.client.UploadBaseFinding(ctx, &api.BaseFindingInfo{
+				BuildID: *flagBaseBuild,
+				Title:   bug.Title,
+			}); bErr != nil {
+				return fmt.Errorf("failed to upload base finding: %w", bErr)
+			}
+		}
+	}
+	return nil
+}
+
+func filterFindingCandidates(bugs []manager.DiffBug) []manager.DiffBug {
+	var candidates []manager.DiffBug
+	for _, bug := range bugs {
+		if bug.Status == manager.DiffBugStatusIgnored || bug.Base.Crashes > 0 || bug.Base.NotCrashed {
+			continue
+		}
+		if bug.Patched.Crashes == 0 || bug.Patched.Report == "" {
+			continue
+		}
+		candidates = append(candidates, bug)
+	}
+	return candidates
 }

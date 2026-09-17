@@ -16,6 +16,7 @@ import (
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"github.com/google/syzkaller/pkg/aflow/ai"
 	"github.com/google/syzkaller/pkg/email"
+	"github.com/google/syzkaller/pkg/vcs"
 	"google.golang.org/appengine/v2/log"
 )
 
@@ -95,11 +96,17 @@ func checkActionAuthorized(ctx context.Context, job *aidb.Job, req *dashapi.Send
 	}
 }
 
-func formatUpstreamedBy(name, email string) string {
-	if name != "" {
-		return fmt.Sprintf("%s <%s>", name, email)
+func filterStageEmails(nsCfg *Config, emails []string) []string {
+	if nsCfg.AI == nil {
+		return emails
 	}
-	return email
+	var stageEmails []string
+	for _, stage := range nsCfg.AI.Stages {
+		if stage.MailingList != "" {
+			stageEmails = append(stageEmails, stage.MailingList)
+		}
+	}
+	return email.SubtractEmailLists(emails, stageEmails)
 }
 
 func processUpstreamSubcommand(ctx context.Context, job *aidb.Job,
@@ -111,7 +118,7 @@ func processUpstreamSubcommand(ctx context.Context, job *aidb.Job,
 		return err
 	}
 
-	upstreamedBy := formatUpstreamedBy(req.AuthorName, req.Author)
+	upstreamedBy := email.FormatAddress(req.AuthorName, req.Author)
 
 	nsCfg := getNsConfig(ctx, job.Namespace)
 	if nsCfg.AI == nil || len(nsCfg.AI.Stages) == 0 {
@@ -140,6 +147,7 @@ func processUpstreamSubcommand(ctx context.Context, job *aidb.Job,
 	}
 	extraCcList = email.MergeEmailLists(extraCcList, req.Cc)
 	extraCcList = email.SubtractEmailLists(extraCcList, ownEmails(ctx))
+	extraCcList = filterStageEmails(nsCfg, extraCcList)
 
 	return aidb.UpstreamReportCommand(ctx, aidb.UpstreamReportArgs{
 		Job: job,
@@ -300,7 +308,7 @@ func apiAIPollReport(ctx context.Context, req *dashapi.PollExternalReportReq) (a
 				return nil, err
 			}
 		case ai.WorkflowPatchIteration:
-			err = populateIterationReportResult(ctx, job, version, r.Stage, result, authors)
+			err = populateIterationReportResult(ctx, job, version, r.Stage, stageCfg.ReplyToComments, result, authors)
 			if err != nil {
 				return nil, err
 			}
@@ -336,6 +344,7 @@ func apiAIPollReport(ctx context.Context, req *dashapi.PollExternalReportReq) (a
 		if result.Patch == nil {
 			result.CanUpstream = false
 		}
+		result.AddressComments = stageCfg.AddressComments
 
 		return &dashapi.PollExternalReportResp{
 			Result: result,
@@ -364,10 +373,14 @@ func makeNewReportResult(ctx context.Context, job *aidb.Job, res *ai.PatchingOut
 	}
 	models := extractExecutedModels(trajectory)
 	var to, cc []string
+	var gitAuthors []string
 	seen := make(map[string]bool)
 	for _, a := range authors {
+		// Email recipients ('To'/'Cc') must adhere to RFC 5322 (quoting special characters like commas).
 		to = append(to, a)
 		seen[email.CanonicalEmail(a)] = true
+		// Git patch metadata ('Authors') must be unquoted (e.g. for in-body 'From:' and 'Signed-off-by:').
+		gitAuthors = append(gitAuthors, vcs.FormatGitAuthor(a))
 	}
 
 	for _, rec := range res.Recipients {
@@ -385,26 +398,27 @@ func makeNewReportResult(ctx context.Context, job *aidb.Job, res *ai.PatchingOut
 	}
 
 	return &dashapi.NewReportResult{
-		Subject:    subject,
-		Body:       body,
-		GitDiff:    res.PatchDiff,
-		BaseCommit: res.KernelCommit,
-		BaseTree:   res.KernelRepo,
-		Version:    version,
-		To:         to,
-		Cc:         cc,
-		Tools:      models,
-		Authors:    authors,
-		Fixes:      res.Fixes,
-		ReviewedBy: res.ReviewedBy,
-		AckedBy:    res.AckedBy,
-		TestedBy:   res.TestedBy,
-		ReportedBy: res.ReportedBy,
+		Subject:     subject,
+		Body:        body,
+		GitDiff:     res.PatchDiff,
+		BaseCommit:  res.KernelCommit,
+		BaseTree:    res.KernelRepo,
+		Version:     version,
+		To:          to,
+		Cc:          cc,
+		Tools:       models,
+		Authors:     gitAuthors,
+		Fixes:       res.Fixes,
+		ReviewedBy:  res.ReviewedBy,
+		AckedBy:     res.AckedBy,
+		TestedBy:    res.TestedBy,
+		ReportedBy:  res.ReportedBy,
+		SuggestedBy: res.SuggestedBy,
 	}, nil
 }
 
 func populateIterationReportResult(ctx context.Context, job *aidb.Job, version int,
-	currentStage string, result *dashapi.ReportPollResult, authors []string) error {
+	currentStage string, replyToComments bool, result *dashapi.ReportPollResult, authors []string) error {
 	res, err := castJobResults[ai.PatchIterationOutputs](job)
 	if err != nil {
 		return fmt.Errorf("failed to cast job results: %w", err)
@@ -423,12 +437,13 @@ func populateIterationReportResult(ctx context.Context, job *aidb.Job, version i
 			AckedBy:          res.AckedBy,
 			TestedBy:         res.TestedBy,
 			ReportedBy:       res.ReportedBy,
+			SuggestedBy:      res.SuggestedBy,
 		}, version, authors)
 		if err != nil {
 			return err
 		}
 		result.Patch.Changelog = collectChangelog(ctx, job.ID, currentStage)
-	} else if len(res.Replies) > 0 {
+	} else if replyToComments && len(res.Replies) > 0 {
 		var comments []*aidb.JobComment
 		if job.ParentReportingID.Valid {
 			comments, _ = aidb.LoadJobCommentsByReporting(ctx, job.ParentReportingID.StringVal)
@@ -555,6 +570,9 @@ func handleCommentCommand(ctx context.Context,
 	}
 
 	extraCc := email.SubtractEmailLists(req.Cc, ownEmails(ctx))
+	nsCfg := getNsConfig(ctx, job.Namespace)
+	extraCc = filterStageEmails(nsCfg, extraCc)
+
 	err = aidb.SaveJobComment(ctx, &aidb.JobComment{
 		ReportingID:  reporting.ID,
 		ExtID:        req.MessageExtID,

@@ -405,7 +405,7 @@ var testConfig = &GlobalConfig{
 					DailyLimit: 1000,
 					Filter: func(bug *Bug) FilterResult {
 						if canBeVfsBug(bug) &&
-							bug.ReproLevel == dashapi.ReproLevelNone {
+							!bug.HasRepro() {
 							return FilterReport
 						}
 						return FilterSkip
@@ -634,6 +634,7 @@ var testConfig = &GlobalConfig{
 		},
 		"ains": {
 			AI: &AIConfig{
+				AutoReproC:     true,
 				BaseRepository: "git://ai/base.git",
 				BaseBranch:     "ai-base",
 				BaseCommit:     "RC",
@@ -781,7 +782,7 @@ const (
 
 func skipWithRepro(bug *Bug) FilterResult {
 	if strings.HasPrefix(bug.Title, "skip with repro") &&
-		bug.ReproLevel != dashapi.ReproLevelNone {
+		bug.HasRepro() {
 		return FilterSkip
 	}
 	return FilterReport
@@ -789,7 +790,7 @@ func skipWithRepro(bug *Bug) FilterResult {
 
 func skipWithRepro2(bug *Bug) FilterResult {
 	if strings.HasPrefix(bug.Title, "skip reporting2 with repro") &&
-		bug.ReproLevel != dashapi.ReproLevelNone {
+		bug.HasRepro() {
 		return FilterSkip
 	}
 	return FilterReport

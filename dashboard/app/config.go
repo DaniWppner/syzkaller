@@ -149,8 +149,10 @@ type Config struct {
 type AIConfig struct {
 	// Whether to upload generated patches to gerrit.
 	UploadPatchesToGerrit bool
-	Stages                []AIPatchStageConfig
-	SecurityPrio          func(*Bug, ai.AssessmentSecurityOutputs) BugPrio `json:"-"`
+	// Whether to automatically create C reproducer generation jobs for eligible bugs.
+	AutoReproC   bool
+	Stages       []AIPatchStageConfig
+	SecurityPrio func(*Bug, ai.AssessmentSecurityOutputs) BugPrio `json:"-"`
 
 	// Emails or domains allowed to execute external AI commands (#syz upstream, reject, etc).
 	AllowedCommandAuthors []string
@@ -169,6 +171,7 @@ type AIPatchStageConfig struct {
 	NoParallelReports  bool
 	MergePatchCc       bool          // If true, CC people mentioned in the patch report (authors, reviewers).
 	AddressComments    bool          // If true, automatically trigger a patch iteration on new comments.
+	ReplyToComments    bool          // If true, allow AI to generate and post conversational text replies to comments.
 	IterationDebounce  time.Duration // Wait time before creating a new iteration. Defaults to 30m.
 }
 
@@ -371,6 +374,8 @@ type Reporting struct {
 	DailyLimit int
 	// Upstream reports into next reporting after this period.
 	Embargo time.Duration
+	// SubsystemEmbargo overrides/customizes the embargo duration for specific subsystems.
+	SubsystemEmbargo map[string]time.Duration
 	// Type of reporting and its configuration.
 	// The app has one built-in type, EmailConfig, which reports bugs by email.
 	// The user can implement other types to attach to external reporting systems (e.g. Bugzilla).
@@ -481,6 +486,25 @@ func (cfg *Config) ReportingByName(name string) *Reporting {
 		}
 	}
 	return nil
+}
+
+func (reporting *Reporting) EmbargoForBug(bug *Bug) time.Duration {
+	if len(reporting.SubsystemEmbargo) == 0 {
+		return reporting.Embargo
+	}
+	subsystems := bug.LabelValues(SubsystemLabel)
+	if len(subsystems) == 0 {
+		return reporting.Embargo
+	}
+	var maxEmbargo time.Duration
+	for _, sub := range subsystems {
+		embargo, ok := reporting.SubsystemEmbargo[sub.Value]
+		if !ok {
+			embargo = reporting.Embargo
+		}
+		maxEmbargo = max(maxEmbargo, embargo)
+	}
+	return maxEmbargo
 }
 
 // configDontUse holds the configuration object that is installed either by tests
@@ -874,8 +898,19 @@ func checkNamespaceReporting(ns string, cfg *Config) {
 			reporting.DisplayTitle = reporting.Name
 		}
 		reporting.moderation = ri < len(cfg.Reporting)-1
-		if !reporting.moderation && reporting.Embargo != 0 {
+		if !reporting.moderation && (reporting.Embargo != 0 || len(reporting.SubsystemEmbargo) > 0) {
 			panic(fmt.Sprintf("embargo in the last reporting %v", reporting.Name))
+		}
+		if reporting.Embargo < 0 {
+			panic(fmt.Sprintf("negative embargo %v in %v", reporting.Embargo, reporting.Name))
+		}
+		for sub, embargo := range reporting.SubsystemEmbargo {
+			if embargo <= 0 {
+				panic(fmt.Sprintf("non-positive embargo %v for subsystem %q in reporting %q", embargo, sub, reporting.Name))
+			}
+			if cfg.Subsystems.Service != nil && cfg.Subsystems.Service.ByName(sub) == nil {
+				panic(fmt.Sprintf("unknown subsystem %q in reporting %q embargo", sub, reporting.Name))
+			}
 		}
 		checkConfigAccessLevel(&reporting.AccessLevel, parentAccessLevel,
 			fmt.Sprintf("reporting %q/%q", ns, reporting.Name))

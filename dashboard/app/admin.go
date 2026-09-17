@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/google/syzkaller/dashboard/dashapi"
 	db "google.golang.org/appengine/v2/datastore"
 	"google.golang.org/appengine/v2/log"
 	aemail "google.golang.org/appengine/v2/mail"
@@ -220,11 +219,8 @@ func updateBugReporting(ctx context.Context, w http.ResponseWriter, r *http.Requ
 		}
 		update = append(update, keys[i])
 	}
-	return updateBatch(ctx, update, func(_ *db.Key, bug *Bug) {
-		err := bug.updateReportings(ctx, cfg, timeNow(ctx))
-		if err != nil {
-			panic(err)
-		}
+	return updateBatch(ctx, update, func(_ *db.Key, bug *Bug) error {
+		return bug.updateReportings(ctx, cfg, timeNow(ctx))
 	})
 }
 
@@ -260,14 +256,18 @@ func updateCrashPriorities(ctx context.Context, w http.ResponseWriter, r *http.R
 		return err
 	}
 	log.Warningf(ctx, "fetched %d bugs and %v crash keys to update", bugsCount, len(crashKeys))
-	return updateBatch(ctx, crashKeys, func(key *db.Key, crash *Crash) {
+	return updateBatch(ctx, crashKeys, func(key *db.Key, crash *Crash) error {
 		bugKey := key.Parent()
 		bug := bugPerKey[bugKey.String()]
 		build, err := loadBuild(ctx, ns, crash.BuildID)
-		if build == nil || err != nil {
-			panic(fmt.Sprintf("err: %s, build: %v", err, build))
+		if err != nil {
+			return err
+		}
+		if build == nil {
+			return fmt.Errorf("failed to load build %v", crash.BuildID)
 		}
 		crash.UpdateReportingPriority(ctx, build, bug)
+		return nil
 	})
 }
 
@@ -289,7 +289,7 @@ func setMissingBugFields(ctx context.Context, w http.ResponseWriter, r *http.Req
 	}
 	log.Warningf(ctx, "fetched %v bugs for update", len(keys))
 	// Save everything unchanged.
-	return updateBatch(ctx, keys, func(_ *db.Key, bug *Bug) {})
+	return updateBatch(ctx, keys, func(_ *db.Key, bug *Bug) error { return nil })
 }
 
 // adminSendEmail can be used to send an arbitrary message from the bot.
@@ -311,14 +311,19 @@ func updateHeadReproLevel(ctx context.Context, w http.ResponseWriter, r *http.Re
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	var keys []*db.Key
-	newLevels := map[string]dashapi.ReproLevel{}
+	type reproState struct {
+		hasC   bool
+		hasSyz bool
+	}
+	newLevels := map[string]reproState{}
 	if err := foreachBug(ctx, func(query *db.Query) *db.Query {
 		return query.Filter("Status=", BugStatusOpen)
 	}, func(bug *Bug, key *db.Key) error {
 		if len(bug.Commits) > 0 {
 			return nil
 		}
-		actual := ReproLevelNone
+		actualC := false
+		actualSyz := false
 		reproCrashes, _, err := queryCrashesForBug(ctx, key, 2)
 		if err != nil {
 			return fmt.Errorf("failed to fetch crashes with repro: %w", err)
@@ -328,33 +333,36 @@ func updateHeadReproLevel(ctx context.Context, w http.ResponseWriter, r *http.Re
 				continue
 			}
 			if crash.ReproC > 0 {
-				actual = ReproLevelC
-				break
+				actualC = true
 			}
 			if crash.ReproSyz > 0 {
-				actual = ReproLevelSyz
+				actualSyz = true
 			}
 		}
-		if actual != bug.HeadReproLevel {
-			fmt.Fprintf(w, "%v: HeadReproLevel mismatch, actual=%d db=%d\n",
-				bugLink(bug.keyHash(ctx)), actual, bug.HeadReproLevel)
-			newLevels[bug.keyHash(ctx)] = actual
+		dbHasC := bug.HeadHasCRepro
+		dbHasSyz := bug.HeadHasSyzRepro
+		mismatch := (actualC != dbHasC) || (actualSyz != dbHasSyz)
+		if mismatch {
+			fmt.Fprintf(w, "%v: HeadReproLevel mismatch, actual C/Syz=%t/%t, db C/Syz=%t/%t\n",
+				bugLink(key.StringID()), actualC, actualSyz, dbHasC, dbHasSyz)
+			newLevels[key.StringID()] = reproState{hasC: actualC, hasSyz: actualSyz}
 			keys = append(keys, key)
 		}
 		return nil
 	}); err != nil {
 		return err
 	}
-	return updateBatch(ctx, keys, func(_ *db.Key, bug *Bug) {
-		newLevel, ok := newLevels[bug.keyHash(ctx)]
+	return updateBatch(ctx, keys, func(key *db.Key, bug *Bug) error {
+		state, ok := newLevels[key.StringID()]
 		if !ok {
-			panic("fetched unknown bug")
+			return fmt.Errorf("fetched unknown bug %v", key.StringID())
 		}
-		bug.HeadReproLevel = newLevel
+		bug.SetHeadReproLevel(state.hasC, state.hasSyz)
+		return nil
 	})
 }
 
-func updateBatch[T any](ctx context.Context, keys []*db.Key, transform func(key *db.Key, item *T)) error {
+func updateBatch[T any](ctx context.Context, keys []*db.Key, transform func(key *db.Key, item *T) error) error {
 	for len(keys) != 0 {
 		batchSize := min(len(keys), 20)
 		batchKeys := keys[:batchSize]
@@ -366,7 +374,9 @@ func updateBatch[T any](ctx context.Context, keys []*db.Key, transform func(key 
 				return err
 			}
 			for i, item := range items {
-				transform(batchKeys[i], item)
+				if err := transform(batchKeys[i], item); err != nil {
+					return err
+				}
 			}
 			_, err := db.PutMulti(ctx, batchKeys, items)
 			return err
@@ -408,8 +418,9 @@ func forceCommitInfoUpdate(ctx context.Context, w http.ResponseWriter, r *http.R
 	}
 
 	log.Warningf(ctx, "fetched %v bugs for commit info update", len(keys))
-	return updateBatch(ctx, keys, func(_ *db.Key, bug *Bug) {
+	return updateBatch(ctx, keys, func(_ *db.Key, bug *Bug) error {
 		bug.NeedCommitInfo = true
+		return nil
 	})
 }
 

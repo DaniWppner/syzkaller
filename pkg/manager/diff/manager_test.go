@@ -23,7 +23,7 @@ func TestNeedReproForTitle(t *testing.T) {
 		"no output from test machine":                          false,
 		"SYZFAIL: read failed":                                 false,
 		"lost connection to test machine":                      false,
-		"INFO: rcu detected stall in clone":                    false,
+		"INFO: rcu detected stall in clone":                    true,
 		"WARNING in arch_install_hw_breakpoint":                true,
 		"KASAN: slab-out-of-bounds Write in __bpf_get_stackid": true,
 	} {
@@ -100,6 +100,7 @@ func TestDiffSuccess(t *testing.T) {
 	select {
 	case bug := <-env.diffCtx.patchedOnly:
 		assert.Equal(t, "crash_title", bug.Report.Title)
+		assert.False(t, env.diffCtx.NeedRepro(&manager.Crash{Report: bug.Report}))
 	case <-time.After(testTimeout):
 		t.Fatal("expected patched only report")
 	}
@@ -191,7 +192,7 @@ func TestDiffRetryRepro(t *testing.T) {
 	env.new.FinishCorpusTriage()
 	env.start()
 
-	for i := 0; i <= maxReproAttempts; i++ {
+	for i := range maxReproAttempts {
 		env.new.CrashesCh <- &report.Report{Title: "crash_title", Report: []byte("log")}
 		select {
 		case <-reproCalled:
@@ -200,9 +201,9 @@ func TestDiffRetryRepro(t *testing.T) {
 		}
 		env.waitForStatus("crash_title", manager.DiffBugStatusCompleted)
 	}
-	// Inject one more crash, which should be ignored.
+	// Inject one more crash, which should not trigger another repro and should preserve Completed status.
 	env.new.CrashesCh <- &report.Report{Title: "crash_title", Report: []byte("log")}
-	env.waitForStatus("crash_title", manager.DiffBugStatusIgnored)
+	env.waitForStatus("crash_title", manager.DiffBugStatusCompleted)
 	select {
 	case <-reproCalled:
 		t.Fatalf("unexpected repro")

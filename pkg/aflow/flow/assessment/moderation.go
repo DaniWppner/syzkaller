@@ -14,6 +14,7 @@ import (
 type moderationInputs struct {
 	TargetOS     string
 	TargetArch   string
+	TargetVMArch string `json:",omitempty"`
 	BugTitle     string
 	CrashReport  string
 	KernelRepo   string
@@ -33,7 +34,7 @@ func init() {
 				codesearcher.PrepareIndex,
 				&aflow.LLMAgent{
 					Name:  "expert",
-					Model: aflow.GoodBalancedModel,
+					Model: aflow.CoreModel,
 					Reply: "ExplanationRaw",
 					Outputs: aflow.LLMOutputs[struct {
 						Actionable bool `jsonschema:"If the report is actionable or not."`

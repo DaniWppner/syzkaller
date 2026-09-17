@@ -21,6 +21,7 @@ You MUST use this tool to verify your generated syz repro program.
 
 type ReproduceArgs struct {
 	ReproSyz string `jsonschema:"Syz program to verify and execute."`
+	Sandbox  string `jsonschema:"Sandbox to use for execution (none/setuid/namespace/android)."`
 }
 
 type ReproduceResult struct {
@@ -30,6 +31,7 @@ type ReproduceResult struct {
 }
 
 type reproduceState struct {
+	AgentName    string
 	TargetOS     string
 	TargetArch   string
 	KernelSrc    string
@@ -42,18 +44,35 @@ type reproduceState struct {
 	Syzkaller    string
 }
 
+func (s reproduceState) targetConfig(sandbox string) crash.TargetConfig {
+	return crash.TargetConfig{
+		AgentName:    s.AgentName,
+		TargetArch:   s.TargetArch,
+		Syzkaller:    s.Syzkaller,
+		Image:        s.Image,
+		Type:         s.Type,
+		VM:           s.VM,
+		KernelSrc:    s.KernelSrc,
+		KernelObj:    s.KernelObj,
+		KernelCommit: s.KernelCommit,
+		KernelConfig: s.KernelConfig,
+		Sandbox:      sandbox,
+	}
+}
+
 func reproduce(ctx *aflow.Context, state reproduceState, args ReproduceArgs) (ReproduceResult, error) {
 	if args.ReproSyz == "" {
 		return ReproduceResult{}, aflow.BadCallError("syz program cannot be empty")
 	}
 
+	args.ReproSyz = ctx.RestoreBlobs(args.ReproSyz)
 	pt, err := prog.GetTarget(state.TargetOS, state.TargetArch)
 	if err != nil {
 		return ReproduceResult{}, err
 	}
 	_, err = pt.Deserialize([]byte(args.ReproSyz), prog.Strict)
 	if err != nil {
-		return ReproduceResult{}, aflow.BadCallError("%v", err)
+		return ReproduceResult{}, aflow.BadCallError("%v", ctx.ReplaceBlobs(err.Error()))
 	}
 
 	if state.Image == "" || state.VM == nil {
@@ -63,16 +82,12 @@ func reproduce(ctx *aflow.Context, state reproduceState, args ReproduceArgs) (Re
 	}
 
 	reproArgs := crash.ReproduceArgs{
-		TargetArch:   state.TargetArch,
-		Syzkaller:    state.Syzkaller,
-		Image:        state.Image,
-		Type:         state.Type,
-		VM:           state.VM,
+		TargetConfig: state.targetConfig(args.Sandbox),
 		ReproSyz:     args.ReproSyz,
-		KernelSrc:    state.KernelSrc,
-		KernelObj:    state.KernelObj,
-		KernelCommit: state.KernelCommit,
-		KernelConfig: state.KernelConfig,
+	}
+
+	if err := reproArgs.Validate(); err != nil {
+		return ReproduceResult{}, aflow.BadCallError("invalid configuration: %v", err)
 	}
 
 	testRes, cachedID, err := crash.ReproduceFuncWithCoverage(ctx, reproArgs, true)

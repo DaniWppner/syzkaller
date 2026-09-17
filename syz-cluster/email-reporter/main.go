@@ -16,6 +16,7 @@ import (
 	"github.com/google/syzkaller/syz-cluster/pkg/api"
 	"github.com/google/syzkaller/syz-cluster/pkg/app"
 	"github.com/google/syzkaller/syz-cluster/pkg/emailclient"
+	"github.com/google/syzkaller/syz-cluster/pkg/report"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -48,8 +49,11 @@ func main() {
 		reporter:       api.LKMLReporter,
 		reporterClient: reporterClient,
 		apiClient:      app.DefaultClient(),
-		emailConfig:    cfg.EmailReporting,
-		sender:         sender,
+		emailConfig: &report.Config{
+			EmailConfig: cfg.EmailReporting,
+			DirectList:  cfg.DirectList,
+		},
+		sender: sender,
 	}
 	msgCh := make(chan *lore.PolledEmail, 16)
 	eg, loopCtx := errgroup.WithContext(ctx)
@@ -106,17 +110,10 @@ func runConsumerLoop(ctx context.Context, msgCh <-chan *lore.PolledEmail, handle
 }
 
 func MakeLorePoller(repoDir string, emailCfg *app.EmailConfig, msgCh chan *lore.PolledEmail) (*lore.Poller, error) {
-	var ownEmails []string
-	if emailCfg.Dashapi != nil {
-		ownEmails = append(ownEmails, emailCfg.Dashapi.From)
-	}
-	if emailCfg.SMTP != nil {
-		ownEmails = append(ownEmails, emailCfg.SMTP.From)
-	}
 	return lore.NewPoller(lore.PollerConfig{
 		RepoDir:        repoDir,
 		URL:            emailCfg.LoreArchiveURL,
-		OwnEmails:      ownEmails,
+		OwnEmails:      emailCfg.OwnEmails(),
 		LookbackPeriod: 48 * time.Hour,
 		Tracer:         &debugtracer.GenericTracer{TraceWriter: os.Stdout, WithTime: true},
 	})

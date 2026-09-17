@@ -4,13 +4,13 @@
 package patching
 
 import (
-	"fmt"
 	"net/mail"
 	"slices"
 
 	"github.com/google/syzkaller/pkg/aflow"
 	"github.com/google/syzkaller/pkg/aflow/ai"
 	"github.com/google/syzkaller/pkg/email"
+	"github.com/google/syzkaller/pkg/vcs"
 )
 
 type tagExtractorArgs struct {
@@ -18,33 +18,24 @@ type tagExtractorArgs struct {
 	RemoveTags []ai.EmailTag `jsonschema:"List of tags reviewers asked to remove/drop."`
 }
 
-var acceptedTags = []string{"Reviewed-by", "Acked-by", "Tested-by", "Reported-by"}
+var acceptedTags = []string{"Reviewed-by", "Acked-by", "Tested-by", "Reported-by", "Suggested-by"}
 
 type tagExtractorState struct {
-	BaseReviewedBy []string
-	BaseAckedBy    []string
-	BaseTestedBy   []string
-	BaseReportedBy []string
-}
-
-func normalizeTagValue(val string) string {
-	addr, err := mail.ParseAddress(val)
-	if err != nil {
-		return val
-	}
-	if addr.Name == "" {
-		return addr.Address
-	}
-	return fmt.Sprintf("%s <%s>", addr.Name, addr.Address)
+	BaseReviewedBy  []string
+	BaseAckedBy     []string
+	BaseTestedBy    []string
+	BaseReportedBy  []string
+	BaseSuggestedBy []string
 }
 
 func validateTagExtractorOutputs(ctx *aflow.Context, state tagExtractorState,
 	args tagExtractorArgs) (tagExtractorArgs, error) {
 	tagsMap := map[string][]string{
-		"Reviewed-by": state.BaseReviewedBy,
-		"Acked-by":    state.BaseAckedBy,
-		"Tested-by":   state.BaseTestedBy,
-		"Reported-by": state.BaseReportedBy,
+		"Reviewed-by":  state.BaseReviewedBy,
+		"Acked-by":     state.BaseAckedBy,
+		"Tested-by":    state.BaseTestedBy,
+		"Reported-by":  state.BaseReportedBy,
+		"Suggested-by": state.BaseSuggestedBy,
 	}
 
 	var validAddTags []ai.EmailTag
@@ -56,7 +47,7 @@ func validateTagExtractorOutputs(ctx *aflow.Context, state tagExtractorState,
 			return args, aflow.BadCallError("value for tag %q must be a valid name and email "+
 				"(e.g. 'Name <email@example.com>'): %v", tag.Tag, err)
 		}
-		tag.Value = normalizeTagValue(tag.Value)
+		tag.Value = vcs.FormatGitAuthor(tag.Value)
 		validAddTags = append(validAddTags, tag)
 	}
 	args.AddTags = validAddTags
@@ -81,27 +72,30 @@ func validateTagExtractorOutputs(ctx *aflow.Context, state tagExtractorState,
 }
 
 type tagsMergerArgs struct {
-	AddTags        []ai.EmailTag
-	RemoveTags     []ai.EmailTag
-	BaseReviewedBy []string
-	BaseAckedBy    []string
-	BaseTestedBy   []string
-	BaseReportedBy []string
+	AddTags         []ai.EmailTag
+	RemoveTags      []ai.EmailTag
+	BaseReviewedBy  []string
+	BaseAckedBy     []string
+	BaseTestedBy    []string
+	BaseReportedBy  []string
+	BaseSuggestedBy []string
 }
 
 type tagsMergerResult struct {
-	ReviewedBy []string
-	AckedBy    []string
-	TestedBy   []string
-	ReportedBy []string
+	ReviewedBy  []string
+	AckedBy     []string
+	TestedBy    []string
+	ReportedBy  []string
+	SuggestedBy []string
 }
 
 func mergeTags(ctx *aflow.Context, args tagsMergerArgs) (tagsMergerResult, error) {
 	tagsMap := map[string][]string{
-		"Reviewed-by": slices.Clone(args.BaseReviewedBy),
-		"Acked-by":    slices.Clone(args.BaseAckedBy),
-		"Tested-by":   slices.Clone(args.BaseTestedBy),
-		"Reported-by": slices.Clone(args.BaseReportedBy),
+		"Reviewed-by":  slices.Clone(args.BaseReviewedBy),
+		"Acked-by":     slices.Clone(args.BaseAckedBy),
+		"Tested-by":    slices.Clone(args.BaseTestedBy),
+		"Reported-by":  slices.Clone(args.BaseReportedBy),
+		"Suggested-by": slices.Clone(args.BaseSuggestedBy),
 	}
 
 	for _, tag := range args.RemoveTags {
@@ -118,10 +112,11 @@ func mergeTags(ctx *aflow.Context, args tagsMergerArgs) (tagsMergerResult, error
 	}
 
 	return tagsMergerResult{
-		ReviewedBy: tagsMap["Reviewed-by"],
-		AckedBy:    tagsMap["Acked-by"],
-		TestedBy:   tagsMap["Tested-by"],
-		ReportedBy: tagsMap["Reported-by"],
+		ReviewedBy:  tagsMap["Reviewed-by"],
+		AckedBy:     tagsMap["Acked-by"],
+		TestedBy:    tagsMap["Tested-by"],
+		ReportedBy:  tagsMap["Reported-by"],
+		SuggestedBy: tagsMap["Suggested-by"],
 	}, nil
 }
 
@@ -129,7 +124,7 @@ var tagsMergerAction = aflow.NewFuncAction("tags-merger", mergeTags)
 
 var tagExtractor = &aflow.LLMAgent{
 	Name:        "tag-extractor",
-	Model:       aflow.GoodBalancedModel,
+	Model:       aflow.LightweightModel,
 	Outputs:     aflow.ValidatedLLMOutputs[tagExtractorArgs](validateTagExtractorOutputs),
 	TaskType:    aflow.FormalReasoningTask,
 	Instruction: tagExtractorInstruction,
@@ -139,7 +134,7 @@ var tagExtractor = &aflow.LLMAgent{
 const tagExtractorInstruction = `
 You are an expert Linux kernel maintainer. Your task is to extract review tags from comments on a proposed patch.
 Reviewers may provide tags to add to the commit.
-The exact list of supported tags is: "Reviewed-by", "Acked-by", "Tested-by", "Reported-by".
+The exact list of supported tags is: "Reviewed-by", "Acked-by", "Tested-by", "Reported-by", "Suggested-by".
 Extract these exact tags into AddTags. The values must be valid names and emails (e.g., "Name <email@example.com>").
 If reviewers explicitly retract a tag or ask to drop it, put it into RemoveTags.
 

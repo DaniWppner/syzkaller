@@ -40,7 +40,7 @@ RUN test "$(uname -m)" != x86_64 && exit 0 || \
 	  libc6-dev-i386 libc6-dev-i386-amd64-cross lib32gcc-14-dev lib32stdc++-14-dev \
 	  # Cross-compilation:
 	  g++-arm-linux-gnueabi g++-aarch64-linux-gnu g++-powerpc64le-linux-gnu \
-	  g++-mips64el-linux-gnuabi64 g++-s390x-linux-gnu g++-riscv64-linux-gnu
+	  g++-mips64el-linux-gnuabi64 g++-s390x-linux-gnu g++-riscv64-linux-gnu g++-loongarch64-linux-gnu
 
 # Since go 1.21 the toolchain required by go.mod is automatically downloaded.
 # There is no need to version up golang here after go.mod changes.
@@ -116,6 +116,9 @@ RUN apt-get install -y -q ca-certificates \
     && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list
 RUN apt-get update && apt-get install -y google-cloud-cli
 RUN git config --system credential.'https://*.*.sourcemanager.dev'.helper gcloud.sh
+# Prevent git from detaching background maintenance processes which can leave stranded lock
+# files (e.g., HEAD.lock) if the container is SIGKILLed.
+RUN git config --system gc.autoDetach false
 
 # Copy the custom strace build.
 COPY --from=strace-builder /opt/bin/strace /opt/bin/strace

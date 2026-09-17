@@ -6,7 +6,6 @@ package crash
 
 import (
 	"cmp"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -15,7 +14,6 @@ import (
 	"slices"
 
 	"github.com/google/syzkaller/pkg/aflow"
-	"github.com/google/syzkaller/pkg/build"
 	"github.com/google/syzkaller/pkg/cover/backend"
 	"github.com/google/syzkaller/pkg/csource"
 	"github.com/google/syzkaller/pkg/hash"
@@ -34,21 +32,10 @@ var ErrDidNotCrash = errors.New("reproducer did not crash")
 var Reproduce = aflow.NewFuncAction("crash-reproducer", ReproduceFunc)
 
 type ReproduceArgs struct {
-	AgentName    string
-	TargetArch   string
-	Syzkaller    string
-	Image        string
-	Type         string
-	VM           json.RawMessage
-	ReproOpts    string
-	ReproSyz     string
-	ReproC       string
-	KernelSrc    string
-	KernelObj    string
-	KernelCommit string
-	KernelConfig string
-	StraceBin    string
-	NeedStrace   bool
+	TargetConfig
+	ReproOpts string
+	ReproSyz  string
+	ReproC    string
 }
 
 type reproduceResult struct {
@@ -56,16 +43,6 @@ type reproduceResult struct {
 	ReproducedCrashReport    string
 	OtherCrashReports        []string
 	ReproducedFaultInjection string
-}
-
-func (args *ReproduceArgs) Validate() error {
-	if targets.Get(targets.Linux, args.TargetArch) == nil {
-		return fmt.Errorf("unsupported target: %v/%v", targets.Linux, args.TargetArch)
-	}
-	if args.Type != "qemu" && args.Type != "gce" {
-		return fmt.Errorf("unsupported VM type %q", args.Type)
-	}
-	return nil
 }
 
 type RunTestResult struct {
@@ -86,8 +63,9 @@ type RunTestResult struct {
 }
 
 // RunTest boots the kernel and runs a single test program.
-func RunTest(args ReproduceArgs, workdir string, collectCoverage bool) (RunTestResult, error) {
+func RunTest(ctx *aflow.Context, args ReproduceArgs, workdir string, collectCoverage bool) (RunTestResult, error) {
 	res := RunTestResult{}
+	args.ReproSyz = ctx.RestoreBlobs(args.ReproSyz)
 	if err := args.Validate(); err != nil {
 		return res, fmt.Errorf("run test: %w", err)
 	}
@@ -95,7 +73,7 @@ func RunTest(args ReproduceArgs, workdir string, collectCoverage bool) (RunTestR
 		return res, errors.New("run test: coverage collection requires a syzkaller program")
 	}
 
-	cfg, err := buildConfig(args, workdir)
+	cfg, err := BuildConfig(args.TargetConfig, workdir)
 	if err != nil {
 		return res, err
 	}
@@ -204,7 +182,7 @@ func aggregateTestResults(validResults []instance.EnvTestResult,
 	}
 
 	if res.Report == nil && res.BootError == "" && firstCoverage != nil {
-		coverage, err := symbolize(args, firstCoverage)
+		coverage, err := symbolize(args.TargetConfig, firstCoverage)
 		if err != nil {
 			return res, fmt.Errorf("failed to symbolize coverage: %w", err)
 		}
@@ -227,6 +205,14 @@ func parseTestError(err *instance.TestError) string {
 	return fmt.Sprintf("%v: %v\n%s", what, err.Title, extraInfo)
 }
 
+// CallError represents execution error details for a single syscall in a program.
+type CallError struct {
+	Index    int    `jsonschema:"0-based index of the failed syscall."`
+	CallName string `jsonschema:"Name of the syscall that failed."`
+	Errno    int32  `jsonschema:"The raw error code (errno) returned."`
+	Error    string `jsonschema:"String representation of the error."`
+}
+
 type cachedExecution struct {
 	BugTitle       string
 	Report         string
@@ -234,8 +220,11 @@ type cachedExecution struct {
 	FaultInjection string
 	Error          string
 	Coverage       [][]symbolizer.Frame
+	CallErrors     []CallError
+	GeneratedSyz   string
 }
 
+// LoadCoverage retrieves the symbolized coverage frames from a cached execution.
 func LoadCoverage(ctx *aflow.Context, cachedID string) ([][]symbolizer.Frame, error) {
 	cached, err := aflow.RetrieveObject[cachedExecution](ctx, cachedID)
 	if err != nil {
@@ -244,60 +233,22 @@ func LoadCoverage(ctx *aflow.Context, cachedID string) ([][]symbolizer.Frame, er
 	return cached.Coverage, nil
 }
 
-func buildConfig(args ReproduceArgs, workdir string) (*mgrconfig.Config, error) {
-	var vmConfig map[string]any
-	if err := json.Unmarshal(args.VM, &vmConfig); err != nil {
-		return nil, fmt.Errorf("failed to parse VM config: %w", err)
-	}
-
-	targetArch := args.TargetArch
-	image := args.Image
-
-	switch args.Type {
-	case "qemu":
-		vmConfig["kernel"] = filepath.Join(args.KernelObj, filepath.FromSlash(build.LinuxKernelImage(targetArch)))
-	case "gce":
-		params := build.Params{
-			TargetOS:     targets.Linux,
-			TargetArch:   targetArch,
-			UserspaceDir: image,
-			OutputDir:    workdir,
-		}
-		kernelPath := filepath.Join(args.KernelObj, filepath.FromSlash(build.LinuxKernelImage(targetArch)))
-		if err := build.EmbedLinuxKernel(params, kernelPath); err != nil {
-			return nil, fmt.Errorf("failed to embed kernel into image: %w", err)
-		}
-		image = filepath.Join(workdir, "image")
-	}
-
-	vmCfg, err := json.Marshal(vmConfig)
+// LoadSeedProgramDetails retrieves the generated syzkaller program from a cached execution with blob payloads replaced.
+func LoadSeedProgramDetails(ctx *aflow.Context, cachedID string) (string, error) {
+	cached, err := aflow.RetrieveObject[cachedExecution](ctx, cachedID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to serialize VM config: %w", err)
+		return "", err
 	}
+	return ctx.ReplaceBlobs(cached.GeneratedSyz), nil
+}
 
-	cfg := mgrconfig.DefaultValues()
-	cfg.Name = args.AgentName
-	cfg.RawTarget = targets.Linux + "/" + targetArch
-	cfg.Workdir = workdir
-	cfg.Syzkaller = args.Syzkaller
-	cfg.KernelObj = args.KernelObj
-	cfg.KernelSrc = args.KernelSrc
-	cfg.Image = image
-	cfg.Type = args.Type
-	cfg.VM = vmCfg
-	cfg.Experimental.DescriptionsMode = mgrconfig.AnyDescriptionsMode
-	if args.NeedStrace && args.StraceBin != "" {
-		cfg.StraceBin = args.StraceBin
-		cfg.StraceBinOnTarget = false
-	}
-
-	if err := mgrconfig.SetTargets(cfg); err != nil {
+// LoadCallErrors retrieves the list of syscall error details from a cached execution.
+func LoadCallErrors(ctx *aflow.Context, cachedID string) ([]CallError, error) {
+	cached, err := aflow.RetrieveObject[cachedExecution](ctx, cachedID)
+	if err != nil {
 		return nil, err
 	}
-	if err := mgrconfig.Complete(cfg); err != nil {
-		return nil, err
-	}
-	return cfg, nil
+	return cached.CallErrors, nil
 }
 
 func ReproduceFuncWithCoverage(ctx *aflow.Context, args ReproduceArgs,
@@ -322,7 +273,7 @@ func ReproduceFuncWithCoverage(ctx *aflow.Context, args ReproduceArgs,
 		if err != nil {
 			return res, err
 		}
-		testRes, err := RunTest(args, workdir, collectCoverage)
+		testRes, err := RunTest(ctx, args, workdir, collectCoverage)
 		if testRes.Report != nil {
 			res.BugTitle = testRes.Report.Title
 			res.Report = string(testRes.Report.Report)
@@ -333,6 +284,7 @@ func ReproduceFuncWithCoverage(ctx *aflow.Context, args ReproduceArgs,
 		res.FaultInjection = testRes.FaultInjection
 		res.Error = testRes.BootError
 		res.Coverage = testRes.Coverage
+		res.GeneratedSyz = args.ReproSyz
 		return res, err
 	})
 	if err != nil {
@@ -358,14 +310,16 @@ func ReproduceFunc(ctx *aflow.Context, args ReproduceArgs) (reproduceResult, err
 
 var makeSymbolizer = symbolizer.Make
 
-func symbolize(args ReproduceArgs, coverage [][]uint64) ([][]symbolizer.Frame, error) {
+func symbolize(args TargetConfig, coverage [][]uint64) ([][]symbolizer.Frame, error) {
 	if len(coverage) == 0 {
 		return nil, nil
 	}
 
-	target := targets.Get(targets.Linux, args.TargetArch)
+	// Coverage PCs come from the kernel, so they must be interpreted
+	// in terms of the VM arch rather than of the program arch.
+	target := targets.Get(targets.Linux, args.VMArch())
 	if target == nil {
-		return nil, fmt.Errorf("unknown target: %s/%s", targets.Linux, args.TargetArch)
+		return nil, fmt.Errorf("unknown target: %s/%s", targets.Linux, args.VMArch())
 	}
 
 	adjustedCoverage := make([][]uint64, 0, len(coverage))

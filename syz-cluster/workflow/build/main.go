@@ -18,11 +18,10 @@ import (
 	"github.com/google/syzkaller/pkg/debugtracer"
 	"github.com/google/syzkaller/pkg/kconfig"
 	"github.com/google/syzkaller/pkg/osutil"
-	"github.com/google/syzkaller/pkg/vcs"
 	"github.com/google/syzkaller/sys/targets"
 	"github.com/google/syzkaller/syz-cluster/pkg/api"
 	"github.com/google/syzkaller/syz-cluster/pkg/app"
-	"github.com/google/syzkaller/syz-cluster/pkg/triage"
+	"github.com/google/syzkaller/syz-cluster/pkg/workspace"
 )
 
 var (
@@ -32,20 +31,17 @@ var (
 	flagTestName   = flag.String("test_name", "", "test name")
 	flagSession    = flag.String("session", "", "session ID")
 	flagFindings   = flag.Bool("findings", false, "report build failures as findings")
-	flagSmokeBuild = flag.Bool("smoke_build", false, "build only if new, don't report findings")
 )
 
 func main() {
 	flag.Parse()
-	ensureFlags(*flagRequest, "--request",
+	ensureFlags(
+		*flagRequest, "--request",
 		*flagRepository, "--repository",
-		*flagOutput, "--output")
-	if !*flagSmokeBuild {
-		ensureFlags(
-			*flagTestName, "--test_name",
-			*flagSession, "--session",
-		)
-	}
+		*flagOutput, "--output",
+		*flagTestName, "--test_name",
+		*flagSession, "--session",
+	)
 
 	req := readRequest()
 	ctx := context.Background()
@@ -84,42 +80,36 @@ func main() {
 		TraceWriter: output,
 		OutDir:      "",
 	}
-	commit, err := checkoutKernel(tracer, req, patches)
+	ws, err := workspace.New(*flagRepository, tracer)
+	if err != nil {
+		log.Printf("failed to initialize workspace: %v", err)
+		reportResults(ctx, client, nil, nil, []byte(err.Error()))
+		return
+	}
+	commit, err := ws.Checkout(req.TreeName, req.CommitHash, patches)
 	if commit != nil {
 		uploadReq.CommitHash = commit.Hash
 		uploadReq.CommitDate = commit.CommitDate
 	}
-	ret := &BuildResult{}
 	if err != nil {
 		log.Printf("failed to checkout: %v", err)
 		reportResults(ctx, client, nil, nil, []byte(err.Error()))
 		return
+	}
+	ret, err := buildKernel(tracer, req)
+	if err != nil {
+		log.Printf("build process failed: %v", err)
+		reportResults(ctx, client, nil, nil, []byte(err.Error()))
+		return
+	}
+	uploadReq.Compiler = ret.Compiler
+	uploadReq.Config = ret.Config
+	if ret.Finding == nil {
+		uploadReq.BuildSuccess = true
 	} else {
-		if *flagSmokeBuild {
-			skip, err := alreadyBuilt(ctx, client, uploadReq)
-			if err != nil {
-				app.Fatalf("failed to query known builds: %v", err)
-			} else if skip {
-				log.Printf("%s already built, skipping", uploadReq.CommitHash)
-				return
-			}
-		}
-		ret, err = buildKernel(tracer, req)
-		if err != nil {
-			log.Printf("build process failed: %v", err)
-			reportResults(ctx, client, nil, nil, []byte(err.Error()))
-			return
-		} else {
-			uploadReq.Compiler = ret.Compiler
-			uploadReq.Config = ret.Config
-			if ret.Finding == nil {
-				uploadReq.BuildSuccess = true
-			} else {
-				log.Printf("%s", output.Bytes())
-				log.Printf("failed: %s\n%s", ret.Finding.Title, ret.Finding.Report)
-				uploadReq.Log = ret.Finding.Log
-			}
-		}
+		log.Printf("%s", output.Bytes())
+		log.Printf("failed: %s\n%s", ret.Finding.Title, ret.Finding.Report)
+		uploadReq.Log = ret.Finding.Log
 	}
 	reportResults(ctx, client, uploadReq, ret.Finding, output.Bytes())
 }
@@ -145,9 +135,6 @@ func reportResults(ctx context.Context, client *api.Client,
 		BuildID: buildID,
 		Success: status == api.TestPassed,
 	})
-	if *flagSmokeBuild {
-		return
-	}
 	testResult := &api.SessionTest{
 		SessionID: *flagSession,
 		TestName:  *flagTestName,
@@ -173,20 +160,6 @@ func reportResults(ctx context.Context, client *api.Client,
 	}
 }
 
-func alreadyBuilt(ctx context.Context, client *api.Client,
-	req *api.UploadBuildReq) (bool, error) {
-	build, err := client.LastBuild(ctx, &api.LastBuildReq{
-		Arch:       req.Build.Arch,
-		ConfigName: req.Build.ConfigName,
-		TreeName:   req.Build.TreeName,
-		Commit:     req.CommitHash,
-	})
-	if err != nil {
-		return false, err
-	}
-	return build != nil, nil
-}
-
 func readRequest() *api.BuildRequest {
 	raw, err := os.ReadFile(*flagRequest)
 	if err != nil {
@@ -202,23 +175,6 @@ func readRequest() *api.BuildRequest {
 	return &req
 }
 
-func checkoutKernel(tracer debugtracer.DebugTracer, req *api.BuildRequest, patches [][]byte) (*vcs.Commit, error) {
-	tracer.Logf("checking out %q", req.CommitHash)
-	ops, err := triage.NewGitTreeOps(*flagRepository, true)
-	if err != nil {
-		return nil, err
-	}
-	commit, err := ops.Commit(req.TreeName, req.CommitHash)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get commit info: %w", err)
-	}
-	if len(patches) > 0 {
-		tracer.Logf("applying %d patches", len(patches))
-	}
-	err = ops.ApplySeries(commit.Hash, patches)
-	return commit, err
-}
-
 type BuildResult struct {
 	Config   []byte
 	Compiler string
@@ -230,16 +186,18 @@ func buildKernel(tracer debugtracer.DebugTracer, req *api.BuildRequest) (*BuildR
 	if err != nil {
 		return nil, fmt.Errorf("failed to read the kernel config: %w", err)
 	}
-	if len(req.EnableConfigs) > 0 {
-		parsed, err := kconfig.ParseConfigData(kernelConfig, req.ConfigName)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse kernel config: %w", err)
-		}
-		for _, cfg := range req.EnableConfigs {
-			parsed.Set(cfg, kconfig.Yes)
-		}
-		kernelConfig = parsed.Serialize()
+	parsed, err := kconfig.ParseConfigData(kernelConfig, req.ConfigName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse kernel config: %w", err)
 	}
+	for _, cfg := range req.EnableConfigs {
+		parsed.Set(cfg, kconfig.Yes)
+	}
+	// Syzkaller builds bzImage/vmlinux and does not build or load .ko modules.
+	// Convert all module (=m) configs to built-in (=y) so tristate dependencies
+	// do not downgrade required configs back to =m during make oldconfig.
+	parsed.ModToYes()
+	kernelConfig = parsed.Serialize()
 	if req.Arch != "amd64" {
 		// TODO: lift this restriction.
 		return nil, fmt.Errorf("only amd64 builds are supported now")

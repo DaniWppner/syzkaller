@@ -15,6 +15,7 @@ import (
 type assessmentSecurityInputs struct {
 	TargetOS     string
 	TargetArch   string
+	TargetVMArch string `json:",omitempty"`
 	CrashReport  string
 	ReproSyz     string
 	ReproC       string
@@ -48,7 +49,7 @@ func init() {
 				codesearcher.PrepareIndex,
 				&aflow.LLMAgent{
 					Name:        "expert",
-					Model:       aflow.BestExpensiveModel,
+					Model:       aflow.DeepReasoningModel,
 					Reply:       "ExplanationRaw",
 					Outputs:     aflow.LLMOutputs[securityOutputs](),
 					TaskType:    aflow.FormalReasoningTask,

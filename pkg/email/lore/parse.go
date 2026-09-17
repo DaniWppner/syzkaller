@@ -13,7 +13,7 @@ import (
 	"slices"
 	"strconv"
 
-	"golang.org/x/exp/maps"
+	"maps"
 	"strings"
 
 	"github.com/google/syzkaller/dashboard/dashapi"
@@ -31,13 +31,16 @@ type Thread struct {
 
 // Series represents a single patch series sent over email.
 type Series struct {
-	Subject        string
-	MessageID      string
-	Version        int
-	Corrupted      string // If non-empty, contains a reason why the series better be ignored.
-	Tags           []string
-	Patches        []Patch
-	BaseCommitHint string
+	Subject           string
+	MessageID         string
+	Version           int
+	Corrupted         string // If non-empty, contains a reason why the series better be ignored.
+	Tags              []string
+	CoverCc           []string
+	Patches           []Patch
+	BaseCommitHint    string
+	XStable           string
+	XKernelTestBranch string
 }
 
 type Patch struct {
@@ -98,9 +101,15 @@ func PatchSeries(emails []*Email) []*Series {
 			if series.BaseCommitHint == "" { // Usually base-commit is in patch 0 or 1. Check them all to be safe.
 				series.BaseCommitHint = email.BaseCommitHint
 			}
+			if series.XStable == "" {
+				series.XStable = email.XStable
+			}
+			if series.XKernelTestBranch == "" {
+				series.XKernelTestBranch = email.XKernelTestBranch
+			}
 			seq := patch.Seq.ValueOr(1)
 			if seq == 0 {
-				// The cover email is not of interest.
+				series.CoverCc = email.Cc
 				continue
 			}
 			if !email.HasPatch {
@@ -118,7 +127,13 @@ func PatchSeries(emails []*Email) []*Series {
 				Email: email,
 			})
 		}
-		if len(hasSeq) != total {
+		// Occasionally, we have at least one missing patch in series sent for review.
+		// Require at least 99% of patches to accept the series.
+		// TODO: Modify syz-cluster to accept two pairs of commits, and use stable-rc tree, which has the changes already
+		// applied, instead of the stable tree.
+		const minPatchRate = 0.99
+		// Note that total may be 0 if the subject mentions e.g. "0/0", so guard the division.
+		if total <= 0 || len(hasSeq) > total || float64(len(hasSeq))/float64(total) < minPatchRate {
 			series.Corrupted = fmt.Sprintf("the subject mentions %d patches, %d are found",
 				total, len(hasSeq))
 			continue
@@ -158,7 +173,7 @@ type PatchSubject struct {
 }
 
 // nolint: lll
-var patchSubjectRe = regexp.MustCompile(`(?mi)^\[(?:([\w\s-]+)\s)?PATCH(?:\s([\w\s-]+))??(?:\s0*(\d+)\/(\d+))?\]\s*(.+)`)
+var patchSubjectRe = regexp.MustCompile(`(?mi)^\[(?:([\w\s-]+)\s)?PATCH(?:\s([\w\s.-]+))??(?:\s0*(\d+)\/(\d+))?\]\s*(.+)`)
 
 func parsePatchSubject(subject string) (PatchSubject, bool) {
 	var ret PatchSubject
@@ -226,13 +241,7 @@ func (c *parseCtx) process() {
 				unique[id] = struct{}{}
 			}
 		}
-		ids := maps.Keys(unique)
-		if len(ids) == 0 {
-			ids = nil
-		} else {
-			slices.Sort(ids)
-		}
-		thread.BugIDs = ids
+		thread.BugIDs = slices.Sorted(maps.Keys(unique))
 	}
 }
 

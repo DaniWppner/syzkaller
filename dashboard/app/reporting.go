@@ -107,9 +107,11 @@ func needReport(ctx context.Context, typ string, state *ReportingState, bug *Bug
 		return
 	}
 	link = bugReporting.Link
-	if !bugReporting.Reported.IsZero() && bugReporting.ReproLevel >= bug.HeadReproLevel {
+	reportedLevel := bugReporting.ReproLevel
+	headLevel := bug.HeadReproLevelVal()
+	if !bugReporting.Reported.IsZero() && reportedLevel >= headLevel {
 		status = fmt.Sprintf("%v: reported%v on %v",
-			reporting.DisplayTitle, reproStr(bugReporting.ReproLevel),
+			reporting.DisplayTitle, reproStr(reportedLevel),
 			html.FormatTime(bugReporting.Reported))
 		reporting, bugReporting = nil, nil
 		return
@@ -121,7 +123,7 @@ func needReport(ctx context.Context, typ string, state *ReportingState, bug *Bug
 		reporting, bugReporting = nil, nil
 		return
 	}
-	if crashNeedsRepro(bug.Title) && bug.ReproLevel < ReproLevelC &&
+	if crashNeedsRepro(bug.Title) && !bug.HasCRepro &&
 		timeSince(ctx, bug.FirstTime) < cfg.WaitForRepro {
 		status = fmt.Sprintf("%v: waiting for C repro", reporting.DisplayTitle)
 		reporting, bugReporting = nil, nil
@@ -211,12 +213,13 @@ var notificationGenerators = []func(context.Context, *Bug, *Reporting,
 	// Embargo upstreaming.
 	func(ctx context.Context, bug *Bug, reporting *Reporting,
 		bugReporting *BugReporting) (*dashapi.BugNotification, error) {
+		embargo := reporting.EmbargoForBug(bug)
 		if reporting.moderation &&
-			reporting.Embargo != 0 &&
+			embargo != 0 &&
 			len(bug.Commits) == 0 &&
 			bugReporting.OnHold.IsZero() &&
-			timeSince(ctx, bugReporting.Reported) > reporting.Embargo {
-			log.Infof(ctx, "%v: upstreaming (embargo): %v", bug.Namespace, bug.Title)
+			timeSince(ctx, bugReporting.Reported) > embargo {
+			log.Infof(ctx, "%v: upstreaming (embargo %v): %v", bug.Namespace, embargo, bug.Title)
 			return createNotification(ctx, dashapi.BugNotifUpstream, true, "", bug, reporting, bugReporting)
 		}
 		return nil, nil
@@ -301,7 +304,9 @@ func createLabelNotification(ctx context.Context, label BugLabel, bug *Bug, repo
 }
 
 func bugObsoletionReason(bug *Bug) dashapi.BugStatusReason {
-	if bug.HeadReproLevel == ReproLevelNone && bug.ReproLevel != ReproLevelNone {
+	hasHead := bug.HasHeadRepro()
+	hasRepro := bug.HasRepro()
+	if !hasHead && hasRepro {
 		return dashapi.InvalidatedByRevokedRepro
 	}
 	return dashapi.InvalidatedByNoActivity
@@ -327,7 +332,7 @@ func (bug *Bug) canBeObsoleted(ctx context.Context) bool {
 	if getNoObsoletions(ctx) {
 		return false
 	}
-	if bug.HeadReproLevel == ReproLevelNone {
+	if !bug.HasHeadRepro() {
 		return true
 	}
 	if obsoleteWhatWontBeFixBisected {
@@ -1039,6 +1044,11 @@ func incomingCommandUpdate(ctx context.Context, now time.Time, cmd *dashapi.BugU
 			return false, internalError, err
 		}
 	}
+	updateBugReportingFields(bug, bugReporting, cmd, now)
+	return true, "", nil
+}
+
+func updateBugReportingFields(bug *Bug, bugReporting *BugReporting, cmd *dashapi.BugUpdate, now time.Time) {
 	if bugReporting.ExtID == "" {
 		bugReporting.ExtID = cmd.ExtID
 	}
@@ -1049,7 +1059,7 @@ func incomingCommandUpdate(ctx context.Context, now time.Time, cmd *dashapi.BugU
 		merged := email.MergeEmailLists(strings.Split(bugReporting.CC, "|"), cmd.CC)
 		bugReporting.CC = strings.Join(merged, "|")
 	}
-	bugReporting.ReproLevel = max(bugReporting.ReproLevel, cmd.ReproLevel)
+	bugReporting.UpdateReproLevel(bug, cmd.ReproLevel)
 	if bug.Status != BugStatusDup {
 		bug.DupOf = ""
 	}
@@ -1061,7 +1071,6 @@ func incomingCommandUpdate(ctx context.Context, now time.Time, cmd *dashapi.BugU
 		// Otherwise it impedes bug obsoletion.
 		bug.LastActivity = now
 	}
-	return true, "", nil
 }
 
 // nolint:revive
@@ -1088,10 +1097,10 @@ func incomingCommandCmd(ctx context.Context, now time.Time, cmd *dashapi.BugUpda
 				bug.Reporting[i].Closed = now
 			}
 		}
-		if bug.ReproLevel < cmd.ReproLevel {
+		if bug.ReproLevelVal() < cmd.ReproLevel {
 			return false, internalError,
-				fmt.Errorf("bug update with invalid repro level: %v/%v",
-					bug.ReproLevel, cmd.ReproLevel)
+				fmt.Errorf("bug update with invalid repro level: bug has %v, cmd has %v",
+					bug.ReproLevelVal(), cmd.ReproLevel)
 		}
 	case dashapi.BugStatusUpstream:
 		if final {
@@ -1300,15 +1309,12 @@ func findCrashForBug(ctx context.Context, bug *Bug) (*Crash, *db.Key, error) {
 		return nil, nil, fmt.Errorf("no crashes")
 	}
 	crash, key := crashes[0], keys[0]
-	switch bug.HeadReproLevel {
-	case ReproLevelC:
-		if crash.ReproC == 0 {
-			log.Errorf(ctx, "bug '%v': has C repro, but crash without C repro", bug.Title)
-		}
-	case ReproLevelSyz:
-		if crash.ReproSyz == 0 {
-			log.Errorf(ctx, "bug '%v': has syz repro, but crash without syz repro", bug.Title)
-		}
+	if bug.HeadHasCRepro && crash.ReproC == 0 {
+		log.Errorf(ctx, "bug '%v': has C repro, but crash without C repro", bug.Title)
+	}
+	hasSyz := bug.HeadHasSyzRepro && !bug.HeadHasCRepro
+	if hasSyz && crash.ReproSyz == 0 {
+		log.Errorf(ctx, "bug '%v': has syz repro, but crash without syz repro", bug.Title)
 	}
 	return crash, key, nil
 }
@@ -1401,7 +1407,7 @@ func loadFullBugInfo(ctx context.Context, bug *Bug, bugKey *db.Key,
 			Title:      similarBug.displayTitle(),
 			Status:     status,
 			Namespace:  similarBug.Namespace,
-			ReproLevel: similarBug.ReproLevel,
+			ReproLevel: similarBug.ReproLevelVal(),
 			Link:       fmt.Sprintf("%v/bug?extid=%v", appURL(ctx), bugReporting.ID),
 			ReportLink: bugReporting.Link,
 			Closed:     similarBug.Closed,
@@ -1527,8 +1533,8 @@ func (a bugReportSorter) Len() int      { return len(a) }
 func (a bugReportSorter) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
 
 func (a bugReportSorter) Less(i, j int) bool {
-	if a[i].ReproLevel != a[j].ReproLevel {
-		return a[i].ReproLevel > a[j].ReproLevel
+	if a[i].ReproLevelVal() != a[j].ReproLevelVal() {
+		return a[i].ReproLevelVal() > a[j].ReproLevelVal()
 	}
 	if a[i].HasReport != a[j].HasReport {
 		return a[i].HasReport

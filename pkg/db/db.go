@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"compress/flate"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -28,6 +29,7 @@ type DB struct {
 	Version uint64            // arbitrary user version (0 for new database)
 	Records map[string]Record // in-memory cache, must not be modified directly
 
+	readOnly      bool
 	filename      string
 	uncompacted   int           // number of records in the file
 	pending       *bytes.Buffer // pending writes to the file
@@ -48,9 +50,10 @@ func Open(filename string, repair bool) (*DB, error) {
 	}
 	var deserializeErr error
 	db.Version, db.Records, db.uncompacted, deserializeErr = deserializeFile(db.filename)
-	// Deserialization error is considered a "soft" error if repair == true,
-	// but compact below ensures that the file is at least writable.
-	if deserializeErr != nil && !repair {
+	if errors.Is(deserializeErr, os.ErrNotExist) {
+		db.Records = make(map[string]Record)
+		deserializeErr = nil
+	} else if deserializeErr != nil && !repair {
 		return nil, deserializeErr
 	}
 	if err := db.compact(); err != nil {
@@ -59,7 +62,25 @@ func Open(filename string, repair bool) (*DB, error) {
 	return db, deserializeErr
 }
 
+// OpenReadOnly opens the specified database file for reading only.
+// Unlike Open, it does not compact or modify the database file on disk.
+func OpenReadOnly(filename string) (*DB, error) {
+	db := &DB{
+		filename: filename,
+		readOnly: true,
+	}
+	var err error
+	db.Version, db.Records, db.uncompacted, err = deserializeFile(db.filename)
+	if err != nil {
+		return nil, err
+	}
+	return db, nil
+}
+
 func (db *DB) Save(key string, val []byte, seq uint64) {
+	if db.readOnly {
+		panic("modifying read-only db")
+	}
 	if seq == seqDeleted {
 		panic("reserved seq")
 	}
@@ -76,6 +97,9 @@ func (db *DB) Save(key string, val []byte, seq uint64) {
 }
 
 func (db *DB) Delete(key string) {
+	if db.readOnly {
+		panic("modifying read-only db")
+	}
 	if _, ok := db.Records[key]; !ok {
 		return
 	}
@@ -96,6 +120,9 @@ func (db *DB) DiscardData() {
 }
 
 func (db *DB) Flush() error {
+	if db.readOnly {
+		panic("modifying read-only db")
+	}
 	if db.pending == nil {
 		return nil
 	}
@@ -115,6 +142,9 @@ func (db *DB) Flush() error {
 }
 
 func (db *DB) BumpVersion(version uint64) error {
+	if db.readOnly {
+		panic("modifying read-only db")
+	}
 	if err := db.Flush(); err != nil {
 		return err
 	}
@@ -139,7 +169,11 @@ func (db *DB) compact() error {
 	}
 	buf := new(bytes.Buffer)
 	serializeHeader(buf, db.Version)
-	for key, rec := range records {
+	// Sort the keys to make the resulting file bytes deterministic. Otherwise,
+	// the file hash would change on every compaction, breaking e.g. the cache in
+	// aflow.
+	for _, key := range slices.Sorted(maps.Keys(records)) {
+		rec := records[key]
 		serializeRecord(buf, key, rec.Val, rec.Seq)
 	}
 	f, err := os.Create(db.filename + ".tmp")
@@ -214,7 +248,7 @@ func serializeRecord(w *bytes.Buffer, key string, val []byte, seq uint64) {
 }
 
 func deserializeFile(filename string) (version uint64, records map[string]Record, uncompacted int, err error) {
-	f, err := os.OpenFile(filename, os.O_RDONLY|os.O_CREATE, osutil.DefaultFilePerm)
+	f, err := os.Open(filename)
 	if err != nil {
 		return 0, nil, 0, err
 	}
@@ -346,13 +380,13 @@ func ReadCorpus(filename string, target *prog.Target) (progs []*prog.Prog, err e
 	if filename == "" {
 		return
 	}
-	db, err := Open(filename, false)
+	_, records, _, err := deserializeFile(filename)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database file: %w", err)
 	}
-	recordKeys := slices.Sorted(maps.Keys(db.Records))
+	recordKeys := slices.Sorted(maps.Keys(records))
 	for _, key := range recordKeys {
-		p, err := target.Deserialize(db.Records[key].Val, prog.NonStrict)
+		p, err := target.Deserialize(records[key].Val, prog.NonStrict)
 		if err != nil {
 			return nil, fmt.Errorf("failed to deserialize corpus program: %w", err)
 		}
@@ -373,10 +407,11 @@ func Merge(into string, other []string, target *prog.Target) ([]DeserializeFailu
 	}
 	var failed []DeserializeFailure
 	for _, add := range other {
-		addDB, err := Open(add, false)
+		_, addRecords, _, err := deserializeFile(add)
 		if err == nil {
 			// It's a DB file.
-			for key, rec := range addDB.Records {
+			for _, key := range slices.Sorted(maps.Keys(addRecords)) {
+				rec := addRecords[key]
 				dstDB.Save(key, rec.Val, rec.Seq)
 			}
 			continue

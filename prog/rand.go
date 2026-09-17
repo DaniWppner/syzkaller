@@ -239,7 +239,7 @@ func (r *randGen) flags(vv []uint64, bitmask bool, oldVal uint64) uint64 {
 	}
 	// Flip rand bits. Do this for non-bitmask sometimes
 	// because we may have detected bitmask incorrectly for complex cases
-	// (e.g. part of the vlaue is bitmask and another is not).
+	// (e.g. part of the value is bitmask and another is not).
 	v := oldVal
 	if v != 0 && r.oneOf(10) {
 		v = 0 // Ignore the old value sometimes.
@@ -313,7 +313,7 @@ func (r *randGen) filenameImpl(s *state) string {
 		for i := 0; ; i++ {
 			f := fmt.Sprintf("%v/file%v", dir, i)
 			if r.oneOf(100) {
-				// Make file name very long using target.SpecialFileLenghts consts.
+				// Make file name very long using target.SpecialFileLengths consts.
 				// Add/subtract some small const to account for our file name prefix
 				// and potential kernel off-by-one's.
 				fileLen := r.randFilenameLength()
@@ -334,7 +334,7 @@ func (r *randGen) randFilenameLength() int {
 	if r.bin() {
 		off = -off
 	}
-	lens := r.target.SpecialFileLenghts
+	lens := r.target.SpecialFileLengths
 	return max(lens[r.Intn(len(lens))]+off, 0)
 }
 
@@ -670,12 +670,12 @@ func (r *randGen) generateParticularCallUnsafe(s *state, meta *Syscall) (calls [
 }
 
 // GenerateAllSyzProg generates a program that contains all pseudo syz_ calls for testing.
-func (target *Target) GenerateAllSyzProg(rs rand.Source) *Prog {
+func (target *Target) GenerateAllSyzProg(rs rand.Source, ct *ChoiceTable) *Prog {
 	p := &Prog{
 		Target: target,
 	}
 	r := newRand(target, rs)
-	s := newState(target, target.DefaultChoiceTable(), nil)
+	s := newState(target, ct, nil)
 	for _, meta := range target.PseudoSyscalls() {
 		calls := r.generateParticularCallUnsafe(s, meta)
 		for _, c := range calls {

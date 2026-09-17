@@ -6,7 +6,7 @@ Example use with Gemini CLI:
 
 2. Create `mcp.config` file, for example:
 
-```
+```json
 {
 	"http": "localhost:59999",
 	"mcp": true,
@@ -27,13 +27,13 @@ Example use with Gemini CLI:
 
 3. Start `syz-agent`:
 
-```
+```bash
 bin/syz-agent -config mcp.config
 ```
 
 4. Add the following to `~/.gemini/settings.json`:
 
-```
+```json
 {
 	"mcpServers": {
 		"syzkaller": {
@@ -46,7 +46,7 @@ bin/syz-agent -config mcp.config
 
 5. Start Gemini CLI:
 
-```
+```bash
 gemini
 ```
 
@@ -66,7 +66,7 @@ You must first run the following tools in the following order to prepare the env
  * codesearch-prepare
 
 Then you can use any of the other codesearch-* tools, and grepper, and read-file tools
-to nagivate the source code related to the crash.
+to navigate the source code related to the crash.
 
 The crash you need to debug is:
 

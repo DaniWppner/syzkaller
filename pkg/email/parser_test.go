@@ -1291,6 +1291,30 @@ base-commit: f8f97927abf7c12382dddc93a144fc9df7919b77 words after the hash are b
 			BaseCommitHint: "",
 		},
 	},
+	{
+		`Date: Fri, 24 Apr 2026 15:30:39 +0200
+Message-ID: <20260424132430.006424517@linuxfoundation.org>
+Subject: [PATCH 6.18 00/55] 6.18.25-rc1 review
+From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+To: stable@vger.kernel.org
+X-stable: review
+X-KernelTest-Branch: linux-6.18.y
+
+This is the start of the stable review cycle for the 6.18.25 release.
+`,
+		Email{
+			MessageID:         "<20260424132430.006424517@linuxfoundation.org>",
+			Date:              time.Date(2026, time.April, 24, 13, 30, 39, 0, time.UTC),
+			Subject:           "[PATCH 6.18 00/55] 6.18.25-rc1 review",
+			Author:            "gregkh@linuxfoundation.org",
+			AuthorName:        "Greg Kroah-Hartman",
+			Cc:                []string{"gregkh@linuxfoundation.org", "stable@vger.kernel.org"},
+			RawCc:             []string{"gregkh@linuxfoundation.org", "stable@vger.kernel.org"},
+			Body:              "This is the start of the stable review cycle for the 6.18.25 release.\n",
+			XStable:           "review",
+			XKernelTestBranch: "linux-6.18.y",
+		},
+	},
 }
 
 func TestDirectlyAddressedTo(t *testing.T) {
@@ -1303,4 +1327,32 @@ func TestDirectlyAddressedTo(t *testing.T) {
 	}
 	assert.True(t, msg.DirectlyAddressedTo("12345hash"))
 	assert.False(t, msg.DirectlyAddressedTo("67890hash"))
+}
+
+func TestFormatAddress(t *testing.T) {
+	tests := []struct {
+		name      string
+		emailAddr string
+		want      string
+	}{
+		{
+			name:      "First, Second",
+			emailAddr: "user@email.com",
+			want:      `"First, Second" <user@email.com>`,
+		},
+		{
+			name:      "First Second",
+			emailAddr: "user@email.com",
+			want:      "First Second <user@email.com>",
+		},
+		{
+			name:      "",
+			emailAddr: "user@email.com",
+			want:      "user@email.com",
+		},
+	}
+	for _, tc := range tests {
+		got := FormatAddress(tc.name, tc.emailAddr)
+		require.Equal(t, tc.want, got)
+	}
 }

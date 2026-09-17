@@ -348,6 +348,11 @@ var dynamicTitleReplacement = []replacement{
 		"IP",
 	},
 	{
+		// Replace IPv6 addresses.
+		regexp.MustCompile(`(^|\W)([0-9a-f:]*::[0-9a-f:]*|(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4})(\W|$)`),
+		"${1}IPV6ADDR${3}",
+	},
+	{
 		// Replace that everything looks like a file line number with "LINE".
 		regexp.MustCompile(`(\.\w+)(:[0-9]+)+`),
 		"${1}:LINE",
@@ -872,8 +877,6 @@ func Truncate(log []byte, begin, end int) []byte {
 var (
 	filenameRe    = regexp.MustCompile(`([a-zA-Z0-9_\-\./]*[a-zA-Z0-9_\-]+\.(c|h)):[0-9]+`)
 	reportFrameRe = regexp.MustCompile(`.* in ((?:<[a-zA-Z0-9_: ]+>)?[a-zA-Z0-9_:]+)`)
-	// Matches a slash followed by at least one directory nesting before .c/.h file.
-	deeperPathRe = regexp.MustCompile(`^/[a-zA-Z0-9_\-\./]+/[a-zA-Z0-9_\-]+\.(c|h)$`)
 )
 
 // These are produced by syzkaller itself.

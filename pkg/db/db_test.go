@@ -9,11 +9,17 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
+	"github.com/google/syzkaller/pkg/hash"
 	"github.com/google/syzkaller/pkg/osutil"
+	"github.com/google/syzkaller/prog"
+	_ "github.com/google/syzkaller/sys"
+	"github.com/google/syzkaller/sys/targets"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestBasic(t *testing.T) {
@@ -321,4 +327,94 @@ func TestOversizeKeyLen(t *testing.T) {
 	if len(db.Records) != 0 {
 		t.Fatalf("expected 0 records, got %d", len(db.Records))
 	}
+}
+
+func TestDeterministic(t *testing.T) {
+	target, err := prog.GetTarget(targets.TestOS, targets.TestArch64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srcFn := tempFile(t)
+	defer os.Remove(srcFn)
+	db, err := Open(srcFn, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct := target.DefaultChoiceTable()
+	rs := rand.NewSource(0)
+	for i := range 50 {
+		p := target.Generate(rand.New(rs), 5, ct)
+		data := p.Serialize()
+		db.Save(hash.String(data), data, uint64(i))
+	}
+	if err := db.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	mergeAndRead := func() ([]byte, [][]byte) {
+		dstFn := tempFile(t)
+		defer os.Remove(dstFn)
+		if _, err := Merge(dstFn, []string{srcFn}, target); err != nil {
+			t.Fatal(err)
+		}
+		rawBytes, err := os.ReadFile(dstFn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		progs, err := ReadCorpus(dstFn, target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var serializedProgs [][]byte
+		for _, p := range progs {
+			serializedProgs = append(serializedProgs, p.Serialize())
+		}
+		return rawBytes, serializedProgs
+	}
+
+	firstBytes, firstProgs := mergeAndRead()
+	for range 10 {
+		gotBytes, gotProgs := mergeAndRead()
+		if !bytes.Equal(firstBytes, gotBytes) {
+			t.Fatal("Merge output file bytes are non-deterministic")
+		}
+		if !reflect.DeepEqual(firstProgs, gotProgs) {
+			t.Fatal("ReadCorpus output program order is non-deterministic")
+		}
+	}
+}
+
+func TestOpenReadOnly(t *testing.T) {
+	t.Run("NonexistentFile", func(t *testing.T) {
+		nonexistent := filepath.Join(t.TempDir(), "nonexistent")
+		_, err := OpenReadOnly(nonexistent)
+		require.Error(t, err)
+		require.NoFileExists(t, nonexistent)
+	})
+
+	t.Run("ReadRecords", func(t *testing.T) {
+		fn := tempFile(t)
+		defer os.Remove(fn)
+
+		writableDB, err := Open(fn, false)
+		require.NoError(t, err)
+		writableDB.Save("key1", []byte("val1"), 1)
+		writableDB.Save("key2", []byte("val2"), 2)
+		require.NoError(t, writableDB.Flush())
+
+		require.NoError(t, os.Chmod(fn, 0400))
+		defer os.Chmod(fn, 0600)
+
+		roDB, err := OpenReadOnly(fn)
+		require.NoError(t, err)
+		require.Len(t, roDB.Records, 2)
+		require.Equal(t, []byte("val1"), roDB.Records["key1"].Val)
+		require.Equal(t, []byte("val2"), roDB.Records["key2"].Val)
+		require.NoFileExists(t, fn+".tmp")
+
+		require.Panics(t, func() { roDB.Save("key3", []byte("val3"), 3) })
+		require.Panics(t, func() { roDB.Delete("key1") })
+		require.Panics(t, func() { roDB.Flush() })
+		require.Panics(t, func() { roDB.BumpVersion(3) })
+	})
 }

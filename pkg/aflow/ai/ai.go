@@ -19,6 +19,9 @@ const (
 	WorkflowRepro              = WorkflowType("repro")
 	WorkflowReproC             = WorkflowType("repro-c")
 	WorkflowPatchTriage        = WorkflowType("patch-triage")
+	WorkflowSeedGen            = WorkflowType("seed-gen")
+	WorkflowSeedGenFileLine    = WorkflowType("seed-gen-file-line")
+	WorkflowFindingTriage      = WorkflowType("finding-triage")
 )
 
 // Outputs of various workflow types.
@@ -34,10 +37,11 @@ type PatchIterationOutputs struct {
 	Recipients       []Recipient
 	Fixes            FixesTag
 
-	ReviewedBy []string
-	AckedBy    []string
-	TestedBy   []string
-	ReportedBy []string
+	ReviewedBy  []string
+	AckedBy     []string
+	TestedBy    []string
+	ReportedBy  []string
+	SuggestedBy []string
 
 	NewChangeLog string
 	Replies      []CommentReply
@@ -81,17 +85,18 @@ type PatchingOutputs struct {
 	Recipients       []Recipient
 	Fixes            FixesTag
 
-	ReviewedBy []string
-	AckedBy    []string
-	TestedBy   []string
-	ReportedBy []string
+	ReviewedBy  []string
+	AckedBy     []string
+	TestedBy    []string
+	ReportedBy  []string
+	SuggestedBy []string
 }
 
 type FixesTag struct {
 	Hash        string
-	Title       string
-	AuthorName  string
-	AuthorEmail string
+	Title       string `json:",omitempty"`
+	AuthorName  string `json:",omitempty"`
+	AuthorEmail string `json:",omitempty"`
 }
 
 type Recipient struct {
@@ -152,10 +157,37 @@ type PatchTriageArgs struct {
 }
 
 type PatchTriageResult struct {
-	WorthFuzzing bool `jsonschema:"True if functional. False if only docs/comments/unreachable."`
+	WorthFuzzing   bool
+	NeedsKMSAN     bool
+	KMSANReasoning string
 	// TODO: this is temporarily here. We should do it at the beginning of the fuzzing step,
 	// where we do have the built binary and can extract exact symbol names / KCOV coverage points.
-	FocusSymbols  []string `jsonschema:"List of specific kernel functions to focus fuzzing on. Should avoid hot-path functions."`                                               // nolint:lll
-	EnableConfigs []string `jsonschema:"List of kernel config flags that must be explicitly enabled to compile and test the modified code. Do not include 'CONFIG_' prefixes."` // nolint:lll
-	Reasoning     string   `jsonschema:"A concise explanation of why this patch should or shouldn't be fuzzed."`
+	FocusSymbols  []string
+	EnableConfigs []string
+	Reasoning     string
+}
+
+type SeedGenOutputs struct {
+	SeedSyz string
+	Success bool
+	GiveUp  bool
+	Reason  string
+}
+
+type SeriesPatch struct {
+	Seq   int
+	Title string
+	Body  string
+}
+
+type FindingTriageArgs struct {
+	TargetArch  string
+	KernelSrc   string
+	Patches     []SeriesPatch `json:",omitempty"`
+	CrashReport string
+}
+
+type FindingTriageResult struct {
+	Introduced bool   `jsonschema:"True only if crash was introduced by the tested patch series."`
+	Reasoning  string `jsonschema:"Detailed explanation analyzing crash report against patch diffs."`
 }

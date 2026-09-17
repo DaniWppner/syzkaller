@@ -274,6 +274,7 @@ static bool flag_nic_vf;
 static bool flag_vhci_injection;
 static bool flag_wifi;
 static bool flag_delay_kcov_mmap;
+static bool flag_return_error;
 
 static bool flag_collect_cover;
 static bool flag_collect_signal;
@@ -446,6 +447,7 @@ struct handshake_req {
 	uint64 syscall_timeout_ms;
 	uint64 program_timeout_ms;
 	uint64 slowdown_scale;
+	bool return_error;
 };
 
 struct execute_req {
@@ -455,6 +457,7 @@ struct execute_req {
 	uint64 exec_flags;
 	uint64 all_call_signal;
 	bool all_extra_signal;
+	bool return_error;
 };
 
 struct execute_reply {
@@ -867,6 +870,7 @@ void parse_handshake(const handshake_req& req)
 	flag_wifi = (bool)(req.flags & rpc::ExecEnv::EnableWifi);
 	flag_delay_kcov_mmap = (bool)(req.flags & rpc::ExecEnv::DelayKcovMmap);
 	flag_nic_vf = (bool)(req.flags & rpc::ExecEnv::EnableNicVF);
+	flag_return_error = req.return_error;
 }
 
 void receive_execute()
@@ -891,6 +895,7 @@ void parse_execute(const execute_req& req)
 	flag_threaded = req.exec_flags & (uint64)rpc::ExecFlag::Threaded;
 	all_call_signal = req.all_call_signal;
 	all_extra_signal = req.all_extra_signal;
+	flag_return_error = req.return_error;
 
 	debug("[%llums] exec opts: reqid=%llu type=%llu procid=%llu threaded=%d cover=%d comps=%d dedup=%d signal=%d "
 	      " sandbox=%d/%d/%d/%d timeouts=%llu/%llu/%llu kernel_64_bit=%d\n",
@@ -1227,7 +1232,7 @@ thread_t* schedule_call(int call_index, int call_num, uint64 copyout_index, uint
 	// which overlaps with comparison type in kernel exposed records. As the result write_comparisons
 	// that will try to write out data from unfinished syscalls will see these rpc::ComparisonRaw records,
 	// mis-interpret PC as type, and fail as: SYZFAIL: invalid kcov comp type (type=ffffffff8100b4e0).
-	if (flag_coverage)
+	if (cover_collection_required())
 		cover_reset(&th->cov);
 	th->executing = true;
 	th->call_index = call_index;
@@ -1700,7 +1705,7 @@ void execute_call(thread_t* th)
 		th->soft_fail_state = true;
 	}
 
-	if (flag_coverage)
+	if (cover_collection_required())
 		cover_reset(&th->cov);
 	// For pseudo-syscalls and user-space functions NONFAILING can abort before assigning to th->res.
 	// Arrange for res = -1 and errno = EFAULT result for such case.
@@ -1714,7 +1719,7 @@ void execute_call(thread_t* th)
 	// Reset the flag before the first possible fail().
 	th->soft_fail_state = false;
 
-	if (flag_coverage)
+	if (cover_collection_required())
 		cover_collect(&th->cov);
 	th->fault_injected = false;
 
@@ -1730,7 +1735,7 @@ void execute_call(thread_t* th)
 	      th->id, current_time_ms() - start_time_ms, call->name, (uint64)th->res);
 	if (th->res == (intptr_t)-1)
 		debug(" errno=%d", th->reserrno);
-	if (flag_coverage)
+	if (cover_collection_required())
 		debug(" cover=%u", th->cov.size);
 	if (th->call_props.fail_nth > 0)
 		debug(" fault=%d", th->fault_injected);
@@ -2020,7 +2025,7 @@ rpc::ComparisonRaw convert(const kcov_comparison_t& cmp)
 void failmsg(const char* err, const char* msg, ...)
 {
 	int e = errno;
-	fprintf(stderr, "SYZFAIL: %s\n", err);
+	fprintf(stderr, "%s: %s\n", flag_return_error ? "NOTFAIL" : "SYZFAIL", err);
 	if (msg) {
 		va_list args;
 		va_start(args, msg);

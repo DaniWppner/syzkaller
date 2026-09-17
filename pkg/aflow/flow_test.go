@@ -280,7 +280,12 @@ func TestNoInputs(t *testing.T) {
 	cache, err := newTestCache(t, filepath.Join(workdir, "cache"), 0, stub.timeNow)
 	require.NoError(t, err)
 	onEvent := func(span *trajectory.Span) error { return nil }
-	_, err = flows["test"].Execute(ctx, &dummyProvider{}, workdir, false, inputs, cache, onEvent)
+	_, err = flows["test"].Execute(ctx, inputs, ExecuteOptions{
+		Provider: &dummyProvider{},
+		Workdir:  workdir,
+		Cache:    cache,
+		OnEvent:  onEvent,
+	})
 	require.Equal(t, err.Error(), "flow inputs are missing:"+
 		" aflow.flowInputs: field \"InBar\" is not present when converting map")
 }
@@ -466,4 +471,27 @@ func TestFlowRegistrationErrors(t *testing.T) {
 			},
 			Root: Pipeline(),
 		})
+}
+
+func TestConsumeTokens(t *testing.T) {
+	t.Run("disabled when zero limit", func(t *testing.T) {
+		ctx := &Context{tokenLimit: 0}
+		require.NoError(t, ctx.ConsumeTokens(100))
+		require.NoError(t, ctx.ConsumeTokens(1000000))
+	})
+
+	t.Run("within limit", func(t *testing.T) {
+		ctx := &Context{tokenLimit: 100}
+		require.NoError(t, ctx.ConsumeTokens(50))
+		require.NoError(t, ctx.ConsumeTokens(50))
+	})
+
+	t.Run("exceed limit", func(t *testing.T) {
+		ctx := &Context{tokenLimit: 100}
+		require.NoError(t, ctx.ConsumeTokens(50))
+		err := ctx.ConsumeTokens(51)
+		require.Error(t, err)
+		require.True(t, IsFlowError(err))
+		require.Contains(t, err.Error(), "workflow reached token limit (100)")
+	})
 }

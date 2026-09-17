@@ -68,17 +68,17 @@ func (corpus *Corpus) Minimize(coverFlag bool) {
 
 	corpus.progsMap = make(map[string]*Item)
 
-	// Overwrite the program lists.
-	corpus.ProgramsList = &ProgramsList{}
+	// Clear the program lists in-place to keep statistics references valid.
+	corpus.ProgramsList.clear()
 	for _, area := range corpus.focusAreas {
-		area.ProgramsList = &ProgramsList{}
+		area.ProgramsList.clear()
 	}
 	for idx := range indices {
 		inp := inputs[idx]
 		corpus.progsMap[inp.Sig] = inp
-		corpus.saveProgram(inp.Prog, inp.Signal)
+		corpus.saveProgram(inp.Prog, len(inp.Signal))
 		for area := range inp.areas {
-			area.saveProgram(inp.Prog, inp.Signal)
+			area.saveProgram(inp.Prog, area.inAreaPCs(inp.Cover))
 		}
 	}
 }

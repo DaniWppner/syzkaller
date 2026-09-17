@@ -16,18 +16,28 @@ import (
 	_ "time/tzdata"
 
 	"github.com/google/syzkaller/pkg/aflow/backend"
+	"github.com/google/syzkaller/pkg/aflow/syzspec"
 	"github.com/google/syzkaller/pkg/aflow/trajectory"
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/osutil"
 	"golang.org/x/sync/errgroup"
 )
 
+// ExecuteOptions groups the execution environment and infrastructure limits for a workflow run.
+type ExecuteOptions struct {
+	Provider   backend.Provider
+	Workdir    string
+	Cache      *Cache
+	OnEvent    onEvent
+	Debug      bool
+	TokenLimit int
+}
+
 // Execute executes the given AI workflow with provided inputs and returns workflow outputs.
 // The workdir argument should point to a dir owned by aflow to store private data,
 // it can be shared across parallel executions in the same process, and preferably
 // preserved across process restarts for caching purposes.
-func (flow *Flow) Execute(ctx context.Context, provider backend.Provider, workdir string, debug bool,
-	inputs map[string]any, cache *Cache, onEvent onEvent) (map[string]any, error) {
+func (flow *Flow) Execute(ctx context.Context, inputs map[string]any, opts ExecuteOptions) (map[string]any, error) {
 	convertedInputs, err := flow.checkInputs(inputs)
 	if err != nil {
 		return nil, fmt.Errorf("flow inputs are missing: %w", err)
@@ -35,19 +45,20 @@ func (flow *Flow) Execute(ctx context.Context, provider backend.Provider, workdi
 	inputs = convertedInputs
 	inputs = maps.Clone(inputs)
 	maps.Insert(inputs, maps.All(flow.Consts))
-	llmClient, err := provider.Client(ctx)
+	llmClient, err := opts.Provider.Client(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize LLM client: %w", err)
 	}
 
 	c := &Context{
 		Context:     ctx,
-		Workdir:     osutil.Abs(workdir),
-		provider:    provider,
-		cache:       cache,
+		Workdir:     osutil.Abs(opts.Workdir),
+		provider:    opts.Provider,
+		cache:       opts.Cache,
 		state:       inputs,
-		onEvent:     onEvent,
-		runnerDebug: debug,
+		onEvent:     opts.OnEvent,
+		runnerDebug: opts.Debug,
+		tokenLimit:  opts.TokenLimit,
 	}
 
 	defer c.Close()
@@ -175,21 +186,24 @@ var (
 )
 
 type Context struct {
-	Context       context.Context
-	Workdir       string
-	provider      backend.Provider
-	cache         *Cache
-	cachedDirs    []string
-	tempDirs      []string
-	state         map[string]any
-	onEvent       onEvent
-	spanSeq       int
-	spanNesting   int
-	runnerMu      sync.Mutex
-	runnerManager *RunnerManager
-	runnerEg      *errgroup.Group
-	runnerCancel  context.CancelFunc
-	runnerDebug   bool
+	Context        context.Context
+	Workdir        string
+	provider       backend.Provider
+	cache          *Cache
+	cachedDirs     []string
+	tempDirs       []string
+	state          map[string]any
+	onEvent        onEvent
+	spanSeq        int
+	spanNesting    int
+	runnerMu       sync.Mutex
+	runnerManager  *RunnerManager
+	runnerEg       *errgroup.Group
+	runnerCancel   context.CancelFunc
+	runnerDebug    bool
+	tokenLimit     int
+	consumedTokens int64
+	blobs          syzspec.BlobStore
 	stubContext
 }
 
@@ -198,6 +212,45 @@ type stubContext struct {
 	sleep           func(time.Duration)
 	generateContent func(string, *backend.GenerateConfig, []*backend.Message) (
 		*backend.GenerateResponse, error)
+}
+
+// ReplaceBlobs replaces large string literal blobs in content with short placeholders.
+func (ctx *Context) ReplaceBlobs(content string) string {
+	return ctx.blobs.ReplaceBlobs(content)
+}
+
+// RestoreBlobs restores all placeholders in content back to their original blobs.
+func (ctx *Context) RestoreBlobs(content string) string {
+	return ctx.blobs.RestoreBlobs(content)
+}
+
+// runWithState executes the given function with the context's state temporarily
+// swapped out. This is useful for running sub-agents in an isolated state
+// scope, preventing their internal variables and tool outputs from leaking into
+// the parent state.
+//
+// WARNING: This method is NOT thread-safe. It mutates the receiver's state
+// in-place. It is safe to use only because aflow workflow execution is entirely
+// sequential and does not execute actions in parallel or spawn background
+// goroutines that access ctx.state.
+func (ctx *Context) runWithState(state map[string]any, fn func(*Context) error) error {
+	oldState := ctx.state
+	ctx.state = state
+	defer func() {
+		ctx.state = oldState
+	}()
+	return fn(ctx)
+}
+
+func (ctx *Context) ConsumeTokens(tokens int) error {
+	if ctx.tokenLimit == 0 {
+		return nil
+	}
+	ctx.consumedTokens += int64(tokens)
+	if ctx.consumedTokens > int64(ctx.tokenLimit) {
+		return FlowError(fmt.Errorf("workflow reached token limit (%v)", ctx.tokenLimit))
+	}
+	return nil
 }
 
 func (ctx *Context) Cache(typ, desc string, populate func(string) error) (string, error) {

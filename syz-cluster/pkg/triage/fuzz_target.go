@@ -4,7 +4,7 @@
 package triage
 
 import (
-	"maps"
+	"regexp"
 	"slices"
 	"strings"
 
@@ -16,16 +16,17 @@ func SelectFuzzConfigs(series *api.Series, fuzzConfigs []*api.FuzzTriageTarget) 
 	for _, cc := range series.Cc {
 		seriesCc[strings.ToLower(cc)] = true
 	}
+	modifiedFiles := series.ModifiedFiles()
 	var ret, defaultRet []*api.KernelFuzzConfig
 	for _, config := range fuzzConfigs {
-		intersects := false
-		for _, cc := range config.EmailLists {
-			intersects = intersects || seriesCc[cc]
-		}
-		if intersects {
-			ret = append(ret, config.Campaigns...)
-		} else if len(config.EmailLists) == 0 {
-			defaultRet = append(defaultRet, config.Campaigns...)
+		matched := slices.ContainsFunc(config.EmailLists, func(cc string) bool {
+			return seriesCc[cc]
+		})
+		matched = matched || matchesPaths(config.PathRegexps, modifiedFiles)
+		if matched {
+			ret = append(ret, expandCampaigns(config)...)
+		} else if len(config.EmailLists) == 0 && len(config.PathRegexps) == 0 {
+			defaultRet = append(defaultRet, expandCampaigns(config)...)
 		}
 	}
 	// We want to return the fallback option only if no element matched exactly.
@@ -33,6 +34,37 @@ func SelectFuzzConfigs(series *api.Series, fuzzConfigs []*api.FuzzTriageTarget) 
 		return ret
 	}
 	return defaultRet
+}
+
+func matchesPaths(regexps, modifiedFiles []string) bool {
+	if len(regexps) == 0 || len(modifiedFiles) == 0 {
+		return false
+	}
+	for _, r := range regexps {
+		re, err := regexp.Compile(r)
+		if err != nil {
+			continue
+		}
+		if slices.ContainsFunc(modifiedFiles, re.MatchString) {
+			return true
+		}
+	}
+	return false
+}
+
+func expandCampaigns(config *api.FuzzTriageTarget) []*api.KernelFuzzConfig {
+	var ret []*api.KernelFuzzConfig
+	for _, campaign := range config.Campaigns {
+		c := *campaign
+		if c.Focus == "" {
+			c.Focus = config.Focus
+		}
+		if c.CorpusURL == "" {
+			c.CorpusURL = config.CorpusURL
+		}
+		ret = append(ret, &c)
+	}
+	return ret
 }
 
 type MergedFuzzConfig struct {
@@ -73,9 +105,7 @@ func MergeKernelFuzzConfigs(configs []*api.KernelFuzzConfig) []*MergedFuzzConfig
 func mergeFuzzConfigs(configs []*api.KernelFuzzConfig) *api.FuzzConfig {
 	var ret api.FuzzConfig
 	for _, config := range configs {
-		if config.Focus != "" {
-			ret.Focus = append(ret.Focus, config.Focus)
-		}
+		ret.Focus = append(ret.Focus, config.Focus)
 		if config.CorpusURL != "" {
 			ret.CorpusURLs = append(ret.CorpusURLs, config.CorpusURL)
 		}
@@ -83,16 +113,19 @@ func mergeFuzzConfigs(configs []*api.KernelFuzzConfig) *api.FuzzConfig {
 		// Must be the same.
 		ret.BugTitleRe = config.BugTitleRe
 	}
-	ret.Focus = unique(ret.Focus)
+	if slices.Contains(ret.Focus, "") {
+		// If there's at least one unfocused target,
+		// we fuzz everything this way.
+		ret.Focus = nil
+	} else {
+		ret.Focus = unique(ret.Focus)
+	}
 	ret.CorpusURLs = unique(ret.CorpusURLs)
 	return &ret
 }
 
 func unique(list []string) []string {
-	seen := make(map[string]struct{}, len(list))
-	for _, s := range list {
-		seen[s] = struct{}{}
-	}
-	unique := slices.Sorted(maps.Keys(seen))
-	return unique
+	list = slices.Clone(list)
+	slices.Sort(list)
+	return slices.Compact(list)
 }

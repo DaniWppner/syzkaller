@@ -3615,7 +3615,7 @@ error_clear_loop:
 #endif
 
 #if SYZ_EXECUTOR || __NR_syz_kvm_setup_cpu || __NR_syz_kvm_vgic_v3_setup || __NR_syz_kvm_setup_syzos_vm || __NR_syz_kvm_add_vcpu || __NR_syz_kvm_assert_syzos_uexit || __NR_syz_kvm_assert_reg || __NR_syz_kvm_assert_syzos_kvm_exit
-#if !GOARCH_arm
+#if !GOARCH_arm && !GOARCH_loong64
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/kvm.h>
@@ -5503,7 +5503,7 @@ static const char* setup_binfmt_misc()
 		return NULL;
 	}
 	if (!write_file("/proc/sys/fs/binfmt_misc/register", ":syz0:M:0:\x01::./file0:") ||
-	    !write_file("/proc/sys/fs/binfmt_misc/register", ":syz1:M:1:\x02::./file0:POC"))
+	    !write_file("/proc/sys/fs/binfmt_misc/register", ":syz1:M:1:\x02::/proc/thread-self/cwd/file0:POC"))
 		return "write(/proc/sys/fs/binfmt_misc/register) failed";
 	return NULL;
 }
@@ -5582,6 +5582,16 @@ static void setup_sysctl()
 	    // We always want to prefer killing the allocating test process rather than somebody else
 	    // (sshd or another random test process).
 	    {"/proc/sys/vm/oom_kill_allocating_task", "1"},
+	    // Enable task-filter on debugfs fault injectors by default to isolate fault injection
+	    // to test processes that explicitly opt in via /proc/self/make-it-fail, protecting syz-executor
+	    // and system daemons from global allocation/io failures.
+	    {"/sys/kernel/debug/failslab/task-filter", "Y"},
+	    {"/sys/kernel/debug/fail_page_alloc/task-filter", "Y"},
+	    {"/sys/kernel/debug/fail_futex/task-filter", "Y"},
+	    {"/sys/kernel/debug/fail_usercopy/task-filter", "Y"},
+	    {"/sys/kernel/debug/fail_make_request/task-filter", "Y"},
+	    {"/sys/kernel/debug/fail_io_timeout/task-filter", "Y"},
+	    {"/sys/kernel/debug/fail_iommufd/task-filter", "Y"},
 	    // This blocks some of the ways the fuzzer can trigger a reboot.
 	    // ctrl-alt-del=0 tells kernel to signal cad_pid instead of rebooting.
 	    // We set cad_pid to a transient process pid ctrl-alt-del a no-op.

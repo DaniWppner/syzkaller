@@ -11,7 +11,7 @@ import (
 	"github.com/google/syzkaller/pkg/aflow/tool/grepper"
 )
 
-func New(enableGit bool) *aflow.LLMTool {
+func New(enableGit bool) *aflow.LLMTool[struct{}, aflow.DefaultLLMArgs] {
 	var tools []aflow.Tool
 	inst := instructionHeader
 	if enableGit {
@@ -25,20 +25,22 @@ func New(enableGit bool) *aflow.LLMTool {
 		inst += instructionGitRestrictions
 	}
 
-	return &aflow.LLMTool{
-		Name:        "codeexpert",
-		Model:       aflow.GoodBalancedModel,
-		TaskType:    aflow.FormalReasoningTask,
-		Description: description,
-		Instruction: inst,
-		Tools:       tools,
+	return &aflow.LLMTool[struct{}, aflow.DefaultLLMArgs]{
+		Name:          "codeexpert",
+		Model:         aflow.CoreModel,
+		TaskType:      aflow.FormalReasoningTask,
+		Description:   description,
+		Instruction:   inst,
+		Prompt:        `{{.Question}}`,
+		Tools:         tools,
+		MaxIterations: 30,
 	}
 }
 
 const description = `
 The tool can answer complex questions about kernel source code,
-function behavior/pre-conditons/post-conditions, structs and their fields,
-assess vality of code snippets, verify various hypothesis, etc.
+function behavior/pre-conditions/post-conditions, structs and their fields,
+assess validity of code snippets, verify various hypothesis, etc.
 It has access to more sources of information than you, use it to answer
 particularly complex questions that require lots of research, and looking
 at lots of data, and have a concrete concise answer.
@@ -46,8 +48,10 @@ at lots of data, and have a concrete concise answer.
 DO NOT use this tool for simple file reading, searching, or extracting line numbers.
 Use other tools provided to you for those purposes.
 Only use this tool for complex architectural or behavioral reasoning.
+DO NOT use this tool for asking questions about syzkaller or syzlang, it does not have any syzlang-specific knowledge.
+DO NOT repeatedly ask the same or slightly rephrased question if you already received an answer.
 
-Formulate your question as concretly as possible, include concrete
+Formulate your question as concretely as possible, include concrete
 function/struct/field/variable names, line numbers, etc.
 Formulate what exactly you want to see in the answer and in what form.
 `
@@ -65,9 +69,10 @@ const instructionHeader = `
 You are a capable Linux kernel developer tasked with researching complex questions
 about kernel source code. You will be given a concrete question, and need to provide
 a concrete answer.
-Use tools extensively while researching the question. Don't make assumptions,
+Research the question using targeted, efficient tool calls. Don't make assumptions,
 or rely on your previous knowledge about the kernel source code, use available tools
-to access the actual source code.
+to access the actual source code. Keep your tool calls focused and limited to the
+scope of the question. Do not explore tangential code paths or perform unbounded searches.
 Use all available sources of information:
  - kernel source code
  - documentation in the Documentation dir in the source tree
@@ -79,19 +84,32 @@ const instructionGitSources = ` - git commits descriptions, git blame
 const instructionBody = `
 Do not guess file names or file paths and attempt to read them without
 verifying their existence first using content search or directory listing tools.
-If a file, symbol, or directory is not found via content search ('grepper') or
-directory listing ('codesearch-dir-index'), treat it as completely absent.
+If a file, symbol, or directory is not found via content search ({{.toolGrepper}}) or
+directory listing ({{.toolCodesearchDirIndex}}), treat it as completely absent.
 Do not attempt to guess alternative names, extensions, or directories.
+
+Tool Selection Guidelines:
+1. For C functions, structs, and variables: Prefer {{.toolCodesearchDefinitionSource}}
+   or {{.toolCodesearchStructLayout}} FIRST to retrieve clean, exact definitions
+   without line-number guessing.
+2. If symbol lookup fails (e.g., preprocessor macros, macro-generated code, or
+   disabled #ifdef branches), fall back to {{.toolReadFile}} or {{.toolGrepper}}.
+3. For file headers, #include directives, preprocessor macro definitions, and
+   non-C files (Kconfig, Makefiles, docs): Use {{.toolReadFile}} or {{.toolGrepper}} directly.
+4. Be concise and targeted. Answer the question as directly and concisely as possible
+   once you have located the relevant code or definitions. If a symbol or function cannot
+   be found after targeted searches, conclude with the best available information rather
+   than continuing repetitive searches.
 `
 
-const instructionGitRestrictions = `Do NOT use 'git-log' to search for the presence or existence of files in the
-repository. 'git-log' is only for tracing commit history of files that are
+const instructionGitRestrictions = `Do NOT use {{.toolGitLog}} to search for the presence or existence of files in the
+repository. {{.toolGitLog}} is only for tracing commit history of files that are
 already present in the current checkout. If a file does not exist in the
 current checkout, it cannot be used for reproduction.
 
-Avoid running broad 'git-log' queries (such as searches on the entire repo)
+Avoid running broad {{.toolGitLog}} queries (such as searches on the entire repo)
 without a specific 'PathPrefix' to restrict the scope, as these are very
 expensive and will time out.
-If a 'git-log' tool call times out, do not retry the query with the same broad
+If a {{.toolGitLog}} tool call times out, do not retry the query with the same broad
 scope. You must specify a tighter, narrower 'PathPrefix' for subsequent queries.
 `

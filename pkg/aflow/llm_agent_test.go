@@ -6,11 +6,11 @@ package aflow
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/syzkaller/pkg/aflow/backend"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -60,6 +60,18 @@ func TestLLMRetryLimit(t *testing.T) {
 		expected = append(expected, 3*time.Minute)
 	}
 	require.Equal(t, expected, delays)
+
+	// Verify that a zero Delay still sleeps for at least 1 second.
+	retryErr = &backend.RetryError{Delay: 0, Err: err0, IsExponential: false}
+	delays = nil
+	tries = 0
+	_, err = agent.generateContent(ctx, cfg, nil, 0, "model1", nil)
+	require.ErrorIs(t, err, err0)
+	require.Equal(t, maxLLMRetryIters+1, tries)
+	require.Len(t, delays, maxLLMRetryIters)
+	for _, d := range delays {
+		require.Equal(t, time.Second, d)
+	}
 }
 
 func TestTokenCompression(t *testing.T) {
@@ -81,31 +93,40 @@ func TestTokenCompression(t *testing.T) {
 			},
 		},
 		[]any{
-			// 1. Initial request. Return a tool call and establish the anchor token count.
-			createToolCallResponse(150, "id1", "tick"),
-			// 2. Second request. Return another tool call and report total tokens 260.
+			// 1. Initial request. Return a tool call with a thought signature and establish the anchor token count.
+			createToolCallResponseWithSig(150, "id1", "tick", []byte("original-sig-1")),
+			// 2. Second request. Return another tool call with a thought signature and report total tokens 260.
 			// This means delta = 260 - 150 = 110. Since 110 > compressTokensValue (100), compression triggers!
-			createToolCallResponse(260, "id2", "tick"),
-			// 3. The loop detects threshold exceeded and invokes compressContext (Flash model).
-			// We return the compressed summary.
-			&backend.GenerateResponse{
-				UsageMetadata: &backend.UsageMetadata{
-					InputTokens:  260,
-					OutputTokens: 10,
-				},
-				Parts: []backend.Part{{Text: "compressed summary"}},
-			},
-			// 4. The main agent resumes with the truncated history. We finish the workflow.
+			createToolCallResponseWithSig(260, "id2", "tick", []byte("original-sig-2")),
+			// 3. The loop detects threshold exceeded and invokes compressContext (Flash model),
+			// followed by the main agent resuming with the truncated history.
 			func(model string, cfg *backend.GenerateConfig, req []*backend.Message) (*backend.GenerateResponse, error) {
-				// Assert that the history was correctly truncated!
-				assert.Equal(t, 2, len(req), "History should be truncated to just Anchor and Summary")
-
-				// Assert Anchor Message remains untouched.
-				assert.Equal(t, "Prompt", req[0].Parts[0].Text)
-
-				// Assert Summary is correctly formatted.
-				assert.Equal(t, "Here is the summary of the previous execution history:\n\ncompressed summary",
+				if model == string(backend.LightweightModel) {
+					// Summarizer invocation: verify single user message with XML tags.
+					require.Equal(t, 1, len(req), "Summarizer should receive a single user message")
+					require.Equal(t, backend.RoleUser, req[0].Role)
+					require.Contains(t, req[0].Parts[0].Text, "<execution_history>")
+					require.Contains(t, req[0].Parts[0].Text, "</execution_history>")
+					require.Empty(t, req[0].Parts[0].ThoughtSignature, "thought signatures must be cleared for summarizer")
+					return &backend.GenerateResponse{
+						UsageMetadata: &backend.UsageMetadata{
+							InputTokens:  260,
+							OutputTokens: 10,
+						},
+						Parts: []backend.Part{{Text: "compressed summary"}},
+					}, nil
+				}
+				// Main agent resumed with the truncated history: Anchor + Summary + Preserved Suffix.
+				require.Equal(t, 4, len(req), "History should be Anchor, Summary, and preserved suffix")
+				require.Equal(t, "Prompt", req[0].Parts[0].Text)
+				require.Equal(t, "Here is the summary of the previous execution history:\n\ncompressed summary",
 					req[1].Parts[0].Text)
+				require.Equal(t, backend.RoleModel, req[2].Role)
+				require.Equal(t, "id2", req[2].Parts[0].FunctionCall.ID)
+				require.Empty(t, req[2].Parts[0].ThoughtSignature,
+					"preserved function call in generic history should have empty thought signature")
+				require.Equal(t, backend.RoleUser, req[3].Role)
+				require.Equal(t, "id2", req[3].Parts[0].FunctionResponse.ID)
 				return &backend.GenerateResponse{
 					UsageMetadata: &backend.UsageMetadata{
 						InputTokens:  20, // tokens dropped after compression
@@ -117,6 +138,12 @@ func TestTokenCompression(t *testing.T) {
 		},
 		nil,
 	)
+}
+
+func createToolCallResponseWithSig(tokens int, id, name string, sig []byte) *backend.GenerateResponse {
+	resp := createToolCallResponse(tokens, id, name)
+	resp.Parts[0].ThoughtSignature = sig
+	return resp
 }
 
 // TestTokenCompressionResetsHistory verifies that when context compression occurs,
@@ -336,6 +363,26 @@ func TestAgentRegistrationErrors(t *testing.T) {
 				Prompt:      "Initial Prompt",
 			},
 		})
+	testRegistrationError[struct{}, struct{}](t,
+		"flow test: action smarty: Candidates > 1 is not supported with Judge",
+		&Flow{
+			Root: &LLMAgent{
+				Name:        "smarty",
+				Model:       "model",
+				Reply:       "Result",
+				TaskType:    FormalReasoningTask,
+				Instruction: "Instructions",
+				Prompt:      "Initial Prompt",
+				Candidates:  2,
+				Judge: &LLMJudge{
+					Name:               "judge",
+					Model:              "model",
+					EvaluationInterval: 1,
+					MinIterations:      1,
+					Instruction:        "Judge",
+				},
+			},
+		})
 }
 
 func TestOutputOverflow(t *testing.T) {
@@ -501,4 +548,217 @@ func TestModelFallbackTrajectory(t *testing.T) {
 		},
 		nil,
 	)
+}
+
+func TestLLMAgentMaxIterations(t *testing.T) {
+	type outputs struct {
+		Reply string
+	}
+	type toolArgs struct {
+		Arg int `jsonschema:"something"`
+	}
+	replies := []any{}
+	for i := range 3 {
+		replies = append(replies, &backend.Part{
+			FunctionCall: &backend.FunctionCall{
+				ID:   "id1",
+				Name: "some-tool",
+				Args: map[string]any{
+					"Arg": i,
+				},
+			},
+		})
+	}
+	testFlow[struct{}, outputs](t, nil,
+		"agent reached max iterations limit (3)",
+		&LLMAgent{
+			Reply:         "Reply",
+			MaxIterations: 3,
+			Tools: []Tool{
+				NewFuncTool("some-tool", func(ctx *Context, state struct{}, args toolArgs) (struct{}, error) {
+					return struct{}{}, nil
+				}, "some-tool description"),
+			},
+		},
+		replies,
+		nil,
+	)
+}
+
+func TestMaxParallelToolCalls(t *testing.T) {
+	type outputs struct {
+		Reply string
+	}
+	type toolArgs struct {
+		Arg int `jsonschema:"something"`
+	}
+	var parts []backend.Part
+	for i := range maxParallelToolCalls + 1 {
+		parts = append(parts, backend.Part{
+			FunctionCall: &backend.FunctionCall{
+				ID:   fmt.Sprintf("id%d", i),
+				Name: "some-tool",
+				Args: map[string]any{
+					"Arg": i,
+				},
+			},
+		})
+	}
+	toolExecutionCount := 0
+	replies := []any{
+		&backend.GenerateResponse{
+			Parts: parts,
+		},
+		func(model string, cfg *backend.GenerateConfig, req []*backend.Message) (*backend.GenerateResponse, error) {
+			require.GreaterOrEqual(t, len(req), 2)
+			lastMsg := req[len(req)-1]
+			require.Equal(t, backend.RoleUser, lastMsg.Role)
+			require.Len(t, lastMsg.Parts, 1)
+			expectedErr := fmt.Sprintf(
+				"too many parallel tool calls (%d), maximum allowed is %d; "+
+					"please reduce the number of tool calls per turn",
+				maxParallelToolCalls+1, maxParallelToolCalls,
+			)
+			require.Equal(t, expectedErr, lastMsg.Parts[0].Text)
+			return &backend.GenerateResponse{
+				Parts: []backend.Part{{Text: "Done"}},
+			}, nil
+		},
+	}
+	testFlow[struct{}, outputs](t, nil,
+		map[string]any{"Reply": "Done"},
+		&LLMAgent{
+			Reply: "Reply",
+			Tools: []Tool{
+				NewFuncTool("some-tool", func(ctx *Context, state struct{}, args toolArgs) (struct{}, error) {
+					toolExecutionCount++
+					return struct{}{}, nil
+				}, "some-tool description"),
+			},
+		},
+		replies,
+		nil,
+	)
+	require.Equal(t, 0, toolExecutionCount, "tools should not be executed when maxParallelToolCalls is exceeded")
+}
+
+func TestLLMJudge(t *testing.T) {
+	type flowOutputs struct {
+		Reply         string
+		JudgeStopped  bool
+		JudgeReason   string
+		FailedHistory []*backend.Message
+	}
+	type toolResults struct {
+		Res int `jsonschema:"res"`
+	}
+
+	agent := &LLMAgent{
+		Reply: "Reply",
+		Tools: []Tool{
+			NewFuncTool("tick", func(ctx *Context, state struct{}, args struct{}) (toolResults, error) {
+				return toolResults{42}, nil
+			}, "ticker"),
+		},
+		Judge: &LLMJudge{
+			Name:               "test-judge",
+			Model:              "model1",
+			MinIterations:      2,
+			EvaluationInterval: 1,
+			Instruction:        "Judge the history",
+		},
+	}
+
+	expectedHistory := []*backend.Message{
+		{Role: "user", Parts: []backend.Part{{Text: "Prompt"}}},
+		{Role: "model", Parts: []backend.Part{{FunctionCall: &backend.FunctionCall{
+			ID:   "id1",
+			Name: "tick",
+		}}}},
+		{Role: "user", Parts: []backend.Part{{FunctionResponse: &backend.FunctionResponse{
+			ID:       "id1",
+			Name:     "tick",
+			Response: map[string]any{"Res": 42},
+		}}}},
+		{Role: "model", Parts: []backend.Part{{FunctionCall: &backend.FunctionCall{
+			ID:   "id2",
+			Name: "tick",
+		}}}},
+		{Role: "user", Parts: []backend.Part{{FunctionResponse: &backend.FunctionResponse{
+			ID:       "id2",
+			Name:     "tick",
+			Response: map[string]any{"Res": 42},
+		}}}},
+		{Role: "model", Parts: []backend.Part{{FunctionCall: &backend.FunctionCall{
+			ID:   "id3",
+			Name: "tick",
+		}}}},
+		{Role: "user", Parts: []backend.Part{{FunctionResponse: &backend.FunctionResponse{
+			ID:       "id3",
+			Name:     "tick",
+			Response: map[string]any{"Res": 42},
+		}}}},
+	}
+
+	testFlow[struct{}, flowOutputs](t, nil, convertToMap(flowOutputs{
+		Reply:         "",
+		JudgeStopped:  true,
+		JudgeReason:   "stuck in tick loop",
+		FailedHistory: expectedHistory,
+	}),
+		agent,
+		[]any{
+			// Iteration 0: LLM calls tick tool.
+			createToolCallResponse(50, "id1", "tick"),
+			// Iteration 1: LLM calls tick tool again.
+			createToolCallResponse(50, "id2", "tick"),
+			// Iteration 2: we use a single smart callback to handle both smarty's Turn 2 and the Judge's Turn.
+			func(model string, cfg *backend.GenerateConfig, req []*backend.Message) (*backend.GenerateResponse, error) {
+				if strings.Contains(cfg.SystemInstruction.Parts[0].Text, "Judge the history") {
+					// This is the judge invocation!
+					lastMsg := req[len(req)-1]
+					hasSetResultsResponse := false
+					for _, part := range lastMsg.Parts {
+						if part.FunctionResponse != nil && part.FunctionResponse.Name == "set-results" {
+							hasSetResultsResponse = true
+							break
+						}
+					}
+					if !hasSetResultsResponse {
+						return &backend.GenerateResponse{
+							Parts: []backend.Part{
+								{FunctionCall: &backend.FunctionCall{
+									Name: "set-results",
+									Args: map[string]any{"Stop": true, "Reason": "stuck in tick loop"},
+								}},
+							},
+						}, nil
+					}
+					// Turn 1 of judge: return final reply.
+					return &backend.GenerateResponse{
+						Parts: []backend.Part{{Text: "Done"}},
+					}, nil
+				}
+				// This is the parent smarty agent Turn 2. Call tick tool.
+				return createToolCallResponse(50, "id3", "tick"), nil
+			},
+		},
+		nil,
+	)
+}
+
+func TestDisarmTags(t *testing.T) {
+	input := "text with <execution_history> and </execution_history> " +
+		"and <thought> and </thought> and <system_instructions> and </system_instructions> " +
+		"and </EXECUTION_HISTORY> and </ execution_history > and < thought\t> " +
+		"and <system_instructions priority=\"high\"> and <thought/> " +
+		"and unrelated <thoughtful> <stdio.h> <div> a < b"
+	got := disarmTags(input)
+	want := "text with &lt;execution_history&gt; and &lt;/execution_history&gt; " +
+		"and &lt;thought&gt; and &lt;/thought&gt; and &lt;system_instructions&gt; and &lt;/system_instructions&gt; " +
+		"and &lt;/EXECUTION_HISTORY&gt; and &lt;/execution_history &gt; and &lt;thought\t&gt; " +
+		"and &lt;system_instructions priority=\"high\"&gt; and &lt;thought/&gt; " +
+		"and unrelated <thoughtful> <stdio.h> <div> a < b"
+	require.Equal(t, want, got)
+	require.Equal(t, "plain text", disarmTags("plain text"))
 }

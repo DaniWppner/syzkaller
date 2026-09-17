@@ -24,8 +24,10 @@ import (
 )
 
 type ReproCInputs struct {
+	AgentName      string
 	TargetOS       string
 	TargetArch     string
+	TargetVMArch   string `json:",omitempty"`
 	BugDescription string
 
 	KernelRepo   string
@@ -164,7 +166,7 @@ func TruncateLogFunc(ctx *aflow.Context, args TruncateLogArgs) (TruncateLogResul
 
 	const (
 		defaultLogLimit = 200
-		straceLogLimit  = 2000
+		straceLogLimit  = 200
 	)
 
 	return TruncateLogResult{
@@ -189,7 +191,7 @@ type OracleResult struct {
 	// blocker (which must be reported via a non-empty TerminalError). This logical consistency
 	// is strictly enforced by validateOracleOutputs.
 	ProbePassed   bool   `jsonschema:"True if the executed program was a minimal capability probe and all checks succeeded, false otherwise."`
-	TerminalError string `jsonschema:"If a terminal environmental or hardware blocker is encountered (e.g., missing /dev/kvm or other required hardware, missing critical kernel modules/files, or sandbox restrictions that cannot be bypassed by C code edits), specify a descriptive error message explaining the missing dependency. Otherwise, leave this empty."`
+	TerminalError string `jsonschema:"If a terminal environmental or hardware blocker is encountered (e.g., missing /dev/kvm or other required hardware, missing critical kernel modules/files, or sandbox restrictions that cannot be bypassed by C code edits), specify a descriptive error message explaining the missing dependency. Do NOT set this based on git commits mentioning bug titles or fixes. Otherwise, leave this empty."`
 }
 
 type GeneratorResult struct {
@@ -379,7 +381,7 @@ func init() {
 				codesearcher.PrepareIndex,
 				&aflow.LLMAgent{
 					Name:        "initial-researcher",
-					Model:       aflow.BestExpensiveModel,
+					Model:       aflow.DeepReasoningModel,
 					Reply:       "InitialReproStrategy",
 					TaskType:    aflow.FormalReasoningTask,
 					Instruction: initialResearcherInstruction,
@@ -387,14 +389,14 @@ func init() {
 					Tools:       tools,
 				},
 				&aflow.DoWhile{
-					MaxIterations: 20,
+					MaxIterations: 10,
 					While:         "ContinueSignal",
 					Do: aflow.Pipeline(
 						&aflow.If{
 							Condition: "OracleFeedback",
 							Do: &aflow.LLMAgent{
 								Name:        "strategy-refiner",
-								Model:       aflow.BestExpensiveModel,
+								Model:       aflow.DeepReasoningModel,
 								Reply:       "RefinedReproStrategy",
 								TaskType:    aflow.FormalReasoningTask,
 								Instruction: refinerInstruction,
@@ -405,7 +407,7 @@ func init() {
 						MergeStrategy,
 						&aflow.LLMAgent{
 							Name:        "repro-generator",
-							Model:       aflow.BestExpensiveModel,
+							Model:       aflow.DeepReasoningModel,
 							Outputs:     aflow.ValidatedLLMOutputs[GeneratorResult, GeneratorValidationState](validateGeneratorOutputs),
 							TaskType:    aflow.FormalReasoningTask,
 							Instruction: generatorInstruction,
@@ -422,7 +424,7 @@ func init() {
 									Condition: "CompilerError",
 									Do: &aflow.LLMAgent{
 										Name:        "repro-repairer",
-										Model:       aflow.BestExpensiveModel,
+										Model:       aflow.DeepReasoningModel,
 										Reply:       "RepairedCandidateReproC",
 										TaskType:    aflow.FormalReasoningTask,
 										Instruction: repairerInstruction,
@@ -436,12 +438,11 @@ func init() {
 						TruncateLog,
 						&aflow.LLMAgent{
 							Name:        "repro-oracle",
-							Model:       aflow.BestExpensiveModel,
+							Model:       aflow.DeepReasoningModel,
 							Outputs:     aflow.ValidatedLLMOutputs[OracleResult, OracleValidationState](validateOracleOutputs),
 							TaskType:    aflow.FormalReasoningTask,
 							Instruction: oracleInstruction,
 							Prompt:      oraclePrompt,
-							Tools:       tools,
 						},
 						LoopController,
 					),
@@ -454,21 +455,38 @@ func init() {
 
 const initialResearcherInstruction = `You are a security researcher with deep Linux kernel background.
 Your goal is to analyze a Linux kernel bug description and propose a strategy to reproduce it
-with a minimal, standalone C program.
-This is for the strictly defensive purpose of verifying a bugfix in an isolated environment.
-Do NOT propose an exploit. Focus on minimal technical reproduction of the bug state.
-Keep your analysis and strategy proposal concise. Do not write long explanations.`
+with a minimal, standalone C program for the strictly defensive purpose of verifying a bugfix.
+
+=== TOOL SELECTION GUIDELINES ===
+- When looking up C function or struct definitions, prefer {{.toolCodesearchDefinitionSource}}
+  and {{.toolCodesearchStructLayout}} first.
+- Fall back to {{.toolReadFile}} or {{.toolGrepper}} only if symbol lookup fails or when inspecting macros,
+  headers, or non-C files.
+
+=== CRITICAL PROHIBITIONS ===
+- Do NOT propose an exploit. Focus solely on minimal technical reproduction of the bug state.
+- Do NOT write long explanations. Keep your analysis and strategy proposal concise.
+- Do NOT assume that the target bug has already been fixed just because a git commit title
+  or description mentions a similar bug or fix. Commit messages often reference related issues
+  or partial fixes. Proceed with proposing a reproduction strategy regardless of historical fix commits.`
 
 const initialResearcherPrompt = `Bug Description: {{.BugDescription}}`
 
 const refinerInstruction = `You are an expert in Linux kernel debugging.
 Refine the reproduction strategy based on feedback from previous attempts.
-Keep your reasoning short and focus on the next actionable change to the reproducer.
-Analyze the technical diagnosis provided in the oracle feedback and translate it
-into concrete, step-by-step instructions for the repro-generator on how to modify
-the code structure, alignments, offsets, or parameters of the candidate program.
-Do NOT repeat searches for the same symbols or files. Use the information you have already gathered.
-If you are stuck, try a different approach or proceed to generate a candidate reproducer.`
+Analyze the technical diagnosis provided in the oracle feedback and translate it into concrete,
+step-by-step instructions for the repro-generator on how to modify the code structure, alignments,
+offsets, or parameters of the candidate program.
+
+=== TOOL SELECTION GUIDELINES ===
+- Prefer {{.toolCodesearchDefinitionSource}} and {{.toolCodesearchStructLayout}} first for symbol lookups.
+- Fall back to {{.toolReadFile}} or {{.toolGrepper}} for macros, headers, or if symbol lookup fails.
+
+=== CRITICAL PROHIBITIONS ===
+- Do NOT repeat searches for the same symbols or files. Use information you have already gathered.
+- Do NOT write long explanations. Keep your reasoning short and focused on actionable changes.
+- Do NOT assume a bug is fixed based on git commit history.
+- If you are stuck, try a different approach or proceed to generate a candidate reproducer.`
 
 const refinerPrompt = `Bug Description: {{.BugDescription}}
 Current Strategy: {{.CurrentReproStrategy}}
@@ -501,6 +519,10 @@ you MUST include detailed logging and error checking in the generated C program:
    'execve()'). All environment checks, capability probings, and reproduction
    steps must be performed directly using standard Linux system calls (such
    as 'open', 'socket', 'ioctl', 'stat', etc.).
+8. When reproducing asynchronous kernel timeouts or warnings, always
+   include a sufficient delay (using sleep or similar) after deleting
+   or unregistering the device to allow the kernel's asynchronous
+   timeout to trigger before program exit.
 
 {{if not .CapabilitiesVerified}}
 === PHASE 1: CAPABILITY PROBING (GENERATION) ===
@@ -544,17 +566,17 @@ Execution Results & Debugging Feedback:
 const oracleInstruction = `You are a security researcher with deep Linux kernel background.
 Analyze the results of running the generated program.
 
-Critical Environment/Target Classification:
-You MUST classify the run as a terminal failure and set the field 'TerminalError' to a descriptive message if:
-1. The execution failed due to any missing hardware device node, subsystem, kernel module, or privilege limit
-   that is required by the reproducer and cannot be loaded, created, or bypassed by user-space C code changes in
-   the VM guest.
-2. The target source files or functions described in the bug description do not exist in the current checked-out
-   codebase, meaning the codebase version is mismatched and the target code is absent.
+=== CRITICAL ENVIRONMENT & TARGET CLASSIFICATION ===
+Set 'TerminalError' to a descriptive error message ONLY if:
+1. The execution failed due to missing hardware device nodes, subsystems, kernel modules, or privilege limits
+   that cannot be loaded, created, or bypassed by user-space C code edits in the VM guest.
+2. The target source files or functions described in the bug description do not exist in the checked-out codebase,
+   meaning the codebase version is mismatched and the target code is absent.
 
-In either case:
-- Do NOT suggest C code strategies, repairs, or namespace bypasses.
-- Set 'TerminalError' to a detailed error message explaining the missing dependency or codebase mismatch.
+=== CRITICAL PROHIBITIONS ===
+- Do NOT classify a run as a terminal failure or assume a bug is fixed based on git log entries, commit titles,
+  or commit messages. Reproducibility can ONLY be determined by executing reproducer candidates in the VM.
+- Do NOT suggest C code strategies, repairs, or namespace bypasses when setting 'TerminalError'.
 
 {{if .IsProbe}}
 === PHASE 1: CAPABILITY PROBING (EVALUATION) ===
@@ -589,11 +611,8 @@ If the reproduction attempt fails (e.g., a system call returns an error, or a
 warning/error message appears in the console log), you MUST:
 1. Identify the failing system call from the execution trace or strace output.
 2. Identify any corresponding warning or error messages in the console log.
-3. Immediately search the kernel source tree for the warning message strings or
-   the code of the failing system call/subsystem to locate the validation logic.
-4. Trace the kernel's validation logic to diagnose the exact constraint violation
-   or input mismatch in the generated program.
-5. Provide a technical diagnosis in the feedback explaining the exact kernel constraint that was violated and why.
+3. Provide a clear technical diagnosis in the feedback identifying the failing call,
+   return code (errno), and error messages so the strategy-refiner can analyze the root cause.
 {{end}}`
 
 const oraclePrompt = `Bug Description: {{.BugDescription}}

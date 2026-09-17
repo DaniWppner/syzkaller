@@ -80,6 +80,7 @@ config:
  - KVM_SW_PROTECTED_VM: [x86_64, v6.8]
  - KVM_HYPERV: [x86_64, v6.8]
  - KVM_IOAPIC: [x86_64, v6.17]
+ - KVM_SMM: [x86_64, v6.2]
  # KMSAN disables HYPERVISOR_GUEST which is required to enable X86_X2APIC
  # which is required to enable this.
  - X86_SGX: [x86_64, v5.11, -kmsan]
@@ -449,12 +450,14 @@ config:
  # The only reason to enable it is IOMMUFD_TEST, which really shouldn't
  # depend on RUNTIME_TESTING_MENU since it only adds debug checks.
  - RUNTIME_TESTING_MENU: [v6.9]
- - ANDROID_BINDER_IPC
+ # ANDROID_BINDER_IPC conflicts with ANDROID_BINDER_IPC_RUST.
+ - ANDROID_BINDER_IPC: [-rust]
+ - ANDROID_BINDER_IPC_RUST: [v6.18, rust]
  # Create binder device per test process for isolation.
  # Earlier we defined here 32 devices and syzkaller allocated one per test process.
  # When binderfs is used, we don't need that many - 2 is enough.
  - ANDROID_BINDER_DEVICES: "binder0,binder1"
- - ANDROID_BINDERFS
+ - ANDROID_BINDERFS: [-rust]
  - COUNTER
  - VALIDATE_FS_PARSER
  - PSTORE

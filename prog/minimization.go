@@ -358,20 +358,76 @@ func (typ *PtrType) minimize(ctx *minimizeArgsCtx, arg Arg, path string) bool {
 
 func (typ *ArrayType) minimize(ctx *minimizeArgsCtx, arg Arg, path string) bool {
 	a := arg.(*GroupArg)
+	if typ.minimizeAll(ctx, a, path) {
+		return true
+	}
+	if typ.minimizeChunks(ctx, a, path) {
+		return true
+	}
+	return typ.minimizeElements(ctx, a, path)
+}
+
+func (typ *ArrayType) minimizeAll(ctx *minimizeArgsCtx, a *GroupArg, path string) bool {
 	// If there are at least 3 elements, try to remove all at once first.
-	// If will be faster than removing them one-by-one if all of them are not needed.
-	if allPath := path + "-all"; len(a.Inner) >= 3 && typ.RangeBegin == 0 && !ctx.triedPaths[allPath] {
-		ctx.triedPaths[allPath] = true
-		for _, elem := range a.Inner {
+	// It will be faster than removing them one-by-one if all of them are not needed.
+	allPath := path + "-all"
+	if len(a.Inner) < 3 || typ.RangeBegin != 0 || ctx.triedPaths[allPath] {
+		return false
+	}
+	ctx.triedPaths[allPath] = true
+	for _, elem := range a.Inner {
+		removeArg(elem)
+	}
+	a.Inner = nil
+	ctx.target.assignSizesCall(ctx.call)
+	if ctx.pred(ctx.p, ctx.callIndex0, statMinArray, allPath) {
+		*ctx.p0 = ctx.p
+	}
+	return true
+}
+
+const (
+	// minArrayChunkReduction is the minimum number of excess elements required to run chunk reduction.
+	minArrayChunkReduction = 10
+	// minArrayChunkStep is the minimum step size for chunk reduction; smaller steps are left
+	// to the fine-grained one-by-one element removal loop below.
+	minArrayChunkStep = 4
+)
+
+func (typ *ArrayType) minimizeChunks(ctx *minimizeArgsCtx, a *GroupArg, path string) bool {
+	// For arrays with at least minArrayChunkReduction excess elements over the minimum length,
+	// try logarithmic step-halving chunk reduction from the tail first. We track reduction step
+	// sizes in ctx.triedPaths so each step size is attempted at most once across restarts.
+	minLen := int(typ.RangeBegin)
+	if len(a.Inner)-minLen < minArrayChunkReduction {
+		return false
+	}
+	step := 1
+	for step*2 <= len(a.Inner)-minLen {
+		step *= 2
+	}
+	for ; len(a.Inner)-step >= minLen && step >= minArrayChunkStep; step /= 2 {
+		stepPath := fmt.Sprintf("%v-step-%v", path, step)
+		if ctx.triedPaths[stepPath] {
+			continue
+		}
+		ctx.triedPaths[stepPath] = true
+		removed := a.Inner[len(a.Inner)-step:]
+		a.Inner = a.Inner[:len(a.Inner)-step]
+		for _, elem := range removed {
 			removeArg(elem)
 		}
-		a.Inner = nil
+		clear(removed)
 		ctx.target.assignSizesCall(ctx.call)
-		if ctx.pred(ctx.p, ctx.callIndex0, statMinArray, allPath) {
+		if ctx.pred(ctx.p, ctx.callIndex0, statMinArray, stepPath) {
 			*ctx.p0 = ctx.p
 		}
 		return true
 	}
+	return false
+}
+
+func (typ *ArrayType) minimizeElements(ctx *minimizeArgsCtx, a *GroupArg, path string) bool {
 	// Try to remove individual elements one-by-one.
 	for i, elem := range slices.Backward(a.Inner) {
 		elemPath := fmt.Sprintf("%v-%v", path, i)
@@ -501,7 +557,7 @@ func (typ *BufferType) minimize(ctx *minimizeArgsCtx, arg Arg, path string) bool
 		if ctx.mode == MinimizeCorpus {
 			return false
 		}
-		// Try to undo target.SpecialFileLenghts mutation
+		// Try to undo target.SpecialFileLengths mutation
 		// and reduce file name length.
 		if !typ.Varlen() {
 			return false

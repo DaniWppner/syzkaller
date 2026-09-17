@@ -807,6 +807,19 @@ func (dash *Dashboard) UploadManagerStats(req *ManagerStatsReq) error {
 	return dash.Query("manager_stats", req, nil)
 }
 
+type ClientInfoReq struct {
+}
+
+type ClientInfoResp struct {
+	Namespace string
+}
+
+func (dash *Dashboard) ClientInfo() (*ClientInfoResp, error) {
+	resp := new(ClientInfoResp)
+	err := dash.Query("client_info", nil, resp)
+	return resp, err
+}
+
 // NewAsset describes a build asset (e.g., kernel or disk image) uploaded to cloud storage.
 //
 // Asset lifetime:
@@ -917,8 +930,10 @@ type (
 	BugStatus       int
 	BugStatusReason string
 	BugNotif        int
-	ReproLevel      int
-	ReportType      int
+	// ReproLevel represents reproduction level.
+	// This type is kept for backward-compatible external reporting APIs.
+	ReproLevel int
+	ReportType int
 )
 
 const (
@@ -950,11 +965,22 @@ const (
 	BugNotifLabel
 )
 
+// ReproLevel represents the reproduction level of a bug, used primarily in reporting APIs.
 const (
 	ReproLevelNone ReproLevel = iota
 	ReproLevelSyz
 	ReproLevelC
 )
+
+func ReproLevelFromCAndSyz(hasC, hasSyz bool) ReproLevel {
+	if hasC {
+		return ReproLevelC
+	}
+	if hasSyz {
+		return ReproLevelSyz
+	}
+	return ReproLevelNone
+}
 
 const (
 	ReportNew         ReportType = iota // First report for this bug in the reporting stage.

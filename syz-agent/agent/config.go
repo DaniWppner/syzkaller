@@ -24,6 +24,7 @@ const (
 var supportedBackends = []string{backendGemini, backendVertex}
 
 type TargetConfig struct {
+	Target       string          `json:"target"`
 	KernelConfig string          `json:"kernel_config"`
 	Image        string          `json:"image"`
 	Type         string          `json:"type"`
@@ -55,6 +56,7 @@ type Config struct {
 	DefaultBackend string `json:"default_backend"`
 	GeminiAPIKey   string `json:"gemini_api_key"`
 	CloudProject   string `json:"-"`
+	SafetyFilters  bool   `json:"safety_filters"`
 }
 
 func loadConfig(configFile string) (*Config, error) {
@@ -64,6 +66,7 @@ func loadConfig(configFile string) (*Config, error) {
 		CacheSize:       1 << 40, // 1TB
 		GeminiAPIKey:    "env:GOOGLE_API_KEY",
 		DefaultBackend:  backendGemini,
+		SafetyFilters:   true,
 	}
 	if err := config.LoadFile(configFile, cfg); err != nil {
 		return nil, fmt.Errorf("failed to load config: %w", err)
@@ -73,9 +76,13 @@ func loadConfig(configFile string) (*Config, error) {
 		return nil, fmt.Errorf("at least one target must be specified in config")
 	}
 	for target, tcfg := range cfg.Targets {
-		osVal, vmarch, arch, _, _, err := mgrconfig.SplitTarget(target)
+		targetStr := target
+		if tcfg.Target != "" {
+			targetStr = tcfg.Target
+		}
+		osVal, vmarch, arch, _, _, err := mgrconfig.SplitTarget(targetStr)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse agent target %q: %w", target, err)
+			return nil, fmt.Errorf("failed to parse agent target %q: %w", targetStr, err)
 		}
 		tcfg.TargetOS = osVal
 		tcfg.TargetArch = arch

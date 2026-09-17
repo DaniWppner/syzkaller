@@ -49,6 +49,16 @@ type FocusArea struct {
 	Weight   float64
 }
 
+func (fa *FocusArea) inAreaPCs(cover []uint64) int {
+	var count int
+	for _, pc := range cover {
+		if _, ok := fa.CoverPCs[pc]; ok {
+			count++
+		}
+	}
+	return count
+}
+
 func NewCorpus(ctx context.Context) *Corpus {
 	return NewMonitoredCorpus(ctx, nil)
 }
@@ -72,7 +82,7 @@ func NewFocusedCorpus(ctx context.Context, updates chan<- NewItemEvent, areas []
 		stat.Link("/cover"), stat.Prometheus("syz_corpus_cover"), stat.LenOf(&corpus.cover, &corpus.mu))
 	for _, area := range areas {
 		obj := &ProgramsList{}
-		if len(areas) > 1 && area.Name != "" {
+		if len(areas) > 1 && area.Name != "" && len(area.CoverPCs) > 0 {
 			// Only show extra statistics if there's more than one area.
 			stat.New("corpus ["+area.Name+"]",
 				fmt.Sprintf("Corpus programs of the focus area %q", area.Name),
@@ -172,7 +182,7 @@ func (corpus *Corpus) Save(inp NewInput) {
 			newItem.Updates = append(newItem.Updates, update)
 		}
 		corpus.progsMap[sig] = newItem
-		corpus.applyFocusAreas(newItem, inp.Cover)
+		corpus.applyFocusAreas(newItem)
 	} else {
 		item := &Item{
 			Sig:              sig,
@@ -186,8 +196,8 @@ func (corpus *Corpus) Save(inp NewInput) {
 			Updates:          []ItemUpdate{update},
 		}
 		corpus.progsMap[sig] = item
-		corpus.applyFocusAreas(item, inp.Cover)
-		corpus.saveProgram(inp.Prog, inp.Signal)
+		corpus.applyFocusAreas(item)
+		corpus.saveProgram(inp.Prog, len(inp.Signal))
 	}
 	corpus.signal.Merge(inp.Signal)
 	newCover := corpus.cover.MergeDiff(inp.Cover)
@@ -205,23 +215,20 @@ func (corpus *Corpus) Save(inp NewInput) {
 	}
 }
 
-func (corpus *Corpus) applyFocusAreas(item *Item, coverDelta []uint64) {
+func (corpus *Corpus) applyFocusAreas(item *Item) {
 	for _, area := range corpus.focusAreas {
-		matches := false
-		for _, pc := range coverDelta {
-			if _, ok := area.CoverPCs[pc]; ok {
-				matches = true
-				break
-			}
-		}
-		if !matches {
+		if _, ok := item.areas[area]; ok {
 			continue
 		}
-		area.saveProgram(item.Prog, item.Signal)
+		prio := area.inAreaPCs(item.Cover)
+		if prio == 0 {
+			continue
+		}
+		area.saveProgram(item.Prog, prio)
 		if item.areas == nil {
 			item.areas = make(map[*focusAreaState]struct{})
-			item.areas[area] = struct{}{}
 		}
+		item.areas[area] = struct{}{}
 	}
 }
 
@@ -279,5 +286,7 @@ func (corpus *Corpus) ProgsPerArea() map[string]int {
 }
 
 func (corpus *Corpus) Cover() []uint64 {
+	corpus.mu.RLock()
+	defer corpus.mu.RUnlock()
 	return corpus.cover.Serialize()
 }

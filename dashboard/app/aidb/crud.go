@@ -406,6 +406,45 @@ func LoadBugJobs(ctx context.Context, bugID string) ([]*Job, error) {
 	})
 }
 
+func LoadFinishedReproCJobs(ctx context.Context, since time.Time) ([]*Job, error) {
+	return selectAll[Job](ctx, spanner.Statement{
+		SQL: selectJobs() + `WHERE Workflow = 'repro-c'
+	AND Finished >= @since
+	AND Error = ''
+	AND BugID IS NOT NULL
+	AND BugID != ''
+	ORDER BY Created DESC
+	LIMIT 100`,
+		Params: map[string]any{
+			"since": since,
+		},
+	})
+}
+
+// CountJobsSince returns the number of jobs of the specified workflow type
+// created on or after since in the given namespace.
+func CountJobsSince(ctx context.Context, ns string, typ ai.WorkflowType, since time.Time) (int64, error) {
+	type countResult struct {
+		Count int64
+	}
+	res, err := selectOne[countResult](ctx, spanner.Statement{
+		SQL: `SELECT COUNT(1) AS Count
+		FROM Jobs
+		WHERE Namespace = @ns
+		  AND Type = @type
+		  AND Created >= @since`,
+		Params: map[string]any{
+			"ns":    ns,
+			"type":  string(typ),
+			"since": since,
+		},
+	})
+	if err != nil {
+		return 0, err
+	}
+	return res.Count, nil
+}
+
 func LoadBugIDsWithPendingPatch(ctx context.Context, ns string, workflows []ai.WorkflowType) ([]string, error) {
 	if len(workflows) == 0 {
 		return nil, nil
@@ -958,8 +997,9 @@ func LoadJobCommentsByReporting(ctx context.Context, reportingID string) ([]*Job
 }
 
 type PendingCommentGroup struct {
-	ReportingID   string
-	LatestComment time.Time
+	ReportingID     string
+	LatestComment   time.Time
+	ReplyToComments bool
 }
 
 func LoadPendingCommentGroups(ctx context.Context, namespace, stage string) ([]*PendingCommentGroup, error) {
@@ -982,7 +1022,7 @@ func LoadJobReporting(ctx context.Context, id string) (*JobReporting, error) {
 	})
 }
 
-func CreatePatchIterationJob(ctx context.Context, reportingID string) (*Job, error) {
+func CreatePatchIterationJob(ctx context.Context, reportingID string, replyToComments bool) (*Job, error) {
 	client, err := dbClient(ctx)
 	if err != nil {
 		return nil, err
@@ -1062,6 +1102,7 @@ func CreatePatchIterationJob(ctx context.Context, reportingID string) (*Job, err
 
 		extractBaseCommitArgs(parentJob, argsMap)
 		argsMap["TargetCommentIDs"] = commentIDs
+		argsMap["ReplyToComments"] = replyToComments
 
 		job = &Job{
 			ID:                uuid.NewString(),
@@ -1219,8 +1260,11 @@ func markCommentsProcessedTx(txn *spanner.ReadWriteTransaction, ids []string) er
 	return txn.BufferWrite(mutations)
 }
 
+// IterationJobDone finalizes an iteration job and creates a new reporting row if needed.
+// TODO: We pass isReplyAllowed callback to avoid a circular package dependency between aidb and package main.
 func IterationJobDone(ctx context.Context, jobID string, commentIDs []string,
-	parentReportingID string, hasPatch, hasReplies bool) error {
+	parentReportingID string, hasPatch, hasReplies bool,
+	isReplyAllowed func(ns, stage string) bool) error {
 	client, err := dbClient(ctx)
 	if err != nil {
 		return err
@@ -1277,8 +1321,13 @@ func IterationJobDone(ctx context.Context, jobID string, commentIDs []string,
 			return err
 		}
 
-		// If the job didn't generate a patch or replies, we don't need to report it externally.
-		if !hasPatch && !hasReplies {
+		// If the job didn't generate a patch or replies (or replying is disabled for this stage),
+		// we don't need to report it externally.
+		replyAllowed := true
+		if isReplyAllowed != nil {
+			replyAllowed = isReplyAllowed(parentJob.Namespace, parentRep.Stage)
+		}
+		if !hasPatch && (!hasReplies || !replyAllowed) {
 			return nil
 		}
 
@@ -1521,6 +1570,9 @@ func extractBaseCommitArgs(job *Job, argsMap map[string]any) {
 		}
 		if tags, ok := m["ReportedBy"].([]any); ok && tags != nil {
 			argsMap["BaseReportedBy"] = tags
+		}
+		if tags, ok := m["SuggestedBy"].([]any); ok && tags != nil {
+			argsMap["BaseSuggestedBy"] = tags
 		}
 	}
 }
