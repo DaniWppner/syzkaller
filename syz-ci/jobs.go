@@ -354,8 +354,7 @@ func (jp *JobProcessor) process(job *Job) *dashapi.JobDoneReq {
 	req, mgr := job.req, job.mgr
 
 	dir := filepath.Join(jp.baseDir, mgr.managercfg.TargetOS)
-	mgrcfg := new(mgrconfig.Config)
-	*mgrcfg = *mgr.managercfg
+	mgrcfg := mgr.jobConfig()
 	mgrcfg.Workdir = filepath.Join(dir, "workdir")
 	repoDir := filepath.Join(dir, "kernel")
 	mgrcfg.KernelSrc = filepath.Join(repoDir, mgr.mgrcfg.KernelSrcSuffix)
@@ -376,7 +375,7 @@ func (jp *JobProcessor) process(job *Job) *dashapi.JobDoneReq {
 	}
 	job.resp = resp
 	if err := jp.initJobRepo(mgr, repoDir); err != nil {
-		jp.Errorf("failed to init job repo: %v", err)
+		jp.Errorf("failed to init job repo: %v", osutil.VerboseMessage(err))
 		job.resp.Error = []byte(err.Error())
 		return job.resp
 	}
@@ -598,24 +597,41 @@ func (jp *JobProcessor) ignoreBisectCommit(commit *vcs.Commit) bool {
 
 func (jp *JobProcessor) testPatch(job *Job, mgrcfg *mgrconfig.Config) error {
 	req, resp, mgr := job.req, job.resp, job.mgr
+	trace := new(bytes.Buffer)
+	dt := &debugtracer.GenericTracer{
+		TraceWriter: io.MultiWriter(trace, log.VerboseWriter(1)),
+		WithTime:    true,
+	}
+	defer func() {
+		resp.Log = trace.Bytes()
+	}()
+
 	env, err := instance.NewEnv(mgrcfg, buildSem, testSem)
 	if err != nil {
+		dt.Logf("failed to create environment: %v", osutil.VerboseMessage(err))
 		return err
 	}
-	jp.Logf(0, "building syzkaller on %v...", req.SyzkallerCommit)
+	dt.Logf("building syzkaller on %v...", req.SyzkallerCommit)
 	syzBuildLog, syzBuildErr := env.BuildSyzkaller(jp.cfg.SyzkallerRepo, req.SyzkallerCommit)
 	if syzBuildErr != nil {
+		dt.Logf("building syzkaller failed: %v", osutil.VerboseMessage(syzBuildErr))
+		if syzBuildLog != "" {
+			dt.Logf("syzkaller build log:\n%s", syzBuildLog)
+		}
 		return syzBuildErr
 	}
-	jp.Logf(0, "fetching kernel...")
+	dt.Logf("fetching kernel...")
 	repo, err := vcs.NewRepo(mgrcfg.TargetOS, mgrcfg.Type, mgrcfg.KernelSrc)
 	if err != nil {
+		dt.Logf("failed to create kernel repo: %v", osutil.VerboseMessage(err))
 		return fmt.Errorf("failed to create kernel repo: %w", err)
 	}
 	kernelCommit, err := jp.checkoutJobCommit(job, repo)
 	if err != nil {
+		dt.Logf("failed to checkout kernel: %v", osutil.VerboseMessage(err))
 		return err
 	}
+	dt.Logf("checked out kernel commit %v (%q, %v)", kernelCommit.Hash, kernelCommit.Title, kernelCommit.CommitDate)
 	resp.Build.KernelCommit = kernelCommit.Hash
 	resp.Build.KernelCommitTitle = kernelCommit.Title
 	resp.Build.KernelCommitDate = kernelCommit.CommitDate
@@ -630,11 +646,15 @@ func (jp *JobProcessor) testPatch(job *Job, mgrcfg *mgrconfig.Config) error {
 		SysctlFile:   mgr.mgrcfg.KernelSysctl,
 		KernelConfig: req.KernelConfig,
 	}
+	dt.Logf("cleaning kernel...")
 	if err := env.CleanKernel(buildCfg); err != nil {
+		dt.Logf("kernel clean failed: %v", osutil.VerboseMessage(err))
 		return fmt.Errorf("kernel clean failed: %w", err)
 	}
 	if len(req.Patch) != 0 {
+		dt.Logf("applying patch (%d bytes)...", len(req.Patch))
 		if err := vcs.Patch(mgrcfg.KernelSrc, req.Patch); err != nil {
+			dt.Logf("failed to apply patch: %v", osutil.VerboseMessage(err))
 			return err
 		}
 	}
@@ -650,32 +670,40 @@ func (jp *JobProcessor) testPatch(job *Job, mgrcfg *mgrconfig.Config) error {
 		[]byte("CONFIG_DEBUG_INFO_BTF=y"),
 		[]byte("# CONFIG_DEBUG_INFO_BTF is not set"))
 
-	log.Logf(0, "job: building kernel...")
+	dt.Logf("building kernel...")
 	kernelConfig, details, err := env.BuildKernel(buildCfg)
 	resp.Build.CompilerID = details.CompilerID
 	if err != nil {
+		dt.Logf("kernel build failed: %v", osutil.VerboseMessage(err))
 		return err
 	}
+	dt.Logf("kernel built successfully with compiler %v", details.CompilerID)
 	if kernelConfig != "" {
 		resp.Build.KernelConfig, err = os.ReadFile(kernelConfig)
 		if err != nil {
+			dt.Logf("failed to read config file: %v", osutil.VerboseMessage(err))
 			return fmt.Errorf("failed to read config file: %w", err)
 		}
 	}
-	jp.Logf(0, "job: testing...")
+	dt.Logf("testing patch...")
 	results, err := env.Test(3, req.ReproSyz, req.ReproOpts, req.ReproC, false)
 	if err != nil {
+		dt.Logf("testing failed: %v", osutil.VerboseMessage(err))
 		return fmt.Errorf("%w\n\nsyzkaller build log:\n%s", err, syzBuildLog)
 	}
 	ret, err := aggregateTestResults(results)
 	if err != nil {
+		dt.Logf("aggregating test results failed: %v", osutil.VerboseMessage(err))
 		return fmt.Errorf("%w\n\nsyzkaller build log:\n%s", err, syzBuildLog)
 	}
 	rep := ret.report
 	if rep != nil {
+		dt.Logf("reproduced crash: %v", rep.Title)
 		resp.CrashTitle = rep.Title
 		resp.CrashAltTitles = rep.AltTitles
 		resp.CrashReport = rep.Report
+	} else {
+		dt.Logf("testing succeeded, no crash reproduced")
 	}
 	resp.CrashLog = ret.rawOutput
 	return nil
@@ -686,16 +714,22 @@ func (jp *JobProcessor) initJobRepo(mgr *Manager, repoDir string) error {
 		return fmt.Errorf("failed to remove job repo dir: %w", err)
 	}
 	if osutil.IsExist(mgr.kernelBuildDir) {
+		if err := osutil.MkdirAll(repoDir); err != nil {
+			return fmt.Errorf("failed to create job repo dir: %w", err)
+		}
+		if err := osutil.SandboxChown(repoDir); err != nil {
+			return fmt.Errorf("failed to chown job repo dir: %w", err)
+		}
 		jp.Logf(0, "cloning job repo from %v using reference", mgr.kernelBuildDir)
 		cmd := exec.Command("git", "clone", "--reference", mgr.kernelBuildDir, mgr.kernelBuildDir, repoDir)
 		if err := osutil.Sandbox(cmd, true, false); err != nil {
 			return fmt.Errorf("failed to sandbox clone: %w", err)
 		}
-		output, err := osutil.Run(time.Hour, cmd)
+		_, err := osutil.Run(time.Hour, cmd)
 		if err == nil {
 			return nil
 		}
-		jp.Logf(0, "failed to clone with reference from %v: %v\n%s", mgr.kernelBuildDir, err, output)
+		jp.Logf(0, "failed to clone with reference from %v: %v", mgr.kernelBuildDir, osutil.VerboseMessage(err))
 		os.RemoveAll(repoDir)
 	}
 	jp.Logf(0, "job repo will be fetched from scratch")

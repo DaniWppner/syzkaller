@@ -87,7 +87,9 @@ func TestAggregateTestResults(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			args := ReproduceArgs{
-				TargetArch: "amd64",
+				TargetConfig: TargetConfig{
+					TargetArch: "amd64",
+				},
 			}
 			res, err := aggregateTestResults(tc.results, crashReporter, args)
 			require.NoError(t, err)
@@ -138,7 +140,7 @@ func TestSymbolize(t *testing.T) {
 		return mock
 	}
 
-	args := ReproduceArgs{
+	args := TargetConfig{
 		TargetArch: "amd64",
 		Type:       "qemu",
 	}

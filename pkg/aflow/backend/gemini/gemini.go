@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/google/syzkaller/pkg/aflow/backend"
+	"github.com/google/syzkaller/pkg/log"
 	"google.golang.org/genai"
 )
 
@@ -26,19 +27,22 @@ type Provider struct {
 	models          map[string]*modelInfo
 	modelPathPrefix string
 	modelOverride   string
+	noSafetyFilters bool
 	err             error
 }
 
 type modelInfo struct {
 	Thinking         bool
+	MinThinkingLevel backend.ThinkingLevel
 	MaxTemperature   float32
 	InputTokenLimit  int
 	OutputTokenLimit int
 }
 
 type Config struct {
-	ModelOverride string
-	ClientConfig  *genai.ClientConfig
+	ModelOverride   string
+	ClientConfig    *genai.ClientConfig
+	NoSafetyFilters bool
 }
 
 func NewProvider(ctx context.Context, cfg Config) (*Provider, error) {
@@ -58,70 +62,52 @@ func (p *Provider) init(ctx context.Context, cfg Config) error {
 		return p.err
 	}
 
+	p.noSafetyFilters = cfg.NoSafetyFilters
+
+	p.models = map[string]*modelInfo{
+		"gemini-3.8-flash": {
+			Thinking: true,
+			// Gemini 3.8 Flash does not support MINIMAL thinking.
+			MinThinkingLevel: backend.ThinkingLevelLow,
+			MaxTemperature:   2.0,
+			InputTokenLimit:  1048576,
+			OutputTokenLimit: 65536,
+		},
+		"gemini-3.7-flash": {
+			Thinking: true,
+			// Gemini 3.7 Flash does not support MINIMAL thinking.
+			MinThinkingLevel: backend.ThinkingLevelLow,
+			MaxTemperature:   2.0,
+			InputTokenLimit:  1048576,
+			OutputTokenLimit: 65536,
+		},
+		"gemini-3.6-flash": {
+			Thinking:         true,
+			MaxTemperature:   2.0,
+			InputTokenLimit:  1048576,
+			OutputTokenLimit: 65536,
+		},
+		"gemini-3.1-pro-preview": {
+			Thinking:         true,
+			MaxTemperature:   2.0,
+			InputTokenLimit:  1048576,
+			OutputTokenLimit: 65536,
+		},
+	}
+	if cfg.ClientConfig != nil && cfg.ClientConfig.Backend == genai.BackendVertexAI {
+		// Vertex AI backend expects the bare model name, not prefixed with "models/".
+		// E.g. "gemini-1.5-pro" instead of "models/gemini-1.5-pro".
+		p.modelPathPrefix = ""
+	} else {
+		p.modelPathPrefix = "models/"
+	}
+
 	client, err := genai.NewClient(ctx, cfg.ClientConfig)
 	if err != nil {
 		p.err = err
 		return err
 	}
 	p.client = client
-
-	isVertex := cfg.ClientConfig != nil && cfg.ClientConfig.Backend == genai.BackendVertexAI
-
-	if isVertex {
-		// Vertex AI's Models.All() endpoint often does not return the same detailed
-		// metadata (like InputTokenLimit or SupportedActions) as the Gemini Developer API,
-		// or requires special IAM permissions to list the catalog. Therefore, we hardcode
-		// the known capabilities for the models we actively use.
-		// Vertex AI backend expects the bare model name, not prefixed with "models/".
-		// E.g. "gemini-1.5-pro" instead of "models/gemini-1.5-pro".
-		p.models = map[string]*modelInfo{
-			"gemini-3-flash-preview": {
-				Thinking:         true,
-				MaxTemperature:   2.0,
-				InputTokenLimit:  1048576,
-				OutputTokenLimit: 65536,
-			},
-			"gemini-3.5-flash": {
-				Thinking:         true,
-				MaxTemperature:   2.0,
-				InputTokenLimit:  1048576,
-				OutputTokenLimit: 65536,
-			},
-			"gemini-3.1-pro-preview": {
-				Thinking:         true,
-				MaxTemperature:   2.0,
-				InputTokenLimit:  1048576,
-				OutputTokenLimit: 65536,
-			},
-		}
-		p.modelPathPrefix = ""
-		return nil
-	}
-
-	// Gemini API. Unlike Vertex AI, the Gemini Developer API catalog endpoint (Models.All)
-	// successfully returns detailed metadata for all models (such as their InputTokenLimit,
-	// OutputTokenLimit, and SupportedActions) without requiring any special IAM configurations.
-	// Therefore, we query the catalog dynamically here.
-	models := make(map[string]*modelInfo)
-	for m, err := range client.Models.All(ctx) {
-		if err != nil {
-			p.err = err
-			return err
-		}
-		if !slices.Contains(m.SupportedActions, "generateContent") ||
-			strings.Contains(m.Name, "-image") ||
-			strings.Contains(m.Name, "-audio") {
-			continue
-		}
-		models[strings.TrimPrefix(m.Name, "models/")] = &modelInfo{
-			Thinking:         m.Thinking,
-			MaxTemperature:   m.MaxTemperature,
-			InputTokenLimit:  int(m.InputTokenLimit),
-			OutputTokenLimit: int(m.OutputTokenLimit),
-		}
-	}
-	p.models = models
-	p.modelPathPrefix = "models/"
 	return nil
 }
 
@@ -140,10 +126,12 @@ func (p *Provider) ResolveModels(category backend.ModelCategory) []string {
 		return []string{p.modelOverride}
 	}
 	switch category {
-	case backend.BestExpensiveModel:
+	case backend.DeepReasoningModel:
 		return []string{"gemini-3.1-pro-preview"}
-	case backend.GoodBalancedModel:
-		return []string{"gemini-3-flash-preview", "gemini-3.5-flash"}
+	case backend.CoreModel:
+		return []string{"gemini-3.8-flash"}
+	case backend.LightweightModel:
+		return []string{"gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash"}
 	default:
 		return nil
 	}
@@ -189,10 +177,11 @@ func (c *client) GenerateContent(ctx context.Context, model string, cfg *backend
 				genaiCfg.Tools = append(genaiCfg.Tools, genaiTool)
 			}
 		}
-		if info.Thinking && cfg.ThinkingLevel != backend.ThinkingLevelMinimal {
+		thinkingLevel := max(cfg.ThinkingLevel, info.MinThinkingLevel)
+		if info.Thinking && thinkingLevel != backend.ThinkingLevelMinimal {
 			genaiCfg.ThinkingConfig = &genai.ThinkingConfig{}
 			genaiCfg.ThinkingConfig.IncludeThoughts = cfg.IncludeThoughts
-			switch cfg.ThinkingLevel {
+			switch thinkingLevel {
 			case backend.ThinkingLevelLow:
 				genaiCfg.ThinkingConfig.ThinkingLevel = genai.ThinkingLevelLow
 			case backend.ThinkingLevelMedium:
@@ -201,6 +190,10 @@ func (c *client) GenerateContent(ctx context.Context, model string, cfg *backend
 				genaiCfg.ThinkingConfig.ThinkingLevel = genai.ThinkingLevelHigh
 			}
 		}
+	}
+
+	if c.p.noSafetyFilters {
+		genaiCfg.SafetySettings = noSafetySettings
 	}
 
 	var req []*genai.Content
@@ -231,7 +224,7 @@ func (c *client) GenerateContent(ctx context.Context, model string, cfg *backend
 	return fromGenaiResponse(resp), nil
 }
 
-var rePleaseRetry = regexp.MustCompile(`Please retry in (\d+)s\.`)
+var rePleaseRetry = regexp.MustCompile(`Please retry in (\d+)[.s]`)
 
 func parseLLMError(err error, model string) error {
 	var apiErr genai.APIError
@@ -278,19 +271,31 @@ func parseLLMError(err error, model string) error {
 func parseLLMResp(resp *genai.GenerateContentResponse) error {
 	if len(resp.Candidates) == 0 || resp.Candidates[0] == nil {
 		if resp.PromptFeedback != nil {
-			return fmt.Errorf("request blocked: %v", resp.PromptFeedback.BlockReasonMessage)
+			reason := resp.PromptFeedback.BlockReasonMessage
+			if reason == "" {
+				reason = string(resp.PromptFeedback.BlockReason)
+			}
+			return fmt.Errorf("request blocked: %v", reason)
 		}
 		return fmt.Errorf("empty model response")
 	}
 	candidate := resp.Candidates[0]
-	if candidate.Content == nil || len(candidate.Content.Parts) == 0 {
-		if candidate.FinishReason == genai.FinishReasonMalformedFunctionCall {
+	if candidate.FinishReason == genai.FinishReasonMaxTokens {
+		return &backend.OutputTokenOverflowError{Err: errors.New(string(candidate.FinishReason))}
+	}
+	hasOutput := candidate.Content != nil && slices.ContainsFunc(candidate.Content.Parts, func(p *genai.Part) bool {
+		return p != nil && !p.Thought
+	})
+	if !hasOutput {
+		if candidate.FinishReason == genai.FinishReasonMalformedFunctionCall ||
+			candidate.FinishReason == genai.FinishReasonStop ||
+			candidate.FinishReason == genai.FinishReasonRecitation {
 			// Let's consider this as a temp error, and that the next time it won't
 			// generate the same buggy output. In either case we have maxLLMRetryIters.
 			return &backend.RetryError{Delay: 0, IsExponential: false, Err: errors.New(string(candidate.FinishReason))}
 		}
-		if candidate.FinishReason == genai.FinishReasonMaxTokens {
-			return &backend.OutputTokenOverflowError{Err: errors.New(string(candidate.FinishReason))}
+		if candidate.FinishMessage == "" {
+			return errors.New(string(candidate.FinishReason))
 		}
 		return fmt.Errorf("%v (%v)", candidate.FinishMessage, candidate.FinishReason)
 	}
@@ -300,6 +305,9 @@ func parseLLMResp(resp *genai.GenerateContentResponse) error {
 		return fmt.Errorf("unexpected reply fields (%+v)", *candidate)
 	}
 	for _, part := range candidate.Content.Parts {
+		if part == nil {
+			return fmt.Errorf("unexpected nil reply part")
+		}
 		if part.VideoMetadata != nil || part.InlineData != nil ||
 			part.FileData != nil || part.FunctionResponse != nil ||
 			part.CodeExecutionResult != nil || part.ExecutableCode != nil {
@@ -309,19 +317,25 @@ func parseLLMResp(resp *genai.GenerateContentResponse) error {
 	return nil
 }
 
+const skipThoughtSignatureValidator = "skip_thought_signature_validator"
+
 func toGenaiContent(msg *backend.Message) *genai.Content {
 	c := &genai.Content{
 		Role: string(msg.Role),
 	}
 	for _, p := range msg.Parts {
 		if p.FunctionCall != nil {
+			sig := p.ThoughtSignature
+			if len(sig) == 0 {
+				sig = []byte(skipThoughtSignatureValidator)
+			}
 			c.Parts = append(c.Parts, &genai.Part{
 				FunctionCall: &genai.FunctionCall{
 					ID:   p.FunctionCall.ID,
 					Name: p.FunctionCall.Name,
 					Args: p.FunctionCall.Args,
 				},
-				ThoughtSignature: p.ThoughtSignature,
+				ThoughtSignature: sig,
 			})
 		} else if p.FunctionResponse != nil {
 			c.Parts = append(c.Parts, &genai.Part{
@@ -332,7 +346,20 @@ func toGenaiContent(msg *backend.Message) *genai.Content {
 				},
 			})
 		} else {
-			c.Parts = append(c.Parts, &genai.Part{Text: p.Text, Thought: p.Thought, ThoughtSignature: p.ThoughtSignature})
+			if p.Text == "" && !p.Thought && len(p.ThoughtSignature) == 0 {
+				log.Logf(2, "aflow/gemini: skipping empty text part without thought metadata")
+				continue
+			}
+			text := p.Text
+			if text == "" {
+				log.Logf(2, "aflow/gemini: replacing empty text part with fallback to initialize proto oneof field")
+				text = "<no text generated>"
+			}
+			c.Parts = append(c.Parts, &genai.Part{
+				Text:             text,
+				Thought:          p.Thought,
+				ThoughtSignature: p.ThoughtSignature,
+			})
 		}
 	}
 	return c
@@ -369,4 +396,8 @@ func fromGenaiResponse(resp *genai.GenerateContentResponse) *backend.GenerateRes
 		}
 	}
 	return res
+}
+
+var noSafetySettings = []*genai.SafetySetting{
+	{Category: genai.HarmCategoryDangerousContent, Threshold: genai.HarmBlockThresholdBlockNone},
 }

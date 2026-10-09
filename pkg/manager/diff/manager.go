@@ -230,14 +230,15 @@ loop:
 		case rep := <-dc.new.Crashes():
 			// A new crash is found on the patched instance.
 			crash := &manager.Crash{Report: rep}
-			need := dc.NeedRepro(crash)
+			ignore := dc.shouldIgnore(crash)
+			need := !ignore && dc.NeedRepro(crash)
 			log.Logf(0, "patched crashed: %v [need repro = %v]",
 				rep.Title, need)
 			dc.store.PatchedCrashed(rep.Title, rep.Report, rep.Output)
 			if need {
 				dc.store.UpdateStatus(rep.Title, manager.DiffBugStatusVerifying)
 				reproLoop.Enqueue(crash)
-			} else {
+			} else if ignore {
 				dc.store.UpdateStatus(rep.Title, manager.DiffBugStatusIgnored)
 			}
 		}
@@ -384,7 +385,6 @@ const maxReproAttempts = 6
 func needReproForTitle(title string) bool {
 	if strings.Contains(title, "no output") ||
 		strings.Contains(title, "lost connection") ||
-		strings.Contains(title, "detected stall") ||
 		strings.Contains(title, "SYZ") {
 		// Don't waste time reproducing these.
 		return false
@@ -392,21 +392,29 @@ func needReproForTitle(title string) bool {
 	return true
 }
 
+func (dc *diffContext) shouldIgnore(crash *manager.Crash) bool {
+	if !needReproForTitle(crash.Title) {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	return dc.ignoreCrash(ctx, crash.Title)
+}
+
+// NeedRepro is called by the repro loop before every reproduction attempt, so it must
+// only consult the in-memory state. The expensive checks are done in shouldIgnore()
+// once, at the moment the crash is first seen.
 func (dc *diffContext) NeedRepro(crash *manager.Crash) bool {
 	if crash.FullRepro {
 		return true
 	}
-	if !needReproForTitle(crash.Title) {
-		return false
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	if dc.ignoreCrash(ctx, crash.Title) {
+	if dc.store.EverCrashedBase(crash.Title) {
+		// The base kernel has crashed with the same title in the meantime.
 		return false
 	}
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
-	return dc.reproAttempts[crash.Title] <= maxReproAttempts
+	return dc.reproAttempts[crash.Title] < maxReproAttempts
 }
 
 func (dc *diffContext) RunRepro(ctx context.Context, crash *manager.Crash) *manager.ReproResult {

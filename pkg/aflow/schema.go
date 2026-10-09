@@ -90,14 +90,15 @@ func convertFromMapReflect(v reflect.Value, m map[string]any, strict, tool bool)
 	m = maps.Clone(m)
 	t := v.Type()
 	for _, fieldType := range reflect.VisibleFields(t) {
-		if !fieldType.IsExported() {
+		if !fieldType.IsExported() || fieldType.Anonymous {
 			continue
 		}
 		name := fieldType.Name
 		field := v.FieldByIndex(fieldType.Index)
 		f, ok := m[name]
 		if !ok || f == nil {
-			if strings.Contains(fieldType.Tag.Get("json"), ",omitempty") {
+			jsonTag := fieldType.Tag.Get("json")
+			if strings.Contains(jsonTag, ",omitempty") || strings.Contains(jsonTag, ",omitzero") {
 				continue
 			}
 			if tool {
@@ -254,6 +255,9 @@ func foreachField(data any) iter.Seq2[string, reflect.Value] {
 	return func(yield func(string, reflect.Value) bool) {
 		v := reflect.ValueOf(data).Elem()
 		for _, field := range reflect.VisibleFields(v.Type()) {
+			if field.Anonymous {
+				continue
+			}
 			if !yield(field.Name, v.FieldByIndex(field.Index)) {
 				break
 			}

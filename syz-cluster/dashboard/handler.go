@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/google/syzkaller/pkg/html/urlutil"
+	"github.com/google/syzkaller/syz-cluster/pkg/api"
 	"github.com/google/syzkaller/syz-cluster/pkg/app"
 	"github.com/google/syzkaller/syz-cluster/pkg/blob"
 	"github.com/google/syzkaller/syz-cluster/pkg/db"
@@ -194,6 +195,68 @@ type uiSeriesData struct {
 	TotalPatches int
 }
 
+func (s uiSessionData) ActiveFindings() []*db.Finding {
+	var res []*db.Finding
+	for _, t := range s.Tests {
+		for _, f := range t.Findings {
+			if f.InvalidatedAt.IsNull() {
+				res = append(res, f)
+			}
+		}
+	}
+	return res
+}
+
+func (s uiSessionData) StatusBadgeClass() string {
+	if len(s.ActiveFindings()) > 0 {
+		return "bg-danger"
+	}
+	switch s.Status() {
+	case db.SessionStatusInProgress:
+		return "bg-info text-dark"
+	case db.SessionStatusFinished:
+		for _, t := range s.Tests {
+			if t.Result == api.TestFailed || t.Result == api.TestError {
+				return "bg-warning text-dark"
+			}
+		}
+		return "bg-success"
+	default:
+		return "bg-secondary"
+	}
+}
+
+func (s uiSessionData) StatusText() string {
+	if count := len(s.ActiveFindings()); count > 0 {
+		return fmt.Sprintf("%d Findings", count)
+	}
+	if s.Status() == db.SessionStatusFinished {
+		for _, t := range s.Tests {
+			if t.Result == api.TestFailed || t.Result == api.TestError {
+				return "Steps Failed"
+			}
+		}
+		return "Passed"
+	}
+	return string(s.Status())
+}
+
+func (s uiSeriesData) MainSession() *uiSessionData {
+	for i := range s.Sessions {
+		if s.Sessions[i].JobID.IsNull() {
+			return &s.Sessions[i]
+		}
+	}
+	return nil
+}
+
+func (s uiSeriesData) MainFindings() []*db.Finding {
+	if sess := s.MainSession(); sess != nil {
+		return sess.ActiveFindings()
+	}
+	return nil
+}
+
 func (h *dashboardHandler) fetchSessionData(ctx context.Context, session *db.Session) (uiSessionData, error) {
 	rawTests, err := h.sessionTestRepo.BySession(ctx, session.ID)
 	if err != nil {
@@ -317,14 +380,15 @@ func (h *dashboardHandler) sessionInfo(w http.ResponseWriter, r *http.Request) e
 
 func (h *dashboardHandler) statsPage(w http.ResponseWriter, r *http.Request) error {
 	type StatsPageData struct {
-		Processed     []*db.CountPerWeek
-		Findings      []*db.CountPerWeek
-		Reports       []*db.CountPerWeek
-		Delay         []*db.DelayPerWeek
-		Distribution  []*db.StatusPerWeek
-		PreventedBugs []*db.PreventedBugsStats
-		MonthlyStats  MonthlyStats
-		JobsServed    []*db.JobsPerMonth
+		Processed         []*db.CountPerWeek
+		Findings          []*db.CountPerWeek
+		Reports           []*db.CountPerWeek
+		Delay             []*db.DelayPerWeek
+		Distribution      []*db.StatusPerWeek
+		PreventedBugs     []*db.PreventedBugsStats
+		ShowPreventedBugs bool
+		MonthlyStats      MonthlyStats
+		JobsServed        []*db.JobsPerMonth
 	}
 	var data StatsPageData
 	var err error
@@ -348,9 +412,12 @@ func (h *dashboardHandler) statsPage(w http.ResponseWriter, r *http.Request) err
 	if err != nil {
 		return fmt.Errorf("failed to query distribution data: %w", err)
 	}
-	data.PreventedBugs, err = h.statsRepo.PreventedBugsPerMonth(r.Context())
-	if err != nil {
-		return fmt.Errorf("failed to query prevented bugs data: %w", err)
+	data.ShowPreventedBugs = r.FormValue("unstable_stats") != ""
+	if data.ShowPreventedBugs {
+		data.PreventedBugs, err = h.statsRepo.PreventedBugsPerMonth(r.Context())
+		if err != nil {
+			return fmt.Errorf("failed to query prevented bugs data: %w", err)
+		}
 	}
 
 	reportsPerMonth, err := h.statsRepo.ReportsPerMonth(r.Context())
@@ -508,6 +575,9 @@ func (h *dashboardHandler) findingInfo(w http.ResponseWriter, r *http.Request) e
 		return err
 	case "c_repro":
 		return h.streamBlob(w, finding.CReproURI)
+	case "triage_trajectory":
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		return h.streamBlob(w, finding.TriageTrajectoryURI)
 	default:
 		return fmt.Errorf("%w: unknown key value", errBadRequest)
 	}

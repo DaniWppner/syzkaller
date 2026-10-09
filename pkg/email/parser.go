@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"maps"
 	"mime"
 	"mime/multipart"
 	"mime/quotedprintable"
@@ -17,28 +18,28 @@ import (
 	"strings"
 	"time"
 	"unicode"
-
-	"golang.org/x/exp/maps"
 )
 
 type Email struct {
-	BugIDs         []string
-	OwnEmailsCcd   bool
-	MessageID      string
-	InReplyTo      string
-	Date           time.Time
-	Link           string
-	Subject        string
-	MailingList    string
-	Author         string
-	AuthorName     string
-	OwnEmail       bool
-	Cc             []string
-	RawCc          []string // unstripped emails
-	Body           string   // text/plain part
-	Patch          string   // attached patch, if any
-	BaseCommitHint string   // Hash of base-commit, if provided.
-	Commands       []*SingleCommand
+	BugIDs            []string
+	OwnEmailsCcd      bool
+	MessageID         string
+	InReplyTo         string
+	Date              time.Time
+	Link              string
+	Subject           string
+	MailingList       string
+	Author            string
+	AuthorName        string
+	OwnEmail          bool
+	Cc                []string
+	RawCc             []string // unstripped emails
+	Body              string   // text/plain part
+	Patch             string   // attached patch, if any
+	BaseCommitHint    string   // Hash of base-commit, if provided.
+	Commands          []*SingleCommand
+	XStable           string
+	XKernelTestBranch string
 }
 
 type SingleCommand struct {
@@ -189,23 +190,25 @@ func Parse(r io.Reader, ownEmails, goodLists, domains []string) (*Email, error) 
 	date, _ := mail.ParseDate(msg.Header.Get("Date"))
 	date = date.UTC()
 	email := &Email{
-		BugIDs:         unique(bugIDs),
-		MessageID:      msg.Header.Get("Message-ID"),
-		InReplyTo:      ExtractInReplyTo(msg.Header),
-		Date:           date,
-		Link:           link,
-		Author:         author,
-		AuthorName:     authorName,
-		OwnEmail:       fromMe,
-		OwnEmailsCcd:   ownEmailsCcd,
-		MailingList:    mailingList,
-		Subject:        subject,
-		Cc:             ccList,
-		RawCc:          mergeRawAddresses(from, originalFroms, to, cc),
-		Body:           bodyStr,
-		Patch:          patch,
-		Commands:       cmds,
-		BaseCommitHint: extractBaseCommitHint(bodyStr),
+		BugIDs:            unique(bugIDs),
+		MessageID:         msg.Header.Get("Message-ID"),
+		InReplyTo:         ExtractInReplyTo(msg.Header),
+		Date:              date,
+		Link:              link,
+		Author:            author,
+		AuthorName:        authorName,
+		OwnEmail:          fromMe,
+		OwnEmailsCcd:      ownEmailsCcd,
+		MailingList:       mailingList,
+		Subject:           subject,
+		Cc:                ccList,
+		RawCc:             mergeRawAddresses(from, originalFroms, to, cc),
+		Body:              bodyStr,
+		Patch:             patch,
+		Commands:          cmds,
+		BaseCommitHint:    extractBaseCommitHint(bodyStr),
+		XStable:           msg.Header.Get("X-stable"),
+		XKernelTestBranch: msg.Header.Get("X-KernelTest-Branch"),
 	}
 	return email, nil
 }
@@ -270,6 +273,22 @@ func EmailsMatch(val1, val2 string) bool {
 		return strings.EqualFold(addr1.Address, addr2.Address)
 	}
 	return val1 == val2
+}
+
+// FormatAddress formats name and email as an RFC 5322 address.
+// Multi-word display names like "First Last <user@email.com>" are valid unquoted in RFC 5322,
+// but names containing delimiters (such as commas in "Last, First") require double quotes.
+// Since net/mail.Address.String() conservatively quotes any display name with whitespace,
+// we verify if the unquoted form is already valid RFC 5322 before falling back to quoted formatting.
+func FormatAddress(name, email string) string {
+	if name == "" {
+		return email
+	}
+	raw := fmt.Sprintf("%s <%s>", name, email)
+	if _, err := mail.ParseAddress(raw); err == nil {
+		return raw
+	}
+	return (&mail.Address{Name: name, Address: email}).String()
 }
 
 // Split splits email into user (without context) and domain (with @ prefix).
@@ -568,8 +587,11 @@ func MergeEmailLists(lists ...[]string) []string {
 			merged[addr.Address] = true
 		}
 	}
-	result := maps.Keys(merged)
-	slices.Sort(result)
+	if len(merged) == 0 {
+		// Return non-nil empty slice because callers/tests expect it (e.g. JSON serialization).
+		return []string{}
+	}
+	result := slices.Sorted(maps.Keys(merged))
 	if len(result) > maxEmails {
 		result = result[:maxEmails]
 	}

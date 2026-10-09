@@ -386,6 +386,7 @@ private:
 		    .syscall_timeout_ms = opts_.syscall_timeout_ms,
 		    .program_timeout_ms = ProgramTimeoutMs(),
 		    .slowdown_scale = opts_.slowdown,
+		    .return_error = IsSet(msg_->flags, rpc::RequestFlag::ReturnError),
 		};
 		if (write(req_pipe_, &req, sizeof(req)) != sizeof(req)) {
 			debug("request pipe write failed (errno=%d)\n", errno);
@@ -434,6 +435,7 @@ private:
 		    .exec_flags = static_cast<uint64>(msg_->exec_opts->exec_flags()),
 		    .all_call_signal = all_call_signal,
 		    .all_extra_signal = all_extra_signal,
+		    .return_error = IsSet(msg_->flags, rpc::RequestFlag::ReturnError),
 		};
 		exec_start_ = current_time_ms();
 		ChangeState(State::Executing);
@@ -937,6 +939,8 @@ static void FatalHandler(int sig, siginfo_t* info, void* ucontext)
 	pc = mctx.gregs[REG_RIP];
 #elif GOARCH_arm64
 	pc = mctx.pc;
+#elif GOARCH_loong64
+	pc = mctx.__pc;
 #endif
 #endif
 	const char* name = "unknown signal";

@@ -84,6 +84,7 @@ var apiHandlers = map[string]APIHandler{
 	"add_build_assets":      nsHandler(apiAddBuildAssets),
 	"log_to_repro":          nsHandler(apiLogToReproduce),
 	"repro_task_done":       nsHandler(apiReproTaskDone),
+	"client_info":           nsHandler(apiClientInfo),
 }
 
 type JSONHandler func(ctx context.Context, r *http.Request) (any, error)
@@ -883,13 +884,9 @@ func reportCrash(ctx context.Context, build *Build, req *dashapi.Crash) (*Bug, e
 
 	bugKey := bug.key(ctx)
 	now := timeNow(ctx)
-	reproLevel := ReproLevelNone
-	if len(req.ReproC) != 0 {
-		reproLevel = ReproLevelC
-	} else if len(req.ReproSyz) != 0 {
-		reproLevel = ReproLevelSyz
-	}
-	save := reproLevel != ReproLevelNone ||
+	hasC := len(req.ReproC) != 0
+	hasSyz := len(req.ReproSyz) != 0
+	save := hasC || hasSyz ||
 		bug.NumCrashes < int64(maxCrashes()) ||
 		now.Sub(bug.LastSavedCrash) > time.Hour ||
 		bug.NumCrashes%20 == 0 ||
@@ -907,11 +904,12 @@ func reportCrash(ctx context.Context, build *Build, req *dashapi.Crash) (*Bug, e
 	newSubsystems := []*subsystem.Subsystem{}
 	// Recalculate subsystems on the first saved crash and on the first saved repro,
 	// unless a user has already manually specified them.
+	crashHasRepro := hasC || hasSyz
 	calculateSubsystems := subsystemService != nil &&
 		save &&
 		!bug.hasUserSubsystems() &&
 		(bug.NumCrashes == 0 ||
-			bug.ReproLevel == ReproLevelNone && reproLevel != ReproLevelNone)
+			!bug.HasRepro() && crashHasRepro)
 	if calculateSubsystems {
 		newSubsystems, err = inferSubsystems(ctx, bug, bugKey, &debugtracer.NullTracer{})
 		if err != nil {
@@ -929,12 +927,12 @@ func reportCrash(ctx context.Context, build *Build, req *dashapi.Crash) (*Bug, e
 		if save {
 			bug.LastSavedCrash = now
 		}
-		if reproLevel != ReproLevelNone {
+		if crashHasRepro {
 			bug.NumRepro++
 			bug.LastReproTime = now
 		}
-		bug.ReproLevel = max(bug.ReproLevel, reproLevel)
-		bug.HeadReproLevel = max(bug.HeadReproLevel, reproLevel)
+		bug.UpdateReproLevel(hasC, hasSyz, now)
+		bug.UpdateHeadReproLevel(hasC, hasSyz)
 		if len(req.Report) != 0 {
 			bug.HasReport = true
 		}
@@ -1532,7 +1530,7 @@ func createBugForCrash(ctx context.Context, ns string, req *dashapi.Crash) (*Bug
 					Status:         BugStatusOpen,
 					NumCrashes:     0,
 					NumRepro:       0,
-					ReproLevel:     ReproLevelNone,
+					StructVersion:  bugStructVersion,
 					HasReport:      false,
 					FirstTime:      now,
 					LastTime:       now,
@@ -1609,7 +1607,14 @@ func needReproForBug(ctx context.Context, bug *Bug) bool {
 	if syzErrorTitleRe.MatchString(bug.Title) {
 		bestReproLevel = ReproLevelSyz
 	}
-	if bug.HeadReproLevel < bestReproLevel {
+	hasBest := false
+	switch bestReproLevel {
+	case ReproLevelC:
+		hasBest = bug.HeadHasCRepro
+	case ReproLevelSyz:
+		hasBest = bug.HeadHasSyzRepro
+	}
+	if !hasBest {
 		// We have not found a best-level repro yet, try until we do.
 		return bug.NumRepro < maxReproPerBug || timeSince(ctx, bug.LastReproTime) >= reproRetryPeriod
 	}
@@ -1871,7 +1876,7 @@ func apiLogToReproduce(ctx context.Context, ns string, req *dashapi.LogToReproRe
 	const bugsToConsider = 10
 	checkedBugs := 0
 	for _, bug := range bugs {
-		if bug.ReproLevel != ReproLevelNone {
+		if bug.HasRepro() {
 			continue
 		}
 		if len(bug.Commits) > 0 || len(bug.ReproAttempts) > 0 {
@@ -2021,4 +2026,11 @@ func apiSaveCoverage(ctx context.Context, payload io.Reader) (any, error) {
 			descr.Namespace, descr.DateTo.String(), descr.TotalRows)
 	}
 	return &rowsCreated, err
+}
+
+// apiClientInfo returns the namespace name associated with the authenticated client.
+// This allows clients (like syz-ci) to dynamically discover their namespace
+// and use it to tag uploaded coverage data.
+func apiClientInfo(ctx context.Context, ns string, req *dashapi.ClientInfoReq) (any, error) {
+	return &dashapi.ClientInfoResp{Namespace: ns}, nil
 }

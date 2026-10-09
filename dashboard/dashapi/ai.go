@@ -108,29 +108,31 @@ type ReportPollResult struct {
 	ID          string // JobReporting ID
 	CanUpstream bool
 	// Emails with name ("First Last" <email@address.com>).
-	To            []string
-	Cc            []string
-	Patch         *NewReportResult `json:",omitempty"`
-	Replies       []*ReplyResult   `json:",omitempty"`
-	ThreadSubject string           `json:",omitempty"` // Used as the email subject when replying without a new patch.
+	To              []string
+	Cc              []string
+	Patch           *NewReportResult `json:",omitempty"`
+	Replies         []*ReplyResult   `json:",omitempty"`
+	ThreadSubject   string           `json:",omitempty"` // Used as the email subject when replying without a new patch.
+	AddressComments bool             `json:",omitempty"`
 }
 
 type NewReportResult struct {
-	Subject    string
-	Body       string
-	Version    int
-	GitDiff    string
-	Changelog  []ChangelogEntry
-	To         []string
-	Cc         []string
-	Tools      []string
-	Authors    []string
-	BaseCommit string
-	BaseTree   string
-	Fixes      ai.FixesTag
-	Links      []string
-	Closes     []string
-	ReportedBy []string
+	Subject     string
+	Body        string
+	Version     int
+	GitDiff     string
+	Changelog   []ChangelogEntry
+	To          []string
+	Cc          []string
+	Tools       []string
+	Authors     []string
+	BaseCommit  string
+	BaseTree    string
+	Fixes       ai.FixesTag
+	Links       []string
+	Closes      []string
+	ReportedBy  []string
+	SuggestedBy []string
 
 	ReviewedBy []string
 	AckedBy    []string

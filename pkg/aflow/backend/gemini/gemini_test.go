@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/syzkaller/pkg/aflow/backend"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/genai"
 )
 
@@ -22,13 +23,18 @@ func TestProviderResolveModels(t *testing.T) {
 		want          []string
 	}{
 		{
-			name:     "resolves good balanced model pool",
-			category: backend.GoodBalancedModel,
-			want:     []string{"gemini-3-flash-preview", "gemini-3.5-flash"},
+			name:     "resolves core model pool",
+			category: backend.CoreModel,
+			want:     []string{"gemini-3.8-flash"},
 		},
 		{
-			name:     "resolves best expensive model pool",
-			category: backend.BestExpensiveModel,
+			name:     "resolves lightweight model pool",
+			category: backend.LightweightModel,
+			want:     []string{"gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash"},
+		},
+		{
+			name:     "resolves deep reasoning model pool",
+			category: backend.DeepReasoningModel,
 			want:     []string{"gemini-3.1-pro-preview"},
 		},
 		{
@@ -39,7 +45,7 @@ func TestProviderResolveModels(t *testing.T) {
 		{
 			name:          "respects provider level override",
 			modelOverride: "override-model",
-			category:      backend.GoodBalancedModel,
+			category:      backend.CoreModel,
 			want:          []string{"override-model"},
 		},
 		{
@@ -72,10 +78,19 @@ func TestParseLLMError(t *testing.T) {
 		// nolint:lll
 		Message: `You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits. To monitor your current usage, head to: https://ai.dev/rate-limit. * Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_paid_tier_input_token_count, limit: 1000000, model: gemini-3-flash Please retry in 24.180878813s.`,
 	}
+	tpmError2 := genai.APIError{
+		Code: 429,
+		// nolint:lll
+		Message: `You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits. To monitor your current usage, head to: https://ai.dev/rate-limit. * Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_paid_tier_input_token_count, limit: 1000000, model: gemini-3-flash Please retry in 24s.`,
+	}
 	tests := []Test{
 		{
 			inputErr:  tpmError1,
 			outputErr: &backend.RetryError{Delay: 25 * time.Second, Err: tpmError1},
+		},
+		{
+			inputErr:  tpmError2,
+			outputErr: &backend.RetryError{Delay: 25 * time.Second, Err: tpmError2},
 		},
 		{
 			inputErr: genai.APIError{
@@ -108,12 +123,83 @@ func TestParseLLMError(t *testing.T) {
 			resp: &genai.GenerateContentResponse{
 				Candidates: []*genai.Candidate{
 					{
+						Content: &genai.Content{
+							Parts: []*genai.Part{
+								{Thought: true, Text: "thinking..."},
+								{Text: "partial output"},
+							},
+						},
 						FinishReason: genai.FinishReasonMaxTokens,
 					},
 				},
 			},
 			outputErr: &backend.OutputTokenOverflowError{
 				Err: errors.New("MAX_TOKENS"),
+			},
+		},
+		{
+			resp: &genai.GenerateContentResponse{
+				PromptFeedback: &genai.GenerateContentResponsePromptFeedback{
+					BlockReason: genai.BlockedReasonSafety,
+				},
+			},
+			outputErr: errors.New("request blocked: SAFETY"),
+		},
+		{
+			resp: &genai.GenerateContentResponse{
+				Candidates: []*genai.Candidate{
+					{
+						FinishReason: genai.FinishReasonSafety,
+					},
+				},
+			},
+			outputErr: errors.New("SAFETY"),
+		},
+		{
+			resp: &genai.GenerateContentResponse{
+				Candidates: []*genai.Candidate{
+					{
+						FinishReason: genai.FinishReasonStop,
+					},
+				},
+			},
+			outputErr: &backend.RetryError{
+				Delay:         0,
+				IsExponential: false,
+				Err:           errors.New("STOP"),
+			},
+		},
+		{
+			resp: &genai.GenerateContentResponse{
+				Candidates: []*genai.Candidate{
+					{
+						FinishReason: genai.FinishReasonRecitation,
+					},
+				},
+			},
+			outputErr: &backend.RetryError{
+				Delay:         0,
+				IsExponential: false,
+				Err:           errors.New("RECITATION"),
+			},
+		},
+		{
+			resp: &genai.GenerateContentResponse{
+				Candidates: []*genai.Candidate{
+					{
+						Content: &genai.Content{
+							Parts: []*genai.Part{
+								{Thought: true, Text: "thinking..."},
+							},
+						},
+						FinishReason: genai.FinishReasonMalformedFunctionCall,
+					},
+				},
+			},
+			outputErr: &backend.RetryError{
+				Delay:         0,
+				IsExponential: false,
+				Err:           errors.New("MALFORMED_FUNCTION_CALL"),
 			},
 		},
 	}
@@ -125,13 +211,7 @@ func TestParseLLMError(t *testing.T) {
 			} else if test.resp != nil {
 				err = parseLLMResp(test.resp)
 			}
-			if err == nil || test.outputErr == nil {
-				if err != test.outputErr {
-					t.Errorf("got %v, want %v", err, test.outputErr)
-				}
-			} else if err.Error() != test.outputErr.Error() {
-				t.Errorf("got %v, want %v", err, test.outputErr)
-			}
+			require.Equal(t, test.outputErr, err)
 		})
 	}
 }
@@ -144,4 +224,43 @@ func TestParseLLMErrorBackoff(t *testing.T) {
 	if !errors.As(err, &rErr) || rErr.Delay != time.Second || !rErr.IsExponential {
 		t.Errorf("expected RetryError with 1s exponential delay, got %v", err)
 	}
+}
+
+func TestToGenaiContentEmptyTextParts(t *testing.T) {
+	msg := &backend.Message{
+		Role: backend.RoleModel,
+		Parts: []backend.Part{
+			{Text: ""},                // Completely empty part -> skipped.
+			{Text: "", Thought: true}, // Thought part with empty text -> replaced with fallback.
+			{Text: "hello"},           // Normal text part -> kept as "hello".
+			{FunctionCall: &backend.FunctionCall{Name: "test_tool"}}, // Tool call -> kept.
+		},
+	}
+	got := toGenaiContent(msg)
+	require.Equal(t, "model", got.Role)
+	require.Len(t, got.Parts, 3)
+	require.Equal(t, "<no text generated>", got.Parts[0].Text)
+	require.True(t, got.Parts[0].Thought)
+	require.Equal(t, "hello", got.Parts[1].Text)
+	require.NotNil(t, got.Parts[2].FunctionCall)
+	require.Equal(t, "test_tool", got.Parts[2].FunctionCall.Name)
+}
+
+func TestToGenaiContentThoughtSignature(t *testing.T) {
+	msg := &backend.Message{
+		Role: backend.RoleModel,
+		Parts: []backend.Part{
+			{
+				FunctionCall: &backend.FunctionCall{Name: "tool_without_sig"},
+			},
+			{
+				FunctionCall:     &backend.FunctionCall{Name: "tool_with_sig"},
+				ThoughtSignature: []byte("custom_sig"),
+			},
+		},
+	}
+	got := toGenaiContent(msg)
+	require.Len(t, got.Parts, 2)
+	require.Equal(t, []byte(skipThoughtSignatureValidator), got.Parts[0].ThoughtSignature)
+	require.Equal(t, []byte("custom_sig"), got.Parts[1].ThoughtSignature)
 }

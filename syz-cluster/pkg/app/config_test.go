@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/google/syzkaller/syz-cluster/pkg/api"
+	"github.com/stretchr/testify/require"
 )
 
 func TestConfigs(t *testing.T) {
@@ -42,4 +45,38 @@ func TestConfigs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("filepath.Walk failed: %v", err)
 	}
+}
+
+func TestOwnEmails(t *testing.T) {
+	var nilCfg *EmailConfig
+	require.Nil(t, nilCfg.OwnEmails())
+
+	cfg := &EmailConfig{
+		Dashapi: &DashapiConfig{
+			From: "bot@dashapi.com",
+		},
+		SMTP: &SMTPConfig{
+			From: "bot@smtp.com",
+		},
+		ExtraOwnEmails: []string{
+			"bot@kernel.org",
+			"bot@dashapi.com",
+		},
+	}
+
+	got := cfg.OwnEmails()
+	want := []string{"bot@dashapi.com", "bot@kernel.org", "bot@smtp.com"}
+	require.Equal(t, want, got)
+}
+
+func TestFuzzTargetsValidation(t *testing.T) {
+	cfg := AppConfig{
+		URL: "http://example.com",
+		FuzzTargets: []*api.FuzzTriageTarget{
+			{
+				PathRegexps: []string{"[invalid("},
+			},
+		},
+	}
+	require.ErrorContains(t, cfg.Validate(), "invalid path regexp")
 }

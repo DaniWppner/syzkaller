@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/google/syzkaller/pkg/cover/backend"
 	"github.com/google/syzkaller/pkg/csource"
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/mgrconfig"
@@ -260,12 +261,13 @@ func (inst *ExecProgInstance) RunSyzProgFile(progFile string, opts RunOptions) (
 		return nil, &TestError{Title: fmt.Sprintf("failed to copy prog to VM: %v", err)}
 	}
 	command := ExecprogCmd(inst.execprogBin, inst.executorBin, inst.mgrCfg.TargetOS, inst.mgrCfg.TargetArch,
-		inst.mgrCfg.Type, opts.Opts, !inst.OldFlagsCompatMode, inst.mgrCfg.Timeouts.Slowdown, coverFile, vmProgFile)
+		inst.mgrCfg.TargetVMArch, inst.mgrCfg.Type, opts.Opts, !inst.OldFlagsCompatMode,
+		inst.mgrCfg.Timeouts.Slowdown, coverFile, vmProgFile)
 	res, err := inst.runCommand(command, opts)
 	if err != nil {
 		return nil, err
 	}
-	if coverFile != "" {
+	if coverFile != "" && res.Report == nil {
 		coverage, err := inst.retrieveCoverageFiles(coverFile, ncalls)
 		if err != nil {
 			return nil, err
@@ -408,6 +410,18 @@ func (inst *ExecProgInstance) retrieveCoverageFiles(vmCoverFilePrefix string, nc
 		cover, err := parseCoverageData(catOutput)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse cover data from %s: %w", file, err)
+		}
+		// syz-execprog (running inside the VM) shifts the PCs using
+		// PreviousInstructionPC before writing them to the coverage files. However,
+		// the host-side symbolizer expects raw PCs and performs its own VM-aware PC
+		// adjustment. To prevent double-adjustment of PCs on the host, we apply
+		// NextInstructionPC to reconstruct the original raw PCs retrieved from the
+		// VM.
+		target := inst.mgrCfg.SysTarget
+		for i, pc := range cover {
+			// syz-execprog hardcodes "" inside the VM; we must match it here to undo
+			// the shift.
+			cover[i] = backend.NextInstructionPC(target, "", pc)
 		}
 		coverage = append(coverage, cover)
 	}

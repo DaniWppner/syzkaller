@@ -21,10 +21,11 @@ var templatesFS embed.FS
 
 // TemplateData holds data for rendering email templates.
 type TemplateData struct {
-	Patch       *dashapi.NewReportResult
-	Replies     []*dashapi.ReplyResult
-	DocsLink    string
-	CanUpstream bool
+	Patch           *dashapi.NewReportResult
+	Replies         []*dashapi.ReplyResult
+	DocsLink        string
+	CanUpstream     bool
+	AddressComments bool
 }
 
 func renderTemplate(name, tmplStr string, data TemplateData) (string, error) {
@@ -44,8 +45,9 @@ func renderTemplate(name, tmplStr string, data TemplateData) (string, error) {
 // RenderBody renders the email body based on the poll result.
 func RenderBody(cfg *Config, res *dashapi.ReportPollResult) (string, error) {
 	data := TemplateData{
-		DocsLink:    cfg.DocsLink,
-		CanUpstream: res.CanUpstream,
+		DocsLink:        cfg.DocsLink,
+		CanUpstream:     res.CanUpstream,
+		AddressComments: res.AddressComments,
 	}
 	if res.Patch != nil {
 		var recipients []ai.Recipient
@@ -68,16 +70,17 @@ func RenderBody(cfg *Config, res *dashapi.ReportPollResult) (string, error) {
 		// TODO: Figure out what Authors we want to use here.
 		res.Patch.Body = strings.TrimSpace(email.FormatPatchDescription(
 			res.Patch.Body, email.PatchTemplateData{
-				Fixes:      res.Patch.Fixes,
-				Tools:      res.Patch.Tools,
-				Authors:    res.Patch.Authors,
-				Recipients: recipients,
-				Links:      res.Patch.Links,
-				Closes:     res.Patch.Closes,
-				ReportedBy: res.Patch.ReportedBy,
-				ReviewedBy: res.Patch.ReviewedBy,
-				AckedBy:    res.Patch.AckedBy,
-				TestedBy:   res.Patch.TestedBy,
+				Fixes:       res.Patch.Fixes,
+				Tools:       res.Patch.Tools,
+				Authors:     res.Patch.Authors,
+				Recipients:  recipients,
+				Links:       res.Patch.Links,
+				Closes:      res.Patch.Closes,
+				ReportedBy:  res.Patch.ReportedBy,
+				SuggestedBy: res.Patch.SuggestedBy,
+				ReviewedBy:  res.Patch.ReviewedBy,
+				AckedBy:     res.Patch.AckedBy,
+				TestedBy:    res.Patch.TestedBy,
 			}))
 		data.Patch = res.Patch
 		tmpl, err := templatesFS.ReadFile("templates/new_patch.txt")

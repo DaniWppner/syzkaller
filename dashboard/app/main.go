@@ -67,10 +67,12 @@ func initHTTPHandlers() {
 	http.Handle("/{ns}/invalid", handlerWrapper(handleInvalid))
 	http.Handle("/{ns}/graph/bugs", handlerWrapper(handleKernelHealthGraph))
 	http.Handle("/{ns}/graph/lifetimes", handlerWrapper(handleGraphLifetimes))
+	http.Handle("/{ns}/graph/resolution", handlerWrapper(handleResolutionGraph))
 	http.Handle("/{ns}/graph/fuzzing", handlerWrapper(handleGraphFuzzing))
 	http.Handle("/{ns}/graph/crashes", handlerWrapper(handleGraphCrashes))
 	http.Handle("/{ns}/graph/found-bugs", handlerWrapper(handleFoundBugsGraph))
 	http.Handle("/{ns}/graph/coverage", handlerWrapper(handleCoverageGraph))
+	http.Handle("/{ns}/graph/ai", handlerWrapper(handleAIGraphs))
 	http.Handle("/{ns}/coverage/file", handlerWrapper(handleFileCoverage))
 	http.Handle("/{ns}/coverage", handlerWrapper(handleCoverageHeatmap))
 	http.Handle("/{ns}/coverage/subsystems", handlerWrapper(handleSubsystemsCoverageHeatmap))
@@ -305,6 +307,20 @@ type uiBugPage struct {
 	PatchVersions   []*uiPatchVersion
 	AIWorkflows     []*uiWorkflow
 	AIJobs          []*uiAIJob
+	Managers        []string
+	DefaultManager  string
+}
+
+func (p *uiBugPage) GetJobs() []*uiAIJob {
+	return p.AIJobs
+}
+
+func (p *uiBugPage) IsAdmin() bool {
+	return p.Header.Admin
+}
+
+func (p *uiBugPage) ShowTestOnManager() bool {
+	return p.Header.AIActions
 }
 
 type uiBugDetails struct {
@@ -401,7 +417,8 @@ type uiBug struct {
 	ReportedTime   time.Time
 	FixTime        time.Time
 	ClosedTime     time.Time
-	ReproLevel     dashapi.ReproLevel
+	HasCRepro      bool
+	HasSyzRepro    bool
 	ReportingIndex int
 	Status         string
 	Link           string
@@ -496,7 +513,7 @@ type userBugFilter struct {
 }
 
 func cachedBugIDsWithPendingPatch(ctx context.Context, ns string) ([]string, error) {
-	return cachedObjectList(ctx,
+	return cachedObject(ctx,
 		fmt.Sprintf("%s-ai-pending-patches", ns),
 		5*time.Minute,
 		func(ctx context.Context) ([]string, error) {
@@ -560,7 +577,7 @@ func (filter *userBugFilter) MatchBug(ctx context.Context, bug *Bug) bool {
 	if filter == nil {
 		return true
 	}
-	if filter.WithRepro && bug.ReproLevel == dashapi.ReproLevelNone {
+	if filter.WithRepro && !bug.HasRepro() {
 		return false
 	}
 	if filter.WithAIPatch && !filter.BugsWithPendingAIPatches[bug.keyHash(ctx)] {
@@ -1222,22 +1239,33 @@ func handleBug(ctx context.Context, w http.ResponseWriter, r *http.Request) erro
 		for _, job := range jobs {
 			aiJobs = append(aiJobs, makeUIAIJob(job))
 		}
+		if !hdr.Admin {
+			sanitizeUIJobs(aiJobs...)
+		}
 
 		patchVersions, err = getPatchVersions(ctx, bug, jobs, hdr.AIActions)
 		if err != nil {
 			return err
 		}
 	}
+	managers, err := CachedManagerList(ctx, bug.Namespace)
+	if err != nil {
+		return err
+	}
+	slices.Sort(managers)
+
 	data := &uiBugPage{
-		Header:        hdr,
-		Now:           timeNow(ctx),
-		Sections:      sections,
-		LabelGroups:   getLabelGroups(ctx, bug),
-		Crashes:       crashesTable,
-		Bug:           bugDetails,
-		PatchVersions: patchVersions,
-		AIWorkflows:   aiWorkflows,
-		AIJobs:        aiJobs,
+		Header:         hdr,
+		Now:            timeNow(ctx),
+		Sections:       sections,
+		LabelGroups:    getLabelGroups(ctx, bug),
+		Crashes:        crashesTable,
+		Bug:            bugDetails,
+		PatchVersions:  patchVersions,
+		AIWorkflows:    aiWorkflows,
+		AIJobs:         aiJobs,
+		Managers:       managers,
+		DefaultManager: bugDefaultManager(ctx, bug, bugDetails),
 	}
 	if accessLevel == AccessAdmin && !bug.hasUserSubsystems() {
 		data.DebugSubsystems = urlutil.SetParam(data.Bug.Link, "debug_subsystems", "1")
@@ -1258,6 +1286,17 @@ func handleBug(ctx context.Context, w http.ResponseWriter, r *http.Request) erro
 	}
 
 	return serveTemplate(w, "bug.html", data)
+}
+
+func bugDefaultManager(ctx context.Context, bug *Bug, bugDetails *uiBugDetails) string {
+	defaultManager := ""
+	if len(bugDetails.Crashes) > 0 {
+		defaultManager = bugDetails.Crashes[0].Manager
+	} else if len(bug.HappenedOn) > 0 {
+		defaultManager = bug.HappenedOn[0]
+	}
+	manager, _ := activeManager(ctx, defaultManager, bug.Namespace)
+	return manager
 }
 
 func handleBugJobCreate(ctx context.Context, r *http.Request, hdr *uiHeader,
@@ -1288,7 +1327,7 @@ func handleManualIterationJob(ctx context.Context, r *http.Request,
 	if r.Method != http.MethodPost {
 		return ErrAccess
 	}
-	job, err := aidb.CreatePatchIterationJob(ctx, reportingID)
+	job, err := aidb.CreatePatchIterationJob(ctx, reportingID, true)
 	if err != nil {
 		return fmt.Errorf("failed to create patch iteration job for %v: %w", reportingID, err)
 	} else if job == nil {
@@ -1313,6 +1352,9 @@ func parseAIJobArgs(r *http.Request, workflow string, aiWorkflows []*uiWorkflow)
 			return nil, fmt.Errorf("custom base commit is empty")
 		}
 		args["BaseCommit"] = r.FormValue("base_commit")
+	}
+	if selected != nil && selected.SelectManager && r.FormValue("KernelConfigManager") != "" {
+		args["KernelConfigManager"] = r.FormValue("KernelConfigManager")
 	}
 	return args, nil
 }
@@ -2184,7 +2226,8 @@ func createUIBug(ctx context.Context, bug *Bug, state *ReportingState, managers 
 		ReportedTime:   reported,
 		ClosedTime:     bug.Closed,
 		FixTime:        bug.FixTime,
-		ReproLevel:     bug.ReproLevel,
+		HasCRepro:      bug.HasCRepro,
+		HasSyzRepro:    bug.HasSyzRepro,
 		ReportingIndex: reportingIdx,
 		Status:         status,
 		Link:           bugExtLink(ctx, bug),
@@ -2235,7 +2278,11 @@ func mergeUIBug(ctx context.Context, bug *uiBug, dup *Bug) {
 	if bug.LastTime.Before(dup.LastTime) {
 		bug.LastTime = dup.LastTime
 	}
-	bug.ReproLevel = max(bug.ReproLevel, dup.ReproLevel)
+	// Note: we intentionally don't merge the repro flags of the dup.
+	// The reproducers belong to the dup bug and are not displayed on the
+	// canonical bug page, so it would only be confusing. All the rest of the
+	// code (bug filtering, repro scheduling, reporting) also only considers
+	// the bug's own reproducers.
 	updateBugBadness(ctx, bug)
 }
 

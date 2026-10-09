@@ -9,14 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
-	"slices"
 	"strings"
 	"time"
 
 	"github.com/google/syzkaller/pkg/aflow"
-	"github.com/google/syzkaller/pkg/aflow/action/kernel"
 	"github.com/google/syzkaller/pkg/osutil"
-	"github.com/google/syzkaller/pkg/vcs"
 )
 
 var sinceRegex = regexp.MustCompile(`^\d+\s+(years?|months?|weeks?|days?)$`)
@@ -45,6 +42,9 @@ Use 'Since' to limit how far back to search. It accepts duration strings like "3
 	ToolShow = aflow.NewFuncTool("git-show", gitShow, `
 Tool provides full information about a specific git commit, including its title,
 full description, and the diff.
+Defaults to 'HEAD' if Commit is omitted.
+Use the 'File' parameter to restrict the diff to a specific file or directory path.
+Use the 'Stat' parameter to see a diffstat summary of modified files and line counts.
 `)
 	ToolBlame = aflow.NewFuncTool("git-blame", gitBlame, `
 Tool provides git blame for a given file and line range.
@@ -54,10 +54,13 @@ It helps to identify which commit last modified specific lines of code.
 	Tools = []aflow.Tool{ToolLog, ToolShow, ToolBlame}
 )
 
-const maxOutputLines = 1000
+const (
+	maxOutputLines = 1000
+	headCommit     = "HEAD"
+)
 
 type state struct {
-	KernelCommit string
+	KernelSrc string
 }
 
 type logArgs struct {
@@ -120,27 +123,25 @@ func gitLog(ctx *aflow.Context, state state, args logArgs) (logResult, error) {
 		gitArgs = append(gitArgs, "--no-merges")
 	}
 
-	gitArgs = append(gitArgs, state.KernelCommit)
+	gitArgs = append(gitArgs, headCommit)
 
 	if args.PathPrefix != "" {
 		gitArgs = append(gitArgs, "--", args.PathPrefix)
 	}
 
-	var output []byte
-	err := kernel.UseLinuxRepo(ctx, func(kernelRepoDir string, _ vcs.Repo) error {
-		var err error
-		output, err = runGit(kernelRepoDir, 10*time.Minute, gitArgs...)
-		return err
-	})
+	output, err := runGit(state.KernelSrc, 10*time.Minute, gitArgs...)
 	if err != nil {
-		return logResult{}, gitBadCallError(err, "git log",
-			"Please specify a tighter search scope (e.g. by providing a PathPrefix).")
+		return logResult{}, gitBadCallError(err, "git log", gitAdvice{
+			Timeout: "Please specify a tighter search scope (e.g. by providing a PathPrefix).",
+		})
 	}
 	return logResult{Output: string(output)}, nil
 }
 
 type showArgs struct {
-	Commit string `jsonschema:"Commit hash or reference (hash:file/name.c)."`
+	Commit string `jsonschema:"Commit hash or reference (e.g. 'HEAD'). Defaults to 'HEAD' if omitted." json:",omitempty"`
+	File   string `jsonschema:"Optional: restrict the commit diff to a specific file or directory." json:",omitempty"`
+	Stat   bool   `jsonschema:"Optional: if true, show diffstat summary of modified files." json:",omitempty"`
 }
 
 type showResult struct {
@@ -148,35 +149,47 @@ type showResult struct {
 }
 
 func gitShow(ctx *aflow.Context, state state, args showArgs) (showResult, error) {
+	if args.Commit == "" {
+		args.Commit = headCommit
+	}
 	commitHash, filePath, _ := strings.Cut(args.Commit, ":")
 	if commitHash == "" {
-		return showResult{}, aflow.BadCallError("commit hash is required")
+		commitHash = headCommit
+		args.Commit = headCommit + ":" + filePath
 	}
 
-	var output []byte
-	err := kernel.UseLinuxRepo(ctx, func(kernelRepoDir string, _ vcs.Repo) error {
-		if _, err := runGit(kernelRepoDir, time.Minute, "cat-file", "-e", commitHash+"^{commit}"); err != nil {
-			return gitBadCallError(err, "git show", fmt.Sprintf("commit %v does not exist", commitHash))
-		}
+	if _, err := runGit(state.KernelSrc, time.Minute, "cat-file", "-e", commitHash+"^{commit}"); err != nil {
+		return showResult{}, gitBadCallError(err, "git show", gitAdvice{
+			NotFound: fmt.Sprintf("commit %v does not exist", commitHash),
+		})
+	}
 
-		if filePath != "" {
-			out, err := runGit(kernelRepoDir, time.Minute, "ls-tree", "--name-only", commitHash, "--", filePath)
-			if err != nil {
-				return err
-			}
-			if len(bytes.TrimSpace(out)) == 0 {
-				return aflow.BadCallError("file %q is not present on commit %q", filePath, commitHash)
-			}
+	if filePath != "" {
+		out, err := runGit(state.KernelSrc, time.Minute, "ls-tree", "--name-only", commitHash, "--", filePath)
+		if err != nil {
+			return showResult{}, gitBadCallError(err, "git show", gitAdvice{})
 		}
+		if len(bytes.TrimSpace(out)) == 0 {
+			return showResult{}, aflow.BadCallError("file %q is not present on commit %q", filePath, commitHash)
+		}
+	}
 
-		var err error
-		output, err = runGit(kernelRepoDir, 5*time.Minute, "show", "--no-color", args.Commit)
-		return err
-	})
+	gitArgs := []string{"show", "--no-color"}
+	if args.Stat {
+		gitArgs = append(gitArgs, "--stat")
+	}
+	gitArgs = append(gitArgs, args.Commit)
+	if args.File != "" {
+		gitArgs = append(gitArgs, "--", args.File)
+	}
+
+	output, err := runGit(state.KernelSrc, 5*time.Minute, gitArgs...)
 	if err != nil {
-		return showResult{}, gitBadCallError(err, "git show", "Consider specifying a different commit.")
+		return showResult{}, gitBadCallError(err, "git show", gitAdvice{
+			Timeout: "Consider specifying a different commit.",
+		})
 	}
-	return showResult{Output: truncate(output, maxOutputLines)}, nil
+	return showResult{Output: aflow.TruncateText(string(output), maxOutputLines)}, nil
 }
 
 type blameArgs struct {
@@ -194,40 +207,39 @@ func gitBlame(ctx *aflow.Context, state state, args blameArgs) (blameResult, err
 	args.End = max(args.End, args.Start)
 	args.End = min(args.End, args.Start+maxOutputLines)
 	lineRange := fmt.Sprintf("%d,%d", args.Start, args.End)
-	var output []byte
-	err := kernel.UseLinuxRepo(ctx, func(kernelRepoDir string, _ vcs.Repo) error {
-		var err error
-		output, err = runGit(kernelRepoDir, 5*time.Minute,
-			"blame", "-s", "-L", lineRange, "--abbrev=12", state.KernelCommit, "--", args.File)
-		return err
-	})
+	output, err := runGit(state.KernelSrc, 5*time.Minute,
+		"blame", "-s", "-L", lineRange, "--abbrev=12", headCommit, "--", args.File)
 	if err != nil {
-		return blameResult{}, gitBadCallError(err, "git blame", "Consider specifying a smaller line range.")
+		return blameResult{}, gitBadCallError(err, "git blame", gitAdvice{
+			Timeout: "Consider specifying a smaller line range.",
+		})
 	}
-	return blameResult{Output: truncate(output, maxOutputLines)}, nil
+	return blameResult{Output: aflow.TruncateText(string(output), maxOutputLines)}, nil
 }
 
-func gitBadCallError(err error, name, advice string) error {
+type gitAdvice struct {
+	Timeout  string
+	NotFound string
+}
+
+func gitBadCallError(err error, name string, advice gitAdvice) error {
 	var verr *osutil.VerboseError
 	if !errors.As(err, &verr) {
 		return err
 	}
 	if errors.Is(err, osutil.ErrTimeout) {
-		return aflow.BadCallError("%s timed out. %s", name, advice)
+		if advice.Timeout != "" {
+			return aflow.BadCallError("%s timed out. %s", name, advice.Timeout)
+		}
+		return aflow.BadCallError("%s timed out", name)
 	}
-	if verr.ExitCode == 128 && (bytes.Contains(verr.Output, []byte("bad object")) ||
-		bytes.Contains(verr.Output, []byte("Not a valid object name")) ||
-		bytes.Contains(verr.Output, []byte("bad revision")) ||
-		bytes.Contains(verr.Output, []byte("unknown revision")) ||
-		bytes.Contains(verr.Output, []byte("ambiguous argument")) ||
-		bytes.Contains(verr.Output, []byte("no match")) ||
-		bytes.Contains(verr.Output, []byte("has only")) ||
-		bytes.Contains(verr.Output, []byte("no such path"))) {
-		return aflow.BadCallError("%s failed: %s", name, bytes.TrimSpace(verr.Output))
-	}
-	// This should mean an invalid grep expression.
-	if verr.ExitCode == 128 && bytes.Contains(verr.Output, []byte("fatal:")) {
-		return aflow.BadCallError("%s failed: %s", name, bytes.TrimSpace(verr.Output))
+	if verr.ExitCode == 128 {
+		if advice.NotFound != "" && isNotFound(verr.Output) {
+			return aflow.BadCallError("%s failed: %s", name, advice.NotFound)
+		}
+		if isBadCall(verr.Output) || bytes.Contains(verr.Output, []byte("fatal:")) {
+			return aflow.BadCallError("%s failed: %s", name, bytes.TrimSpace(verr.Output))
+		}
 	}
 	if verr.ExitCode == 1 && len(verr.Output) == 0 {
 		return nil // No matches is a valid result.
@@ -235,16 +247,19 @@ func gitBadCallError(err error, name, advice string) error {
 	return err
 }
 
-func truncate(output []byte, maxLines int) string {
-	lines := slices.Collect(bytes.Lines(output))
-	if len(lines) <= maxLines {
-		return string(output)
-	}
-	return fmt.Sprintf(`
-Full output is too long, showing %v out of %v lines.
+func isNotFound(output []byte) bool {
+	return bytes.Contains(output, []byte("bad object")) ||
+		bytes.Contains(output, []byte("Not a valid object name")) ||
+		bytes.Contains(output, []byte("bad revision")) ||
+		bytes.Contains(output, []byte("unknown revision"))
+}
 
-%s
-`, maxLines, len(lines), slices.Concat(lines[:maxLines]))
+func isBadCall(output []byte) bool {
+	return isNotFound(output) ||
+		bytes.Contains(output, []byte("ambiguous argument")) ||
+		bytes.Contains(output, []byte("no match")) ||
+		bytes.Contains(output, []byte("has only")) ||
+		bytes.Contains(output, []byte("no such path"))
 }
 
 func runGit(dir string, timeout time.Duration, args ...string) ([]byte, error) {

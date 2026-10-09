@@ -102,10 +102,15 @@ type Client interface {
 type ModelCategory string
 
 const (
-	// BestExpensiveModel is the most capable, but potentially slower and more expensive model.
-	BestExpensiveModel ModelCategory = "best-expensive"
-	// GoodBalancedModel is a fast, cost-effective model with good capabilities.
-	GoodBalancedModel ModelCategory = "good-balanced"
+	// DeepReasoningModel is the frontier model for complex causal diagnosis,
+	// architectural planning, and security impact analysis.
+	DeepReasoningModel ModelCategory = "deep-reasoning"
+	// CoreModel is the primary workhorse model for agentic execution,
+	// multi-turn tool interaction, code synthesis, and review loops.
+	CoreModel ModelCategory = "core"
+	// LightweightModel is a low-overhead model for deterministic extraction,
+	// formatting, and context compression.
+	LightweightModel ModelCategory = "lightweight"
 )
 
 // Provider represents an LLM provider (e.g., Gemini, Claude).
@@ -133,6 +138,22 @@ func (e *RetryError) Error() string {
 
 func (e *RetryError) Unwrap() error {
 	return e.Err
+}
+
+const maxLLMBackoff = 3 * time.Minute
+
+func BackoffDuration(try int, baseDelay time.Duration) time.Duration {
+	if baseDelay == 0 {
+		return 0
+	}
+	backoff := baseDelay
+	for range try {
+		backoff *= 2
+		if backoff >= maxLLMBackoff {
+			return maxLLMBackoff
+		}
+	}
+	return backoff
 }
 
 // OutputTokenOverflowError indicates that the model reached its output token limit.

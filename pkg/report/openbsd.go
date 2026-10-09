@@ -26,6 +26,37 @@ func ctorOpenbsd(cfg *config) (reporterImpl, []string, error) {
 	return ctx, suppressions, nil
 }
 
+// Title a trap panic from its backtrace rather than from ddb's "Stopped at"
+// line. On an MP kernel ddb attaches on a CPU that did not fault, so that
+// line reads savectx and the very same defect buckets separately on GENERIC
+// and on GENERIC.MP. Seen for real: one NULL dereference in dovutimens() is
+// open three times over - as "uvm_fault: dovutimens", as "uvm_fault:
+// savectx", and as a third bug whose title is the raw ddb line with two CPUs'
+// printf output interleaved character by character into it.
+//
+// The backtrace sits in one of two places depending on the trap: inside a
+// "Starting stack trace..." block, or directly after ddb's process table.
+// Anchor on neither, and take the first frame-shaped line instead.
+//
+// Frames to walk past: the trap plumbing that got us into the report, and the
+// sanitizer trampolines and byte helpers, which are never themselves the bug
+// (so strlcpy attributes to its caller). Kept in step with the KASAN skip
+// list used elsewhere in this file. Walking past all of them can leave
+// nothing to capture - an MP report in which only the wrong CPU's savectx
+// frame survived - and then this format does not match at all and the
+// "Stopped at" formats below still apply.
+const openbsdSkipFrames = `(?:(?:panic|kerntrap|usertrap|alltraps\w*|savectx|db_enter|` +
+	`__asan_(?:load|store)\w*|kasan_mem\w+|memcpy|memmove|memset|memcmp|bcmp|bcopy|` +
+	`bzero|kcopy|strcmp|strncmp|strlcpy|strlcat|strlen|strnlen|strncpy|copyin\w*|` +
+	`copyout\w*)\([^\n]*\) at [^\n]*\n)*`
+
+// The first frame of that backtrace which is actually a candidate for the bug.
+// It has to resolve to a symbol: a jump through a bad pointer prints
+// "fffffd802ea85278(...) at 0xfffffd802ea85278", which names nothing, so skip
+// it and title by the frame below -- the code that made the bad call.
+const openbsdPanicFrame = `(?:.*\n)+?` + openbsdSkipFrames +
+	`([A-Za-z0-9_]+)\([^\n]*\) at [A-Za-z_]`
+
 var openbsdOopses = append([]*oops{
 	{
 		[]byte("cleaned vnode"),
@@ -41,10 +72,28 @@ var openbsdOopses = append([]*oops{
 		[]byte("panic:"),
 		[]oopsFormat{
 			{
-				title: compile(`Caught invalid memory access(?Us:.*)\n(?:[^\n]* at ` +
-					`(?:__asan_(?:load|store)(?:[0-9]+|N)+_noabort|memcpy|memmove|memset|memcmp|` +
+				// A KASAN fault reaches panic() through one of two frame shapes,
+				// both skipped here so the title names the real faulting function
+				// on the next frame:
+				//   - a compiler-inserted access check: __asan_{load,store}N_noabort
+				//   - the mem/str interceptors, which call kasan_shadow_check and
+				//     panic directly with NO __asan_ frame: kasan_mem{cpy,move,set,cmp}
+				// Plus the byte helpers (memcpy/strlcpy/copyin/...) that are callees,
+				// never the bug themselves.
+				// On MP the initial console panic line can be interleaved
+				// character-by-character with another CPU's printf, leaving the
+				// only clean "Caught invalid memory access" inside the "show
+				// panic" output. The optional prefix lets this format start its
+				// match at the same position as the generic "show panic" format
+				// below, so it wins the position tie by list order instead of
+				// losing by one line.
+				title: compile(`(?:\nddb\{\d+\}> show panic(?Us:.*)[*]cpu\d+: )?` +
+					`Caught invalid memory access(?Us:.*)\n(?:[^\n]* at ` +
+					`(?:__asan_(?:load|store)(?:[0-9]+|N)+_noabort|` +
+					`kasan_mem(?:cpy|move|set|cmp)|` +
+					`memcpy|memmove|memset|memcmp|` +
 					`bcmp|bcopy|bzero|kcopy|strcmp|strncmp|strlcpy|strlcat|strlen|strnlen|` +
-					`strncmp|strncpy|copyin|copyinstr|copyout|copyoutstr)` +
+					`strncpy|copyin|copyinstr|copyout|copyoutstr)` +
 					`\+0x[0-9a-f]+[^\n]*\n)+([A-Za-z0-9_]+)`),
 				fmt: "KASAN: invalid memory access in %[1]v",
 			},
@@ -135,6 +184,14 @@ var openbsdOopses = append([]*oops{
 		[]byte("uvm_fault("),
 		[]oopsFormat{
 			{
+				title: compile("uvm_fault\\(" + openbsdPanicFrame),
+				// The report regexp supplies the format arguments when it is
+				// set, so it has to carry the same capture group.
+				report: compile("uvm_fault\\(" + openbsdPanicFrame +
+					"(?:.*\\n)+?.*end trace frame"),
+				fmt: "uvm_fault: %[1]v",
+			},
+			{
 				title:  compile("uvm_fault\\((?:.*\\n)+?.*Stopped at[ ]+{{ADDR}}"),
 				report: compile("uvm_fault\\((?:.*\\n)+?.*end trace frame"),
 				fmt:    "uvm_fault",
@@ -155,6 +212,14 @@ var openbsdOopses = append([]*oops{
 	{
 		[]byte("kernel:"),
 		[]oopsFormat{
+			{
+				title: compile("kernel: page fault trap" + openbsdPanicFrame),
+				fmt:   "uvm_fault: %[1]v",
+			},
+			{
+				title: compile("kernel: protection fault trap" + openbsdPanicFrame),
+				fmt:   "protection_fault: %[1]v",
+			},
 			{
 				title: compile("kernel: page fault trap, code=0.*\\nStopped at[ ]+([^\\+]+)"),
 				fmt:   "uvm_fault: %[1]v",

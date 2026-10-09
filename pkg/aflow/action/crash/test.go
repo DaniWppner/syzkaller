@@ -4,17 +4,14 @@
 package crash
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
-	"path/filepath"
-	"slices"
 	"time"
 
 	"github.com/google/syzkaller/pkg/aflow"
 	"github.com/google/syzkaller/pkg/aflow/action/kernel"
+	"github.com/google/syzkaller/pkg/aflow/tool/patchdiff"
 	"github.com/google/syzkaller/pkg/hash"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/sys/targets"
@@ -27,10 +24,15 @@ import (
 // and resets source code state to HEAD (removes all local edits).
 var TestPatch = aflow.NewFuncAction("test-patch", testPatch)
 
+// TestPatchInplace is like TestPatch, but it leaves the local edits applied
+// to the source tree instead of resetting it to HEAD.
+var TestPatchInplace = aflow.NewFuncAction("test-patch-inplace", testPatchInplace)
+
 type testArgs struct {
 	AgentName        string
 	TargetOS         string
 	TargetArch       string
+	TargetVMArch     string `json:",omitempty"`
 	Syzkaller        string
 	Image            string
 	Type             string
@@ -49,8 +51,12 @@ type testResult struct {
 }
 
 func testPatch(ctx *aflow.Context, args testArgs) (testResult, error) {
-	res := testResult{}
 	defer undoChanges(args.KernelScratchSrc)
+	return testPatchInplace(ctx, args)
+}
+
+func testPatchInplace(ctx *aflow.Context, args testArgs) (testResult, error) {
+	res := testResult{}
 
 	diff, err := currentDiff(args.KernelScratchSrc)
 	if err != nil {
@@ -91,7 +97,7 @@ func testPatch(ctx *aflow.Context, args testArgs) (testResult, error) {
 
 func testPatchBuild(ctx *aflow.Context, args testArgs) (string, error) {
 	if err := kernel.BuildKernel(args.KernelScratchSrc, args.KernelScratchSrc,
-		args.KernelConfig, args.TargetOS, args.TargetArch, false); err != nil {
+		args.KernelConfig, args.TargetOS, args.TargetArch, args.TargetVMArch, false); err != nil {
 		// TODO: should distinguish between infra errors, and patch compilation errors.
 		return fmt.Sprintf("Building the kernel failed with: %v", err), nil
 	}
@@ -107,21 +113,24 @@ func testPatchRepro(ctx *aflow.Context, args testArgs) (string, error) {
 		return "", err
 	}
 	reproduceArgs := ReproduceArgs{
-		AgentName:    args.AgentName,
-		TargetArch:   args.TargetArch,
-		Syzkaller:    args.Syzkaller,
-		Image:        args.Image,
-		Type:         args.Type,
-		VM:           args.VM,
-		ReproOpts:    args.ReproOpts,
-		ReproSyz:     args.ReproSyz,
-		ReproC:       args.ReproC,
-		KernelSrc:    args.KernelScratchSrc,
-		KernelObj:    args.KernelScratchSrc,
-		KernelCommit: args.KernelCommit,
-		KernelConfig: args.KernelConfig,
+		TargetConfig: TargetConfig{
+			AgentName:    args.AgentName,
+			TargetArch:   args.TargetArch,
+			TargetVMArch: args.TargetVMArch,
+			Syzkaller:    args.Syzkaller,
+			Image:        args.Image,
+			Type:         args.Type,
+			VM:           args.VM,
+			KernelSrc:    args.KernelScratchSrc,
+			KernelObj:    args.KernelScratchSrc,
+			KernelCommit: args.KernelCommit,
+			KernelConfig: args.KernelConfig,
+		},
+		ReproOpts: args.ReproOpts,
+		ReproSyz:  args.ReproSyz,
+		ReproC:    args.ReproC,
 	}
-	testRes, err := RunTest(reproduceArgs, workdir, false)
+	testRes, err := RunTest(ctx, reproduceArgs, workdir, false)
 	if err != nil {
 		return "", err
 	}
@@ -137,25 +146,7 @@ func currentDiff(repo string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	diff, err := osutil.RunCmd(time.Minute, repo, "git", "diff", "-U0")
-	if err != nil {
-		return "", err
-	}
-	formatDiff, err := findClangFormatDiff()
-	if err != nil {
-		return "", err
-	}
-	cmd := exec.Command(formatDiff, "-p1", "-i", "-style=file")
-	cmd.Stdin = bytes.NewReader(diff)
-	cmd.Dir = repo
-	if output, err := osutil.Run(10*time.Minute, cmd); err != nil {
-		return "", fmt.Errorf("%w\n%s", err, output)
-	}
-	diff, err = osutil.RunCmd(time.Minute, repo, "git", "diff")
-	if err != nil {
-		return "", err
-	}
-	return string(diff), nil
+	return patchdiff.Diff(repo)
 }
 
 func undoChanges(repo string) error {
@@ -171,22 +162,4 @@ func undoChanges(repo string) error {
 	// We do not use -fdx to keep object files around and make the next tool call faster.
 	_, err = osutil.RunCmd(time.Minute, repo, "git", "clean", "-fd")
 	return err
-}
-
-func findClangFormatDiff() (string, error) {
-	// It may be installed at different paths, and there may or may not be the version number.
-	paths := []string{
-		"/usr/lib/clang-format*/clang-format-diff.py",
-		"/usr/share/clang/clang-format*/clang-format-diff.py",
-	}
-	for _, path := range paths {
-		files, _ := filepath.Glob(path)
-		if len(files) == 0 {
-			continue
-		}
-		// If there are version numbers, we want to find the latest one.
-		slices.Sort(files)
-		return files[len(files)-1], nil
-	}
-	return "", fmt.Errorf("can't find clang-format-diff.py, install clang-format package")
 }

@@ -47,7 +47,10 @@ func main() {
 	}
 }
 
-const workdir = "workdir"
+const (
+	workdir           = "workdir"
+	defaultTokenLimit = 100 * 1000 * 1000 // 100M tokens
+)
 
 func run(configFile string, exitOnUpgrade, autoUpdate bool, syzkallerDir, name string) error {
 	cfg, err := loadConfig(configFile)
@@ -293,10 +296,14 @@ func (s *Server) executeJob(ctx context.Context, req *dashapi.AIJobPollResp) (ou
 	}
 	agentOS, _ := req.Args["TargetOS"].(string)
 	agentArch, _ := req.Args["TargetArch"].(string)
+	agentVMArch, _ := req.Args["TargetVMArch"].(string)
 
 	var tcfg *TargetConfig
 	for _, t := range s.cfg.Targets {
 		if t.TargetOS == agentOS && t.TargetArch == agentArch {
+			if agentVMArch != "" && t.TargetVMArch != agentVMArch {
+				continue
+			}
 			tcfg = t
 			break
 		}
@@ -308,6 +315,9 @@ func (s *Server) executeJob(ctx context.Context, req *dashapi.AIJobPollResp) (ou
 
 	inputs := initState(tcfg, s.syzkallerDir, s.name)
 	maps.Insert(inputs, maps.All(req.Args))
+	if vmArch, _ := inputs["TargetVMArch"].(string); vmArch == "" {
+		inputs["TargetVMArch"] = tcfg.TargetVMArch
+	}
 
 	onEvent := func(span *trajectory.Span) error {
 		log.Logf(0, "%v", span)
@@ -331,7 +341,8 @@ func (s *Server) executeJob(ctx context.Context, req *dashapi.AIJobPollResp) (ou
 	}
 
 	geminiCfg := gemini.Config{
-		ModelOverride: s.cfg.Model,
+		ModelOverride:   s.cfg.Model,
+		NoSafetyFilters: !s.cfg.SafetyFilters,
 	}
 	switch backend {
 	case backendVertex:
@@ -354,7 +365,13 @@ func (s *Server) executeJob(ctx context.Context, req *dashapi.AIJobPollResp) (ou
 		return nil, fmt.Errorf("failed to initialize LLM provider: %w", err)
 	}
 	defer provider.Close()
-	return flow.Execute(ctx, provider, s.workdir, false, inputs, s.cache, onEvent)
+	return flow.Execute(ctx, inputs, aflow.ExecuteOptions{
+		Provider:   provider,
+		Workdir:    s.workdir,
+		Cache:      s.cache,
+		OnEvent:    onEvent,
+		TokenLimit: defaultTokenLimit,
+	})
 }
 
 func (s *Server) modelOverQuota(flow *aflow.Flow) bool {
@@ -383,6 +400,7 @@ func initState(cfg *TargetConfig, syzkallerDir, agentName string) map[string]any
 		"AgentName":    agentName,
 		"TargetOS":     cfg.TargetOS,
 		"TargetArch":   cfg.TargetArch,
+		"TargetVMArch": cfg.TargetVMArch,
 		"Syzkaller":    osutil.Abs(syzkallerDir),
 		"Image":        cfg.Image,
 		"Type":         cfg.Type,

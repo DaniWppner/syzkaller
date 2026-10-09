@@ -22,7 +22,11 @@
 #include "clang/Basic/CharInfo.h"
 #include "clang/Basic/LLVM.h"
 #include "clang/Basic/SourceManager.h"
+#if __has_include("clang/Basic/TypeTraits.h")
 #include "clang/Basic/TypeTraits.h"
+#else
+#include "clang/Basic/BuiltinTraits.h"
+#endif
 #include "clang/Basic/Version.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Tooling/CommonOptionsParser.h"
@@ -1017,8 +1021,6 @@ static int Main(int argc, const char** argv) {
   return 0;
 }
 
-__attribute__((constructor(1000))) static void ctor(int argc, const char** argv) {
-  const char* run = getenv("SYZ_RUN_CLANGTOOL");
-  if (run && !strcmp(run, "declextract"))
-    exit(Main(argc, argv));
+extern "C" {
+int syz_declextract_main(int argc, char** argv) { return Main(argc, (const char**)argv); }
 }

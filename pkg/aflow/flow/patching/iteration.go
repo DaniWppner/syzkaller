@@ -18,9 +18,10 @@ import (
 )
 
 type PatchIterationInputs struct {
-	AgentName  string
-	TargetOS   string
-	TargetArch string
+	AgentName    string
+	TargetOS     string
+	TargetArch   string
+	TargetVMArch string `json:",omitempty"`
 	// Standard test environment config (same as in patching.Inputs)
 	Syzkaller    string
 	Image        string
@@ -38,13 +39,17 @@ type PatchIterationInputs struct {
 	// Discussion history grouped by patch version.
 	PatchHistory []ai.PatchHistoryEntry
 
+	// Whether textual comment replies are enabled for this stage.
+	ReplyToComments bool `json:",omitzero"`
+
 	// Base fixes tag from previous version.
 	BaseFixes ai.FixesTag `json:",omitzero"`
 
-	BaseReviewedBy []string `json:",omitempty"`
-	BaseAckedBy    []string `json:",omitempty"`
-	BaseTestedBy   []string `json:",omitempty"`
-	BaseReportedBy []string `json:",omitempty"`
+	BaseReviewedBy  []string `json:",omitempty"`
+	BaseAckedBy     []string `json:",omitempty"`
+	BaseTestedBy    []string `json:",omitempty"`
+	BaseReportedBy  []string `json:",omitempty"`
+	BaseSuggestedBy []string `json:",omitempty"`
 
 	// See patching workflow.
 	BaseRepository string
@@ -54,7 +59,8 @@ type PatchIterationInputs struct {
 }
 
 type verdictAgentOutputs struct {
-	CodeItems         []string `jsonschema:"Clean list of changes explicitly requested for the code itself."`
+	CodeItems         []string `jsonschema:"Clean list of changes explicitly requested for the code logic itself."`
+	StyleItems        []string `jsonschema:"Clean list of changes requested for code style and formatting."`
 	DescriptionItems  []string `jsonschema:"Clean list of changes requested to the commit description/changelog."`
 	FixesItems        []string `jsonschema:"Clean list of comments suggesting Fixes tag is incorrect or needs update."`
 	UpdateFixesReason string   `jsonschema:"Explanation of why Fixes tag needs update, and any hints by reviewers."`
@@ -62,7 +68,8 @@ type verdictAgentOutputs struct {
 }
 
 func validateVerdictOutputs(ctx *aflow.Context, state struct{}, args verdictAgentOutputs) (verdictAgentOutputs, error) {
-	hasItems := len(args.CodeItems) > 0 || len(args.DescriptionItems) > 0 || len(args.FixesItems) > 0
+	hasItems := len(args.CodeItems) > 0 || len(args.StyleItems) > 0 ||
+		len(args.DescriptionItems) > 0 || len(args.FixesItems) > 0
 	hasResend := args.ResendReason != ""
 	if hasItems && hasResend {
 		return args, aflow.BadCallError("cannot provide both Items arrays and a ResendReason; " +
@@ -93,6 +100,8 @@ func init() {
 		&aflow.Flow{
 			Consts: map[string]any{
 				"NeedStrace": false,
+				"Sandbox":    "none",
+				"Snapshot":   false,
 			},
 			Root: aflow.Pipeline(
 				// Setup base kernel for code tools.
@@ -107,7 +116,7 @@ func init() {
 				// Analyze comments to decide whether we need to generate a new patch version.
 				&aflow.LLMAgent{
 					Name:        "verdict-agent",
-					Model:       aflow.BestExpensiveModel,
+					Model:       aflow.CoreModel,
 					Outputs:     aflow.ValidatedLLMOutputs[verdictAgentOutputs](validateVerdictOutputs),
 					TaskType:    aflow.FormalReasoningTask,
 					Instruction: verdictInstruction,
@@ -125,16 +134,20 @@ func init() {
 						kernel.CheckoutScratch,
 						&aflow.If{
 							Condition: "CodeItems",
+							// In patch-iteration, human reviewer feedback is the sole ground truth,
+							// so we do not run an automated architectural reviewer agent.
 							Do: patchGenerationLoop(
-								applyGitPatch, patchIterationInstruction, patchIterationPrompt, viewPatchHistoryTool),
-							Else: aflow.Pipeline(applyGitPatch, forwardPatchDiff),
+								applyGitPatch, patchIterationInstruction, patchIterationPrompt,
+								"", viewPatchHistoryTool),
+							Else: forwardPatchDiff,
 						},
+						patchRefinementLoop(false),
 						&aflow.If{
 							Condition: "FixesItems",
 							Do: aflow.Pipeline(
 								&aflow.LLMAgent{
 									Name:        "fixes-finder",
-									Model:       aflow.BestExpensiveModel,
+									Model:       aflow.CoreModel,
 									Outputs:     aflow.ValidatedLLMOutputs[fixesFinderArgs](validateFixesHashes),
 									TaskType:    aflow.FormalReasoningTask,
 									Instruction: fixesIterationInstruction,
@@ -147,7 +160,7 @@ func init() {
 						getRecentCommits,
 						&aflow.LLMAgent{
 							Name:        "changelog-generator",
-							Model:       aflow.GoodBalancedModel,
+							Model:       aflow.CoreModel,
 							Outputs:     aflow.ValidatedLLMOutputs[changelogGeneratorOutputs](validateChangelogOutputs),
 							TaskType:    aflow.FormalReasoningTask,
 							Instruction: changelogInstruction,
@@ -157,27 +170,31 @@ func init() {
 					),
 				},
 
-				// Evaluate each new thread comment individually to decide if it needs a direct reply.
-				&aflow.ForEach{
-					List: "NewComments",
-					Item: "CurrentComment",
-					Do: aflow.Pipeline(
-						&aflow.LLMAgent{
-							Name:  "comment-reply-agent",
-							Model: aflow.BestExpensiveModel,
-							// nolint: lll
-							Outputs: aflow.LLMOutputs[struct {
-								Action    string `jsonschema:"Either 'reply' or 'ignore'"`
-								Reason    string `jsonschema:"Explanation of why you chose to reply or ignore"`
-								Quote     string `jsonschema:"A brief, relevant verbatim excerpt (1-3 lines) cut directly from the original comment being replied to."`
-								ReplyText string `jsonschema:"The final text of your reply."`
-							}](),
-							TaskType:    aflow.FormalReasoningTask,
-							Instruction: commentProcessInstruction,
-							Prompt:      commentProcessPrompt,
-						},
-						appendCommentReply,
-					),
+				// Evaluate each new thread comment individually to decide if it needs a direct reply,
+				// provided that replying to comments is enabled for this stage.
+				&aflow.If{
+					Condition: "ReplyToComments",
+					Do: &aflow.ForEach{
+						List: "NewComments",
+						Item: "CurrentComment",
+						Do: aflow.Pipeline(
+							&aflow.LLMAgent{
+								Name:  "comment-reply-agent",
+								Model: aflow.CoreModel,
+								// nolint: lll
+								Outputs: aflow.LLMOutputs[struct {
+									Action    string `jsonschema:"Either 'reply' or 'ignore'"`
+									Reason    string `jsonschema:"Explanation of why you chose to reply or ignore"`
+									Quote     string `jsonschema:"A brief, relevant verbatim excerpt (1-3 lines) cut directly from the original comment being replied to."`
+									ReplyText string `jsonschema:"The final text of your reply."`
+								}](),
+								TaskType:    aflow.FormalReasoningTask,
+								Instruction: commentProcessInstruction,
+								Prompt:      commentProcessPrompt,
+							},
+							appendCommentReply,
+						),
+					},
 				},
 			),
 		})
@@ -222,6 +239,7 @@ var viewPatchHistoryTool = aflow.NewFuncTool("view-patch-history", func(ctx *afl
 
 var extractTriageResults = aflow.NewFuncAction("extract-triage-results", func(ctx *aflow.Context, args struct {
 	CodeItems        []string
+	StyleItems       []string
 	DescriptionItems []string
 	FixesItems       []string
 	ResendReason     string
@@ -231,7 +249,7 @@ var extractTriageResults = aflow.NewFuncAction("extract-triage-results", func(ct
 	return struct {
 		NeedNewVersion bool
 	}{
-		NeedNewVersion: len(args.CodeItems) > 0 || len(args.DescriptionItems) > 0 ||
+		NeedNewVersion: len(args.CodeItems) > 0 || len(args.StyleItems) > 0 || len(args.DescriptionItems) > 0 ||
 			len(args.FixesItems) > 0 || args.ResendReason != "",
 	}, nil
 })
@@ -433,10 +451,11 @@ Your task is to determine if a new version of the patch needs to be generated ba
 You must also distill the messy email feedback into clean lists of requirements for downstream agents.
 CRITICAL: You must extract actionable items ONLY from the new comments provided in the current iteration.
 Do not extract items from previous historical comments.
-Separate the actionable items into three strictly divided categories:
-1. CodeActionItems: Changes requested to the C/header source code.
-2. DescriptionActionItems: Changes requested to the commit description or changelog.
-3. FixesActionItems: Feedback regarding the Fixes tag.
+Separate the actionable items into four strictly divided categories:
+1. CodeActionItems: Changes requested to the C/header source code logic.
+2. StyleActionItems: Changes requested for code style and formatting.
+3. DescriptionActionItems: Changes requested to the commit description or changelog.
+4. FixesActionItems: Feedback regarding the Fixes tag.
 Watch out for citations (lines starting with >) which often contain previous messages or context, not new requirements.
 Note: You shouldn't fully debug the issue right now. Just do a cautious check if the V+1 patch is necessary.
 
@@ -469,6 +488,11 @@ with standard JSON escapes (like \n for newlines and \" for quotes), but are oth
 `
 
 const verdictPrompt = `
+{{if not .ReplyToComments}}
+Note: Sending textual comment replies is disabled for this stage. The bot cannot reply to comments
+or ask clarifying questions; it can only generate and send a new patch version if actionable
+changes are requested.
+{{end}}
 Bug title: {{jsonMarshal .BugTitle}}
 Crash report:
 {{jsonMarshal .CrashReport}}
@@ -594,7 +618,7 @@ e.g. "as I already told you", "as explained in the commit message", etc.
 
 
 If a reviewer asks to add or remove a tag (like Reviewed-by, Acked-by, etc) that is NOT in the supported
-list: "Reviewed-by", "Acked-by", "Tested-by", "Reported-by", you MUST reply and explain that the
+list: "Reviewed-by", "Acked-by", "Tested-by", "Reported-by", "Suggested-by", you MUST reply and explain that the
 automated system currently only supports processing this specific list of tags, so you cannot apply
 their tag automatically.
 

@@ -86,6 +86,7 @@ type Manager struct {
 	cfg            *Config
 	repo           vcs.Repo
 	mgrcfg         *ManagerConfig
+	namespace      string
 	managercfg     *mgrconfig.Config
 	cmd            *ManagerCmd
 	dash           ManagerDashapi
@@ -101,6 +102,7 @@ type ManagerDashapi interface {
 	ReportBuildError(req *dashapi.BuildErrorReq) error
 	UploadBuild(build *dashapi.Build) error
 	BuilderPoll(manager string) (*dashapi.BuilderPollResp, error)
+	ClientInfo() (*dashapi.ClientInfoResp, error)
 	LogError(name, msg string, args ...any)
 	CommitPoll() (*dashapi.CommitPollResp, error)
 	UploadCommits(commits []dashapi.Commit) error
@@ -495,22 +497,44 @@ func (mgr *Manager) testImage(imageDir string, info *BuildInfo) error {
 	if err != nil {
 		return fmt.Errorf("failed to create manager config: %w", err)
 	}
-	rep, err := instance.RunSmokeTest(mgrcfg)
-	if err != nil {
-		mgr.Errorf("%s", err)
-		return err
-	} else if rep == nil {
-		return nil
+	var rep *report.Report
+	if mgr.mgrcfg.Tests != "" {
+		log.Logf(0, "%v: running tests %q...", mgr.name, mgr.mgrcfg.Tests)
+		rep, err = instance.RunTests(mgrcfg, mgr.mgrcfg.Tests)
+		if err != nil {
+			mgr.Errorf("%s", err)
+			return err
+		}
+		if rep != nil {
+			// Override the title to a constant string to ensure all unit test failures
+			// are grouped under a single bug on the dashboard. The list of specific
+			// failing tests is still visible in the crash log output.
+			rep.Title = "SYZFATAL: unit test error"
+			rep.AltTitles = nil
+			if err := mgr.reportBuildError(rep, info, imageDir); err != nil {
+				mgr.Errorf("failed to report image error: %v", err)
+			}
+			return fmt.Errorf("%s", rep.Title)
+		}
+	} else {
+		rep, err = instance.RunSmokeTest(mgrcfg)
+		if err != nil {
+			mgr.Errorf("%s", err)
+			return err
+		}
+		if rep != nil {
+			rep.Title = fmt.Sprintf("%v test error: %v", mgr.mgrcfg.RepoAlias, rep.Title)
+			// There are usually no duplicates for boot errors, so we reset AltTitles.
+			// But if we pass them, we would need to add the same prefix as for Title
+			// in order to avoid duping boot bugs with non-boot bugs.
+			rep.AltTitles = nil
+			if err := mgr.reportBuildError(rep, info, imageDir); err != nil {
+				mgr.Errorf("failed to report image error: %v", err)
+			}
+			return fmt.Errorf("%s", rep.Title)
+		}
 	}
-	rep.Title = fmt.Sprintf("%v test error: %v", mgr.mgrcfg.RepoAlias, rep.Title)
-	// There are usually no duplicates for boot errors, so we reset AltTitles.
-	// But if we pass them, we would need to add the same prefix as for Title
-	// in order to avoid duping boot bugs with non-boot bugs.
-	rep.AltTitles = nil
-	if err := mgr.reportBuildError(rep, info, imageDir); err != nil {
-		mgr.Errorf("failed to report image error: %v", err)
-	}
-	return fmt.Errorf("%s", rep.Title)
+	return nil
 }
 
 func (mgr *Manager) reportBuildError(rep *report.Report, info *BuildInfo, imageDir string) error {
@@ -554,8 +578,7 @@ func (mgr *Manager) reportBuildError(rep *report.Report, info *BuildInfo, imageD
 }
 
 func (mgr *Manager) createTestConfig(imageDir string, info *BuildInfo) (*mgrconfig.Config, error) {
-	mgrcfg := new(mgrconfig.Config)
-	*mgrcfg = *mgr.managercfg
+	mgrcfg := mgr.jobConfig()
 	mgrcfg.Name += "-test"
 	mgrcfg.Tag = info.KernelCommit
 	mgrcfg.HTTP = "" // Don't start the HTTP server.
@@ -573,6 +596,15 @@ func (mgr *Manager) createTestConfig(imageDir string, info *BuildInfo) (*mgrconf
 		return nil, fmt.Errorf("bad manager config: %w", err)
 	}
 	return mgrcfg, nil
+}
+
+// disable strace on all syz-ci jobs.
+func (mgr *Manager) jobConfig() *mgrconfig.Config {
+	mgrcfg := new(mgrconfig.Config)
+	*mgrcfg = *mgr.managercfg
+	mgrcfg.StraceBin = ""
+	mgrcfg.StraceBinOnTarget = false
+	return mgrcfg
 }
 
 func (mgr *Manager) writeConfig(buildTag string) (string, error) {
@@ -954,7 +986,27 @@ func (mgr *Manager) uploadCoverJSONLToGCS(ctx context.Context, gcsClient gcs.Cli
 	return eg.Wait()
 }
 
+func (mgr *Manager) getNamespace() (string, error) {
+	if mgr.namespace != "" {
+		return mgr.namespace, nil
+	}
+	if mgr.dash == nil {
+		return "", nil
+	}
+	log.Logf(0, "%s: requesting namespace from dashboard...", mgr.name)
+	info, err := mgr.dash.ClientInfo()
+	if err != nil {
+		return "", fmt.Errorf("failed to get namespace from dashboard: %w", err)
+	}
+	mgr.namespace = info.Namespace
+	return mgr.namespace, nil
+}
+
 func (mgr *Manager) uploadCoverStat(ctx context.Context, fuzzingMinutes int) error {
+	ns, err := mgr.getNamespace()
+	if err != nil {
+		return fmt.Errorf("failed to get namespace: %w", err)
+	}
 	// Coverage report generation consumes and caches lots of memory.
 	// In the syz-ci context report generation won't be used after this point,
 	// so tell manager to flush report generator.
@@ -975,6 +1027,7 @@ func (mgr *Manager) uploadCoverStat(ctx context.Context, fuzzingMinutes int) err
 			if err := cover.WriteCIJSONLine(w, covInfo, cover.CIDetails{
 				Version:        1,
 				Timestamp:      curTime.Format(time.RFC3339Nano),
+				Namespace:      ns,
 				FuzzingMinutes: fuzzingMinutes,
 				Arch:           mgr.lastBuild.Arch,
 				BuildID:        mgr.lastBuild.ID,

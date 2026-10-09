@@ -105,7 +105,7 @@ endif
 	bin/syz-extract bin/syz-fmt \
 	extract generate generate_go generate_rpc generate_sys \
 	format format_go format_cpp format_sys \
-	tidy deadcode test test_race \
+	tidy lint deadcode test test_race \
 	check_copyright check_language check_whitespace check_sql_newlines check_links check_diff check_commits check_shebang check_html \
 	presubmit presubmit_aux presubmit_build presubmit_arch_linux presubmit_arch_freebsd \
 	presubmit_arch_netbsd presubmit_arch_openbsd presubmit_arch_darwin presubmit_arch_windows \
@@ -156,7 +156,8 @@ go-flags:
 	@echo "${GOHOSTFLAGS}"
 
 aflow: descriptions
-	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-aflow github.com/google/syzkaller/tools/syz-aflow
+	# syz-aflow uses codesearch clang tool which requires cgo.
+	CGO_ENABLED=1 GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-aflow github.com/google/syzkaller/tools/syz-aflow
 
 manager: descriptions
 	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-manager github.com/google/syzkaller/syz-manager
@@ -260,7 +261,7 @@ generate_rpc:
 
 generate_trace2syz:
 	(cd tools/syz-trace2syz/parser; ragel -Z -G2 -o lex.go straceLex.rl)
-	(cd tools/syz-trace2syz/parser; goyacc -o strace.go -p Strace -v="" strace.y)
+	(cd tools/syz-trace2syz/parser; $(HOSTGO) tool goyacc -o strace.go -p Strace -v="" strace.y)
 
 format: format_go format_cpp format_sys format_keep_sorted
 
@@ -279,7 +280,7 @@ format_cpp:
 |pkg/flatrpc/flatrpc.h\
 |pkg/covermerger/testdata/integration/\
 |executor/android/.*_policy.h" \
-	| xargs -I {} -P 0 clang-format --style=file -i {}
+	| xargs -I {} -P 100 clang-format --style=file -i {}
 
 format_sys: bin/syz-fmt
 	bin/syz-fmt all
@@ -299,8 +300,10 @@ tidy: descriptions
 		--extra-arg=-std=c++17 \
 		executor/*.cc
 
-lint: deadcode check_whitespace check_sql_newlines check_links check_html check_shebang
+bin/golangci-lint: go.mod
 	CGO_ENABLED=1 $(HOSTGO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint
+
+lint: bin/golangci-lint check_whitespace check_sql_newlines check_links check_html check_shebang
 	CGO_ENABLED=1 $(HOSTGO) build -buildmode=plugin -o bin/syz-linter.so ./tools/syz-linter
 	bin/golangci-lint run ./...
 
@@ -324,7 +327,7 @@ presubmit:
 
 presubmit_aux:
 	$(MAKE) generate
-	$(MAKE) -j100 check_commits check_diff check_copyright check_language check_k8s tidy
+	$(MAKE) -j100 check_commits check_diff check_copyright check_language check_k8s tidy deadcode
 	$(GO) mod tidy
 
 presubmit_build: descriptions
@@ -340,6 +343,7 @@ presubmit_arch_linux: descriptions
 	TARGETOS=linux TARGETARCH=386 TARGETVMARCH=386 $(MAKE) target
 	TARGETOS=linux TARGETARCH=arm64 TARGETVMARCH=arm64 $(MAKE) target
 	TARGETOS=linux TARGETARCH=arm TARGETVMARCH=arm $(MAKE) target
+	TARGETOS=linux TARGETARCH=loong64 TARGETVMARCH=loong64 $(MAKE) target
 	TARGETOS=linux TARGETARCH=mips64le TARGETVMARCH=mips64le $(MAKE) target
 	TARGETOS=linux TARGETARCH=ppc64le TARGETVMARCH=ppc64le $(MAKE) target
 	TARGETOS=linux TARGETARCH=riscv64 TARGETVMARCH=riscv64 $(MAKE) target
@@ -423,12 +427,12 @@ install_prerequisites: act
 	sudo apt-get install -y -q g++-mips64el-linux-gnuabi64 || true
 	sudo apt-get install -y -q g++-s390x-linux-gnu || true
 	sudo apt-get install -y -q g++-riscv64-linux-gnu || true
+	sudo apt-get install -y -q g++-loongarch64-linux-gnu || true
 	sudo apt-get install -y -q g++ || true
 	[ -z "$(shell which python)" -a -n "$(shell which python3)" ] && sudo apt-get install -y -q python-is-python3 || true
 	sudo apt-get install -y -q clang-tidy || true
 	sudo apt-get install -y -q clang clang-format ragel
 	sudo apt-get install -y -q flatbuffers-compiler libflatbuffers-dev
-	GO111MODULE=off go get -u golang.org/x/tools/cmd/goyacc
 
 check_copyright:
 	./tools/check-copyright.sh

@@ -115,13 +115,14 @@ func (sf *SeriesFetcher) Update(ctx context.Context, from time.Time) error {
 	if err != nil {
 		return fmt.Errorf("failed to fetch the config: %w", err)
 	}
+	ownEmails := cfg.EmailReporting.OwnEmails()
 	for _, item := range list {
 		// TODO: this could be done in several threads.
 		rawBody, err := item.Read()
 		if err != nil {
 			return fmt.Errorf("failed to read email %s: %w", item.Hash, err)
 		}
-		email, err := lore.Parse(rawBody, nil, nil)
+		email, err := lore.Parse(rawBody, ownEmails, nil)
 		if err != nil {
 			log.Printf("failed to parse email: %v", err)
 			continue
@@ -153,7 +154,17 @@ func (sf *SeriesFetcher) handleSeries(ctx context.Context, cfg *app.AppConfig, s
 		return nil
 	}
 	first := series.Patches[0]
-	reportLevel := api.ReportLevelAll
+	var directRequest bool
+	if cfg.DirectList != "" {
+		canonicalDirect := email.CanonicalEmail(cfg.DirectList)
+		directRequest = slices.ContainsFunc(first.RawCc, func(addr string) bool {
+			return email.CanonicalEmail(addr) == canonicalDirect
+		})
+	}
+	reportLevel := api.ReportLevelBugs
+	if directRequest {
+		reportLevel = api.ReportLevelAll
+	}
 	if first.OwnEmail {
 		// If another bot instance reads the same mailing list, we don't want to
 		// spam it back. So we still fuzz the series, but don't report the results.
@@ -166,14 +177,22 @@ func (sf *SeriesFetcher) handleSeries(ctx context.Context, cfg *app.AppConfig, s
 		date = time.Now()
 	}
 	apiSeries := &api.Series{
-		ExtID:          series.MessageID,
-		AuthorEmail:    first.Author,
-		Title:          series.Subject,
-		Version:        series.Version,
-		SubjectTags:    series.Tags,
-		Link:           lore.LinkToMessage(series.MessageID),
-		PublishedAt:    date,
-		BaseCommitHint: series.BaseCommitHint,
+		ExtID:             series.MessageID,
+		AuthorEmail:       first.Author,
+		Title:             series.Subject,
+		Version:           series.Version,
+		SubjectTags:       series.Tags,
+		Link:              lore.LinkToMessage(series.MessageID),
+		PublishedAt:       date,
+		BaseCommitHint:    series.BaseCommitHint,
+		XStable:           series.XStable,
+		XKernelTestBranch: series.XKernelTestBranch,
+	}
+	// Only developer backports with an explicit stable version in the subject/tags are skipped here.
+	// Upstream bug fixes that just Cc stable@vger.kernel.org are processed as normal upstream series.
+	if apiSeries.IsStableBackport() {
+		log.Printf("skipping stable backport %s (%s)", series.MessageID, series.Subject)
+		return nil
 	}
 	sp := seriesProcessor{}
 	for i, patch := range series.Patches {
@@ -194,23 +213,21 @@ func (sf *SeriesFetcher) handleSeries(ctx context.Context, cfg *app.AppConfig, s
 			Body:  body,
 		})
 	}
-	apiSeries.Cc = sp.Emails()
+	if len(series.CoverCc) > 0 && series.XStable == "review" {
+		coverSp := seriesProcessor{}
+		for _, email := range series.CoverCc {
+			coverSp[email] = struct{}{}
+		}
+		apiSeries.Cc = coverSp.Emails()
+	} else {
+		apiSeries.Cc = sp.Emails()
+	}
 	ret, err := sf.client.UploadSeries(ctx, apiSeries)
 	if err != nil {
 		return fmt.Errorf("failed to save series: %w", err)
 	} else if !ret.Saved {
 		log.Printf("series %s already exists in the DB", series.MessageID)
 		return nil
-	}
-	var directRequest bool
-	if cfg.DirectList != "" {
-		canonicalDirect := email.CanonicalEmail(cfg.DirectList)
-		for _, addr := range first.RawCc {
-			if email.CanonicalEmail(addr) == canonicalDirect {
-				directRequest = true
-				break
-			}
-		}
 	}
 
 	_, err = sf.client.UploadSession(ctx, &api.NewSession{

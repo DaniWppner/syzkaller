@@ -87,41 +87,53 @@ type Build struct {
 	AssetsLastCheck     time.Time // the last time we checked the assets for deprecation
 }
 
+// bugStructVersion is the current version of the Bug entity schema in Datastore.
+// Bump this version when making backwards-incompatible changes to the Bug entity
+// that require a schema migration handler.
+const bugStructVersion = 2
+
 type Bug struct {
-	Namespace    string
-	Seq          int64 // sequences of the bug with the same title
-	Title        string
-	MergedTitles []string // crash titles that we already merged into this bug
-	AltTitles    []string // alternative crash titles that we may merge into this bug
-	Status       int
-	StatusReason dashapi.BugStatusReason // e.g. if the bug status is "invalid", here's the reason why
-	DupOf        string
-	NumCrashes   int64
-	NumRepro     int64
-	// ReproLevel is the best ever found repro level for this bug.
-	// HeadReproLevel is best known repro level that still works on the HEAD commit.
-	ReproLevel      dashapi.ReproLevel
-	HeadReproLevel  dashapi.ReproLevel `datastore:"HeadReproLevel"`
-	BisectCause     BisectStatus
-	BisectFix       BisectStatus
-	HasReport       bool
-	NeedCommitInfo  bool
-	FirstTime       time.Time
-	LastTime        time.Time
-	LastSavedCrash  time.Time
-	LastReproTime   time.Time
-	LastCauseBisect time.Time
-	FixTime         time.Time // when we become aware of the fixing commit
-	LastActivity    time.Time // last time we observed any activity related to the bug
-	Closed          time.Time
-	SubsystemsTime  time.Time // when we have updated subsystems last time
-	SubsystemsRev   int
-	Reporting       []BugReporting
-	Commits         []string // titles of fixing commmits
-	CommitInfo      []Commit // additional info for commits (for historical reasons parallel array to Commits)
-	HappenedOn      []string // list of managers
-	PatchedOn       []string `datastore:",noindex"` // list of managers
-	UNCC            []string // don't CC these emails on this bug
+	Namespace       string
+	Seq             int64 // sequences of the bug with the same title
+	Title           string
+	MergedTitles    []string // crash titles that we already merged into this bug
+	AltTitles       []string // alternative crash titles that we may merge into this bug
+	Status          int
+	StatusReason    dashapi.BugStatusReason // e.g. if the bug status is "invalid", here's the reason why
+	DupOf           string
+	NumCrashes      int64
+	NumRepro        int64
+	HasCRepro       bool
+	HasSyzRepro     bool
+	HeadHasCRepro   bool
+	HeadHasSyzRepro bool
+	// StructVersion is the version of the Bug entity schema in Datastore.
+	// Used to select batches of bugs during schema migrations.
+	StructVersion  int
+	BisectCause    BisectStatus
+	BisectFix      BisectStatus
+	HasReport      bool
+	NeedCommitInfo bool
+	FirstTime      time.Time
+	LastTime       time.Time
+	LastSavedCrash time.Time
+	LastReproTime  time.Time
+	// FirstCReproTime is the timestamp when the first C reproducer was found for the bug.
+	FirstCReproTime time.Time `datastore:",noindex"`
+	// FirstSyzReproTime is the timestamp when the first Syz reproducer was found for the bug.
+	FirstSyzReproTime time.Time `datastore:",noindex"`
+	LastCauseBisect   time.Time
+	FixTime           time.Time // when we become aware of the fixing commit
+	LastActivity      time.Time // last time we observed any activity related to the bug
+	Closed            time.Time
+	SubsystemsTime    time.Time // when we have updated subsystems last time
+	SubsystemsRev     int
+	Reporting         []BugReporting
+	Commits           []string // titles of fixing commmits
+	CommitInfo        []Commit // additional info for commits (for historical reasons parallel array to Commits)
+	HappenedOn        []string // list of managers
+	PatchedOn         []string `datastore:",noindex"` // list of managers
+	UNCC              []string // don't CC these emails on this bug
 	// Kcidb publishing status bitmask:
 	// bit 0 - the bug is published
 	// bit 1 - don't want to publish it (syzkaller build/test errors)
@@ -249,6 +261,9 @@ func (bug *Bug) Load(origProps []db.Property) error {
 	for _, p := range origProps {
 		if strings.HasPrefix(p.Name, "Tags.") {
 			tags = append(tags, p)
+		} else if p.Name == "ReproLevel" || p.Name == "HeadReproLevel" {
+			// Skip legacy fields to avoid ErrFieldMismatch from db.LoadStruct.
+			continue
 		} else {
 			ps = append(ps, p)
 		}
@@ -268,18 +283,6 @@ func (bug *Bug) Load(origProps []db.Property) error {
 				Value: entry.Name,
 			})
 		}
-	}
-	headReproFound := false
-	for _, p := range ps {
-		if p.Name == "HeadReproLevel" {
-			headReproFound = true
-			break
-		}
-	}
-	if !headReproFound {
-		// The field is new, so it won't be set in all entities.
-		// Assume it to be equal to the best found repro for the bug.
-		bug.HeadReproLevel = bug.ReproLevel
 	}
 	return nil
 }
@@ -589,10 +592,11 @@ type Job struct {
 	CrashID   int64
 
 	// Provided by user:
-	KernelRepo   string
-	KernelBranch string
-	Patch        int64 // reference to Patch text entity
-	KernelConfig int64 // reference to the kernel config entity
+	KernelRepo      string
+	KernelBranch    string
+	Patch           int64 // reference to Patch text entity
+	KernelConfig    int64 // reference to the kernel config entity
+	CandidateReproC int64 // reference to ReproC text entity (for C reproducer testing)
 
 	Attempts    int       // number of times we tried to execute this job
 	IsRunning   bool      // the job might have been started, but never finished
@@ -1224,4 +1228,51 @@ func runInTransaction(ctx context.Context, tx txFunc, opts *db.TransactionOption
 		return err
 	}
 	return fmt.Errorf("failed after %v dev server retries: %w", maxDevAppServerRetries, err)
+}
+
+func (bug *Bug) ReproLevelVal() dashapi.ReproLevel {
+	return dashapi.ReproLevelFromCAndSyz(bug.HasCRepro, bug.HasSyzRepro)
+}
+
+func (bug *Bug) HeadReproLevelVal() dashapi.ReproLevel {
+	return dashapi.ReproLevelFromCAndSyz(bug.HeadHasCRepro, bug.HeadHasSyzRepro)
+}
+
+// UpdateReproLevel updates the bug reproducer levels and records FirstCReproTime / FirstSyzReproTime.
+func (bug *Bug) UpdateReproLevel(hasC, hasSyz bool, now time.Time) {
+	if hasC && !bug.HasCRepro && bug.FirstCReproTime.IsZero() {
+		bug.FirstCReproTime = now
+	}
+	if hasSyz && !bug.HasSyzRepro && bug.FirstSyzReproTime.IsZero() {
+		bug.FirstSyzReproTime = now
+	}
+	bug.HasCRepro = bug.HasCRepro || hasC
+	bug.HasSyzRepro = bug.HasSyzRepro || hasSyz
+}
+
+// UpdateHeadReproLevel updates the bug head repro level.
+func (bug *Bug) UpdateHeadReproLevel(hasC, hasSyz bool) {
+	bug.HeadHasCRepro = bug.HeadHasCRepro || hasC
+	bug.HeadHasSyzRepro = bug.HeadHasSyzRepro || hasSyz
+}
+
+func (bug *Bug) HasRepro() bool {
+	return bug.HasCRepro || bug.HasSyzRepro
+}
+
+func (bug *Bug) HasHeadRepro() bool {
+	return bug.HeadHasCRepro || bug.HeadHasSyzRepro
+}
+
+func (r *BugReporting) HasRepro(bug *Bug) bool {
+	return r.ReproLevel > dashapi.ReproLevelNone
+}
+
+func (r *BugReporting) UpdateReproLevel(bug *Bug, level dashapi.ReproLevel) {
+	r.ReproLevel = max(r.ReproLevel, level)
+}
+
+func (bug *Bug) SetHeadReproLevel(hasC, hasSyz bool) {
+	bug.HeadHasCRepro = hasC
+	bug.HeadHasSyzRepro = hasSyz
 }

@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"net/mail"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 
+	"github.com/google/syzkaller/pkg/email"
 	"github.com/google/syzkaller/syz-cluster/pkg/api"
 	"gopkg.in/yaml.v3"
 )
@@ -59,6 +61,8 @@ type EmailConfig struct {
 	SupportEmail string `yaml:"supportEmail"`
 	// The address will be suggested for the Tested-by tag.
 	CreditEmail string `yaml:"creditEmail"`
+	// Extra own email addresses to recognize.
+	ExtraOwnEmails []string `yaml:"extraOwnEmails"`
 	// The means to send the emails ("smtp", "dashapi").
 	Sender string `yaml:"sender"`
 	// Will be used if Sender is "smtp".
@@ -75,6 +79,21 @@ type EmailConfig struct {
 	LoreArchiveURL string `yaml:"loreArchiveURL"`
 	// The prefix which will be added to all reports' titles.
 	SubjectPrefix string `yaml:"subjectPrefix"`
+}
+
+func (c *EmailConfig) OwnEmails() []string {
+	if c == nil {
+		return nil
+	}
+	var own []string
+	if c.Dashapi != nil && c.Dashapi.From != "" {
+		own = append(own, c.Dashapi.From)
+	}
+	if c.SMTP != nil && c.SMTP.From != "" {
+		own = append(own, c.SMTP.From)
+	}
+	own = append(own, c.ExtraOwnEmails...)
+	return email.MergeEmailLists(own)
 }
 
 type SMTPConfig struct {
@@ -142,10 +161,23 @@ func (c AppConfig) Validate() error {
 			return fmt.Errorf("emailReporting: %w", err)
 		}
 	}
+	for _, target := range c.FuzzTargets {
+		for _, r := range target.PathRegexps {
+			if _, err := regexp.Compile(r); err != nil {
+				return fmt.Errorf("invalid path regexp %q: %w", r, err)
+			}
+		}
+		for _, campaign := range target.Campaigns {
+			if campaign.Track != string(api.TrackKASAN) && campaign.Track != string(api.TrackKMSAN) {
+				return fmt.Errorf("unsupported fuzzing track %q, must be %q or %q",
+					campaign.Track, api.TrackKASAN, api.TrackKMSAN)
+			}
+		}
+	}
 	return nil
 }
 
-func (c EmailConfig) Validate() error {
+func (c *EmailConfig) Validate() error {
 	for _, err := range []error{
 		ensureNonEmpty("name", c.Name),
 		ensureEmail("supportEmail", c.SupportEmail),

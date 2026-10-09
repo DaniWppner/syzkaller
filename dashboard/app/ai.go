@@ -50,6 +50,18 @@ type uiAIJobsPage struct {
 	PrevCursorID    string
 }
 
+func (p *uiAIJobsPage) GetJobs() []*uiAIJob {
+	return p.Jobs
+}
+
+func (p *uiAIJobsPage) IsAdmin() bool {
+	return p.Header.Admin
+}
+
+func (p *uiAIJobsPage) ShowTestOnManager() bool {
+	return false
+}
+
 type ManualWorkflowSpec struct {
 	Name        string
 	Type        ai.WorkflowType
@@ -71,6 +83,7 @@ type ManualWorkflowField struct {
 const (
 	maxAIJobDoneErrorLen     = 1 << 20
 	maxAIJobListErrorSummary = 200
+	aiErrorPlaceholder       = "log-in to see details"
 )
 
 func manualAIWorkflows(cfg *Config) []ManualWorkflowSpec {
@@ -155,6 +168,7 @@ func manualAIWorkflows(cfg *Config) []ManualWorkflowSpec {
 				Options: []string{
 					targets.AMD64,
 					targets.ARM64,
+					targets.I386,
 				},
 			},
 			ManualWorkflowField{
@@ -197,6 +211,18 @@ type uiAIJobPage struct {
 	CanSetCorrectness  bool
 	Reportings         []*uiJobReporting
 	CanRestart         bool
+}
+
+func (p *uiAIJobPage) GetJobs() []*uiAIJob {
+	return p.Jobs
+}
+
+func (p *uiAIJobPage) IsAdmin() bool {
+	return p.Header.Admin
+}
+
+func (p *uiAIJobPage) ShowTestOnManager() bool {
+	return p.Header.AIActions
 }
 
 type uiAIJobDetails struct {
@@ -250,6 +276,7 @@ type uiAIJob struct {
 	CorrectTitle     string
 	Results          []*uiAIResult
 	IsCurrent        bool
+	CanTestOnManager bool
 }
 
 type uiAIResult struct {
@@ -343,6 +370,9 @@ func handleAIJobsPage(ctx context.Context, w http.ResponseWriter, r *http.Reques
 	for _, job := range jobs {
 		uiJobs = append(uiJobs, makeUIAIJob(job))
 	}
+	if !hdr.Admin {
+		sanitizeUIJobs(uiJobs...)
+	}
 	workflows, err := aidb.LoadActiveWorkflows(ctx)
 	if err != nil {
 		return err
@@ -412,6 +442,7 @@ func handleAIJobCreate(ctx context.Context, r *http.Request, hdr *uiHeader) erro
 			return fmt.Errorf("%w: failed to get manager build config: %w", ErrClientBadRequest, err)
 		}
 		args["KernelConfigID"] = build.KernelConfig
+		args["KernelConfigManager"] = manager
 	} else {
 		return fmt.Errorf("%w: either a custom kernel config or a manager is required", ErrClientBadRequest)
 	}
@@ -514,6 +545,12 @@ func handleAIJobPagePost(ctx context.Context, job *aidb.Job, r *http.Request, hd
 		correct := r.FormValue("correct")
 		return "", handleAIJobPageCorrectness(ctx, job, correct, "", user.Email)
 
+	case "test_repro_c":
+		if job.Workflow != string(ai.WorkflowReproC) {
+			return "", fmt.Errorf("%w: only C reproducer jobs can be tested", ErrClientBadRequest)
+		}
+		return handleAITestReproCJob(ctx, job, r)
+
 	default:
 		return "", fmt.Errorf("%w: unknown action %q", ErrClientBadRequest, action)
 	}
@@ -548,7 +585,7 @@ func handleAIJobPagePushToReporting(ctx context.Context, job *aidb.Job, userName
 		return fmt.Errorf("no valid next stage found")
 	}
 
-	upstreamedBy := formatUpstreamedBy(userName, userEmail)
+	upstreamedBy := email.FormatAddress(userName, userEmail)
 	args := aidb.UpstreamReportArgs{
 		Job: job,
 		Reporting: &aidb.JobReporting{
@@ -709,7 +746,11 @@ func handleAIJobPage(ctx context.Context, w http.ResponseWriter, r *http.Request
 		return err
 	}
 	if newJobID != "" {
-		http.Redirect(w, r, "/ai_job?id="+newJobID, http.StatusFound)
+		redirectURL := newJobID
+		if !strings.HasPrefix(redirectURL, "/") {
+			redirectURL = "/ai_job?id=" + newJobID
+		}
+		http.Redirect(w, r, redirectURL, http.StatusFound)
 		return nil
 	}
 
@@ -747,16 +788,31 @@ func handleAIJobPage(ctx context.Context, w http.ResponseWriter, r *http.Request
 
 	uiJob := makeUIAIJob(job)
 	uiTrajectory := makeUIAITrajectory(trajectory)
-	trajectoryHTML, err := aflowhtml.RenderTrajectory(uiTrajectory)
-	if err != nil {
-		return err
-	}
 	uiReportings, err := loadJobReportingsWithComments(ctx, job.ID)
 	if err != nil {
 		return err
 	}
 
 	uiJobs, err := buildUIJobChain(ctx, r, job, uiJob)
+	if err != nil {
+		return err
+	}
+
+	if !hdr.Admin {
+		sanitizeUIJobs(uiJobs...)
+		for _, h := range uiHistory {
+			if h.Error != "" {
+				h.Error = aiErrorPlaceholder
+			}
+		}
+		for _, span := range uiTrajectory {
+			if span.Error != "" {
+				span.Error = aiErrorPlaceholder
+			}
+		}
+	}
+
+	trajectoryHTML, err := aflowhtml.RenderTrajectory(uiTrajectory)
 	if err != nil {
 		return err
 	}
@@ -956,6 +1012,15 @@ func filterJobsAccess(ctx context.Context, r *http.Request, jobs []*aidb.Job) ([
 	return jobs, nil
 }
 
+func sanitizeUIJobs(jobs ...*uiAIJob) {
+	for _, job := range jobs {
+		if job != nil && job.Error != "" {
+			job.Error = aiErrorPlaceholder
+			job.ErrorSummary = ""
+		}
+	}
+}
+
 func makeUIAIJob(job *aidb.Job) *uiAIJob {
 	var results []*uiAIResult
 	if m, ok := job.Results.Value.(map[string]any); ok && job.Results.Valid {
@@ -1001,6 +1066,14 @@ func makeUIAIJob(job *aidb.Job) *uiAIJob {
 	if desc == "" {
 		desc = "---"
 	}
+	canTestOnManager := false
+	if job.Workflow == string(ai.WorkflowReproC) && job.Error == "" && job.Finished.Valid {
+		if resMap, ok := job.Results.Value.(map[string]any); ok {
+			if reproC, _ := resMap[textReproC].(string); reproC != "" {
+				canTestOnManager = true
+			}
+		}
+	}
 	return &uiAIJob{
 		ID:               job.ID,
 		Link:             fmt.Sprintf("/ai_job?id=%v", job.ID),
@@ -1019,6 +1092,7 @@ func makeUIAIJob(job *aidb.Job) *uiAIJob {
 		CorrectTitle:     title,
 		Results:          results,
 		ErrorSummary:     summarizeAIJobError(job.Error),
+		CanTestOnManager: canTestOnManager,
 	}
 }
 
@@ -1295,7 +1369,18 @@ func finishIterationJob(ctx context.Context, job *aidb.Job) error {
 	hasPatch := res.PatchDiff != ""
 	hasReplies := len(res.Replies) > 0
 
-	err = aidb.IterationJobDone(ctx, job.ID, args.TargetCommentIDs, job.ParentReportingID.StringVal, hasPatch, hasReplies)
+	err = aidb.IterationJobDone(ctx, job.ID, args.TargetCommentIDs, job.ParentReportingID.StringVal,
+		hasPatch, hasReplies, func(ns, stage string) bool {
+			nsCfg := getNsConfig(ctx, ns)
+			if nsCfg == nil || nsCfg.AI == nil {
+				return false
+			}
+			idx := nsCfg.AI.StageIndexByName(stage)
+			if idx == -1 {
+				return false
+			}
+			return nsCfg.AI.Stages[idx].ReplyToComments
+		})
 	if err != nil {
 		log.Errorf(ctx, "failed to finalize iteration job %v: %v", job.ID, err)
 	}
@@ -1512,6 +1597,7 @@ func apiAITrajectoryLog(ctx context.Context, req *dashapi.AITrajectoryReq) (any,
 type uiWorkflow struct {
 	Name             string
 	CustomBaseCommit bool
+	SelectManager    bool
 }
 
 // aiBugWorkflows returns active workflows that are applicable for the bug.
@@ -1528,6 +1614,7 @@ func aiBugWorkflows(ctx context.Context, bug *Bug) ([]*uiWorkflow, error) {
 			result = append(result, &uiWorkflow{
 				Name:             flow.Name,
 				CustomBaseCommit: flow.Type == ai.WorkflowPatching,
+				SelectManager:    flow.Type == ai.WorkflowReproC || flow.Type == ai.WorkflowRepro,
 			})
 		}
 	}
@@ -1588,9 +1675,21 @@ func bugJobCreate(ctx context.Context, workflow string, typ ai.WorkflowType, bug
 		"SyzkallerCommit": build.SyzkallerCommit,
 		"TargetOS":        build.OS,
 		"TargetArch":      build.Arch,
+		"TargetVMArch":    build.VMArch,
 		"BaseRepository":  cfg.AI.BaseRepository,
 		"BaseBranch":      cfg.AI.BaseBranch,
 		"BaseCommit":      cfg.AI.BaseCommit,
+	}
+	if manager, ok := extraArgs["KernelConfigManager"].(string); ok && manager != "" {
+		manager, _ = activeManager(ctx, manager, bug.Namespace)
+		mgrBuild, err := lastManagerBuild(ctx, bug.Namespace, manager)
+		if err != nil {
+			return "", fmt.Errorf("failed to get manager build config: %w", err)
+		}
+		args["KernelConfigID"] = mgrBuild.KernelConfig
+		args["KernelConfigManager"] = manager
+		args["TargetArch"] = mgrBuild.Arch
+		args["TargetVMArch"] = mgrBuild.VMArch
 	}
 	maps.Copy(args, extraArgs)
 	return aidb.CreateJob(ctx, &aidb.Job{
@@ -1621,6 +1720,7 @@ func autoCreatePatchIterationJobs(ctx context.Context, client APIClient) (bool, 
 				return false, fmt.Errorf("failed to load pending comment groups for %v/%v: %w", ns, stage.Name, err)
 			}
 			for _, g := range grp {
+				g.ReplyToComments = stage.ReplyToComments
 				if timeNow(ctx).Sub(g.LatestComment) < stage.IterationDebounce {
 					continue
 				}
@@ -1636,7 +1736,7 @@ func autoCreatePatchIterationJobs(ctx context.Context, client APIClient) (bool, 
 	})
 	const maxGroupsPerPoll = 5
 	for _, g := range groups[:min(len(groups), maxGroupsPerPoll)] {
-		job, err := aidb.CreatePatchIterationJob(ctx, g.ReportingID)
+		job, err := aidb.CreatePatchIterationJob(ctx, g.ReportingID, g.ReplyToComments)
 		if err != nil {
 			log.Errorf(ctx, "failed to create patch iteration job for %v: %v", g.ReportingID, err)
 		} else if job != nil {
@@ -1808,6 +1908,26 @@ func collectChangelog(ctx context.Context, jobID, currentStage string) []dashapi
 	return changes
 }
 
+const (
+	maxAutoReproCJobs     = 5
+	autoReproCRateWindow  = 6 * time.Hour
+	maxAutoReproCAttempts = 2
+	reproCMinAge          = 48 * time.Hour
+	reproCMaxAge          = 30 * 24 * time.Hour
+	reproCPatchAge        = 30 * 24 * time.Hour
+)
+
+func canAutoCreateReproC(ctx context.Context, ns string) (bool, error) {
+	if !getNsConfig(ctx, ns).AI.AutoReproC {
+		return false, nil
+	}
+	count, err := aidb.CountJobsSince(ctx, ns, ai.WorkflowReproC, timeNow(ctx).Add(-autoReproCRateWindow))
+	if err != nil {
+		return false, fmt.Errorf("failed to check repro-c rate limit for %v: %w", ns, err)
+	}
+	return count < maxAutoReproCJobs, nil
+}
+
 // autoCreateAIJobs attempts to auto-assign AI jobs for the given requested workflows.
 // To avoid race conditions between concurrent agents, it operates in two phases,
 // both leveraging Datastore transactions:
@@ -1821,12 +1941,26 @@ func autoCreateAIJobs(ctx context.Context, reqWorkflows []dashapi.AIWorkflow, cl
 		if cfg.AI == nil || !client.AllowedNamespace(ns) {
 			continue
 		}
-		if created, err := findPendingJobs(ctx, ns, date, reqWorkflows); err != nil {
+		isReproC := func(w dashapi.AIWorkflow) bool { return w.Type == ai.WorkflowReproC }
+		workflowsForNS := reqWorkflows
+		if slices.ContainsFunc(reqWorkflows, isReproC) {
+			canReproC, err := canAutoCreateReproC(ctx, ns)
+			if err != nil {
+				return false, err
+			}
+			if !canReproC {
+				workflowsForNS = slices.DeleteFunc(slices.Clone(reqWorkflows), isReproC)
+			}
+		}
+		if len(workflowsForNS) == 0 {
+			continue
+		}
+		if created, err := findPendingJobs(ctx, ns, date, workflowsForNS); err != nil {
 			return false, err
 		} else if created {
 			return true, nil
 		}
-		if created, err := processStaleBugs(ctx, ns, date, reqWorkflows); err != nil {
+		if created, err := processStaleBugs(ctx, ns, date, workflowsForNS); err != nil {
 			return false, err
 		} else if created {
 			return true, nil
@@ -1941,7 +2075,7 @@ func pendingWorkflowsForBug(ctx context.Context, bug *Bug, bugKey *db.Key) ([]st
 		last  time.Time
 	}{}
 	for _, job := range jobs {
-		typ := ai.WorkflowType(job.Workflow)
+		typ := job.Type
 		// Have finished successful job.
 		if job.Finished.Valid && job.Error == "" ||
 			// Or already have a pending or a running job.
@@ -1953,8 +2087,12 @@ func pendingWorkflowsForBug(ctx context.Context, bug *Bug, bugKey *db.Key) ([]st
 		// Have a failed, or aborted job.
 		attempts := workflowAttempts[typ]
 		attempts.count++
-		if job.Started.Time.After(attempts.last) {
-			attempts.last = job.Started.Time
+		jobTime := job.Created
+		if job.Started.Valid {
+			jobTime = job.Started.Time
+		}
+		if jobTime.After(attempts.last) {
+			attempts.last = jobTime
 		}
 		workflowAttempts[typ] = attempts
 	}
@@ -1963,7 +2101,12 @@ func pendingWorkflowsForBug(ctx context.Context, bug *Bug, bugKey *db.Key) ([]st
 	// or may be fixed over time. So we retry failed/aborted jobs with an exponential
 	// backoff based on attempts count. 1 job is retried in 1 day; 2 jobs - in 2 days;
 	// 3 jobs - in 4 days, and so on up to the cap of 30 days.
+	// For repro-c, cap automatic retries to avoid repeatedly creating doomed or costly jobs.
 	for typ, attempts := range workflowAttempts {
+		if typ == ai.WorkflowReproC && attempts.count >= maxAutoReproCAttempts {
+			delete(workflows, typ)
+			continue
+		}
 		retryPeriod := time.Duration(min(30, 1<<(attempts.count-1))) * 24 * time.Hour
 		if timeSince(ctx, attempts.last) < retryPeriod {
 			delete(workflows, typ)
@@ -1975,6 +2118,11 @@ func pendingWorkflowsForBug(ctx context.Context, bug *Bug, bugKey *db.Key) ([]st
 	}
 	slices.Sort(pending)
 	return pending, nil
+}
+
+func (bug *Bug) hasRecentPatchCandidate(ctx context.Context, maxAge time.Duration) bool {
+	lastPatch := bug.discussionSummary().LastPatchMessage
+	return !lastPatch.IsZero() && timeSince(ctx, lastPatch) < maxAge
 }
 
 func workflowsForBug(ctx context.Context, bug *Bug, manual bool) map[ai.WorkflowType]bool {
@@ -1990,20 +2138,40 @@ func workflowsForBug(ctx context.Context, bug *Bug, manual bool) map[ai.Workflow
 		workflows[ai.WorkflowAssessmentKCSAN] = true
 	}
 	// A reproducer increases chances of a correct assessment, so wait for it for a day.
-	if manual || bug.ReproLevel > dashapi.ReproLevelNone ||
+	if manual || bug.HasRepro() ||
 		timeSince(ctx, bug.FirstTime) > 24*time.Hour {
 		workflows[ai.WorkflowAssessmentSecurity] = true
 	}
 	if manual {
-		// Types we don't create automatically yet, but can be created manually.
+		// Workflows created only manually, or manual overrides bypassing auto-creation filters.
 		if typ.IsUAF() {
 			workflows[ai.WorkflowModeration] = true
 		}
-		if bug.HeadReproLevel > dashapi.ReproLevelNone {
+		if bug.HasHeadRepro() {
 			workflows[ai.WorkflowPatching] = true
 		}
 		workflows[ai.WorkflowRepro] = true
 		workflows[ai.WorkflowReproC] = true
+	} else {
+		// Automatic C reproducer generation heuristics:
+		// - Namespace must have AutoReproC enabled.
+		// - Open bugs only, with no fixing commits.
+		// - Must have a crash report, but no existing C reproducer.
+		// - Wait at least 48h for human / syzkaller-native reproducers to arrive.
+		// - Last crash must be within 30 days to ensure the bug is still fresh / relevant.
+		// - Skip non-fatal issues (INFO).
+		// - Skip bugs that have recent patch candidates being discussed / tested.
+		nsCfg := getNsConfig(ctx, bug.Namespace)
+		canAutoReproC := nsCfg.AI != nil && nsCfg.AI.AutoReproC &&
+			bug.Status == BugStatusOpen && len(bug.Commits) == 0 &&
+			!bug.HasCRepro && bug.HasReport &&
+			timeSince(ctx, bug.FirstTime) > reproCMinAge &&
+			timeSince(ctx, bug.LastTime) < reproCMaxAge &&
+			!strings.HasPrefix(bug.Title, "INFO:") &&
+			!bug.hasRecentPatchCandidate(ctx, reproCPatchAge)
+		if canAutoReproC {
+			workflows[ai.WorkflowReproC] = true
+		}
 	}
 	return workflows
 }
@@ -2148,4 +2316,46 @@ func extractExecutedModels(trajectory []*aidb.TrajectorySpan) []string {
 	res := slices.Collect(maps.Keys(models))
 	slices.Sort(res)
 	return res
+}
+
+// handleAITestReproCJob launches a C reproducer test job for a given AI job.
+func handleAITestReproCJob(ctx context.Context, aiJob *aidb.Job, r *http.Request) (string, error) {
+	user := currentUser(ctx)
+	if user == nil {
+		return "", ErrAccess
+	}
+	if !aiJob.BugID.Valid || aiJob.BugID.StringVal == "" {
+		return "", fmt.Errorf("%w: AI job has no associated Bug ID", ErrClientBadRequest)
+	}
+	bugKey := db.NewKey(ctx, "Bug", aiJob.BugID.StringVal, 0, nil)
+	bug := new(Bug)
+	if err := db.Get(ctx, bugKey, bug); err != nil {
+		return "", fmt.Errorf("failed to get bug %v: %w", aiJob.BugID.StringVal, err)
+	}
+	if err := checkAccessLevel(ctx, r, bug.sanitizeAccess(ctx, accessLevel(ctx, r))); err != nil {
+		return "", err
+	}
+	reproC, manager := extractAIJobReproC(aiJob, bug)
+	if len(reproC) == 0 {
+		return "", fmt.Errorf("%w: C reproducer is empty", ErrClientBadRequest)
+	}
+	if manager == "" {
+		return "", fmt.Errorf("%w: could not determine target manager for bug", ErrClientBadRequest)
+	}
+	_, _, err := handleTestReproCRequest(ctx, &testReproCReqArgs{
+		bug:     bug,
+		bugKey:  bugKey,
+		user:    user.Email,
+		manager: manager,
+		reproC:  reproC,
+	})
+	if err != nil {
+		return "", err
+	}
+	if redirect := r.FormValue("redirect"); redirect != "" {
+		if strings.HasPrefix(redirect, "/") && !strings.HasPrefix(redirect, "//") {
+			return redirect, nil
+		}
+	}
+	return fmt.Sprintf("/bug?id=%v", bug.keyHash(ctx)), nil
 }

@@ -7,10 +7,12 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -65,7 +67,13 @@ func testFlow[Inputs, Outputs any](t *testing.T, inputs map[string]any, result a
 				storeCfg = &cfgCopy
 			}
 			requests = append(requests, llmRequest{model, storeCfg, slices.Clone(req)})
-			require.NotEmpty(t, llmReplies, "unexpected LLM call")
+			if len(llmReplies) == 0 {
+				var b strings.Builder
+				for _, r := range req {
+					b.WriteString(fmt.Sprintf("%v\n", r.Parts))
+				}
+				t.Fatalf("unexpected LLM call! Request:\n%s", b.String())
+			}
 			reply := llmReplies[0]
 			if cb, ok := reply.(func(string, *backend.GenerateConfig, []*backend.Message) (
 				*backend.GenerateResponse, error)); ok {
@@ -108,7 +116,12 @@ func testFlow[Inputs, Outputs any](t *testing.T, inputs map[string]any, result a
 	if inputs == nil {
 		inputs = map[string]any{}
 	}
-	got, err := flows["test"].Execute(ctx, &dummyProvider{}, workdir, false, inputs, cache, onEvent)
+	got, err := flows["test"].Execute(ctx, inputs, ExecuteOptions{
+		Provider: &dummyProvider{},
+		Workdir:  workdir,
+		Cache:    cache,
+		OnEvent:  onEvent,
+	})
 	switch result := result.(type) {
 	case map[string]any:
 		require.NoError(t, err)

@@ -41,12 +41,6 @@ indexes:
 
 - kind: Bug
   properties:
-  - name: Status
-  - name: HappenedOn
-  - name: HeadReproLevel
-
-- kind: Bug
-  properties:
   - name: HappenedOn
   - name: Status
 
@@ -77,28 +71,6 @@ indexes:
   - name: Namespace
   - name: NeedCommitInfo
   - name: Commits
-
-- kind: Bug
-  properties:
-  - name: BisectCause
-  - name: ReproLevel
-  - name: FirstTime
-    direction: desc
-
-- kind: Bug
-  properties:
-  - name: BisectCause
-  - name: ReproLevel
-  - name: Status
-  - name: FirstTime
-    direction: desc
-
-- kind: Bug
-  properties:
-  - name: BisectFix
-  - name: ReproLevel
-  - name: Status
-  - name: LastTime
 
 - kind: Bug
   properties:
@@ -171,20 +143,18 @@ indexes:
   - name: Namespace
   - name: AssetsLastCheck
 
-- kind: Build
-  properties:
-  - name: Namespace
-  - name: Manager
-  - name: Type
-  - name: Time
-    direction: desc
-
 - kind: Crash
   ancestor: yes
   properties:
   - name: Reported
   - name: ReproC
   - name: ReproSyz
+
+- kind: Crash
+  ancestor: yes
+  properties:
+  - name: Time
+    direction: desc
 
 - kind: Crash
   ancestor: yes
@@ -253,6 +223,14 @@ indexes:
     direction: desc
 
 - kind: Job
+  ancestor: yes
+  properties:
+  - name: Type
+  - name: Manager
+  - name: Finished
+
+
+- kind: Job
   properties:
   - name: Type
   - name: Finished
@@ -282,3 +260,20 @@ indexes:
   - name: Status
   - name: AIJobCheck
   - name: AIPendingWorkflows
+
+- kind: Bug
+  properties:
+  - name: Status
+  - name: HasCRepro
+  - name: HasSyzRepro
+  - name: BisectCause
+  - name: FirstTime
+    direction: desc
+
+- kind: Bug
+  properties:
+  - name: Status
+  - name: HasCRepro
+  - name: HasSyzRepro
+  - name: BisectFix
+  - name: LastTime

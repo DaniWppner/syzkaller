@@ -327,6 +327,24 @@ func TestParsePatchSubject(t *testing.T) {
 				Total:   value[int](21),
 			},
 		},
+		{
+			subj: `[PATCH 6.18 00/29] 6.18.1-rc1 review`,
+			ret: PatchSubject{
+				Title: "6.18.1-rc1 review",
+				Tags:  []string{"6.18"},
+				Seq:   value[int](0),
+				Total: value[int](29),
+			},
+		},
+		{
+			subj: `[PATCH 6.1 000/451] 6.1.83-rc1 review`,
+			ret: PatchSubject{
+				Title: "6.1.83-rc1 review",
+				Tags:  []string{"6.1"},
+				Seq:   value[int](0),
+				Total: value[int](451),
+			},
+		},
 	}
 	for id, test := range tests {
 		t.Run(fmt.Sprint(id), func(t *testing.T) {
@@ -460,6 +478,26 @@ Content-Type: text/plain
 In-Reply-To: <Something>
 
 No patch, just text`,
+		// A stable review series.
+		`Date: Fri, 24 Apr 2026 15:30:39 +0200
+Subject: [PATCH 6.18 00/01] 6.18.25-rc1 review
+Message-ID: <Fifth>
+From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+To: stable@vger.kernel.org
+X-stable: review
+X-KernelTest-Branch: linux-6.18.y
+Content-Type: text/plain
+
+This is the start of the stable review cycle.`,
+		`Date: Fri, 24 Apr 2026 15:31:00 +0200
+Subject: [PATCH 6.18 01/01] rxrpc: Fix missing validation
+Message-ID: <Fifth-1>
+From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+To: stable@vger.kernel.org
+Content-Type: text/plain
+In-Reply-To: <Fifth>
+
+` + dummyPatch,
 	}
 
 	var emails []*Email
@@ -472,7 +510,7 @@ No patch, just text`,
 	}
 
 	series := PatchSeries(emails)
-	assert.Len(t, series, 4)
+	assert.Len(t, series, 5)
 
 	expectPerID := map[string]*Series{
 		"<First>": {
@@ -489,6 +527,7 @@ No patch, just text`,
 			Subject: "A longer series",
 			Version: 2,
 			Tags:    []string{"net"},
+			CoverCc: []string{"a@user.com", "b@user.com"},
 			Patches: []Patch{
 				{
 					Seq:   1,
@@ -517,6 +556,20 @@ No patch, just text`,
 			Corrupted: "the subject mentions 1 patches, 0 are found",
 			Patches:   nil,
 		},
+		"<Fifth>": {
+			Subject:           "6.18.25-rc1 review",
+			Version:           1,
+			Tags:              []string{"6.18"},
+			XStable:           "review",
+			XKernelTestBranch: "linux-6.18.y",
+			CoverCc:           []string{"gregkh@linuxfoundation.org", "stable@vger.kernel.org"},
+			Patches: []Patch{
+				{
+					Seq:   1,
+					Email: &Email{Email: &email.Email{Subject: "[PATCH 6.18 01/01] rxrpc: Fix missing validation"}},
+				},
+			},
+		},
 	}
 	for _, s := range series {
 		expect := expectPerID[s.MessageID]
@@ -528,6 +581,9 @@ No patch, just text`,
 			assert.Equal(t, expect.Corrupted, s.Corrupted, "corrupted differs")
 			assert.Equal(t, expect.Subject, s.Subject, "subject differs")
 			assert.Equal(t, expect.Version, s.Version, "version differs")
+			assert.Equal(t, expect.XStable, s.XStable, "XStable differs")
+			assert.Equal(t, expect.XKernelTestBranch, s.XKernelTestBranch, "XKernelTestBranch differs")
+			require.Equal(t, expect.CoverCc, s.CoverCc, "CoverCc differs")
 			require.Len(t, s.Patches, len(expect.Patches), "patch count differs")
 			for i, expectPatch := range expect.Patches {
 				got := s.Patches[i]
@@ -568,6 +624,105 @@ func TestLink(t *testing.T) {
 				got = LinkToMessage(test.id)
 			}
 			assert.Equal(t, test.want, got)
+		})
+	}
+}
+
+func TestPatchSeriesMinRate(t *testing.T) {
+	// A series with 100 patches where 99 are present (99% rate >= 0.99) should be accepted.
+	var acceptedEmails []*Email
+	acceptedEmails = append(acceptedEmails, &Email{
+		Email: &email.Email{
+			MessageID: "<cover>",
+			Subject:   "[PATCH 000/100] Big series",
+		},
+	})
+	for i := 1; i <= 99; i++ {
+		acceptedEmails = append(acceptedEmails, &Email{
+			Email: &email.Email{
+				MessageID: fmt.Sprintf("<p%d>", i),
+				InReplyTo: "<cover>",
+				Subject:   fmt.Sprintf("[PATCH %03d/100] Patch %d", i, i),
+			},
+			HasPatch: true,
+		})
+	}
+	series := PatchSeries(acceptedEmails)
+	require.Len(t, series, 1)
+	assert.Empty(t, series[0].Corrupted)
+	assert.Len(t, series[0].Patches, 99)
+
+	// A series with 100 patches where 98 are present (98% rate < 0.99) should be corrupted.
+	var corruptedEmails []*Email
+	corruptedEmails = append(corruptedEmails, &Email{
+		Email: &email.Email{
+			MessageID: "<cover2>",
+			Subject:   "[PATCH 000/100] Another big series",
+		},
+	})
+	for i := 1; i <= 98; i++ {
+		corruptedEmails = append(corruptedEmails, &Email{
+			Email: &email.Email{
+				MessageID: fmt.Sprintf("<p2-%d>", i),
+				InReplyTo: "<cover2>",
+				Subject:   fmt.Sprintf("[PATCH %03d/100] Patch %d", i, i),
+			},
+			HasPatch: true,
+		})
+	}
+	series2 := PatchSeries(corruptedEmails)
+	require.Len(t, series2, 1)
+	assert.Equal(t, "the subject mentions 100 patches, 98 are found", series2[0].Corrupted)
+}
+
+// Series that consist only of a cover letter (and no actual patches) must be rejected.
+func TestPatchSeriesNoPatches(t *testing.T) {
+	tests := []struct {
+		name      string
+		emails    []*Email
+		corrupted string
+	}{
+		{
+			name: "only cover letter",
+			emails: []*Email{
+				{Email: &email.Email{MessageID: "<cover>", Subject: "[PATCH 0/2] Series"}},
+			},
+			corrupted: "the subject mentions 2 patches, 0 are found",
+		},
+		{
+			name: "cover letter and replies without patches",
+			emails: []*Email{
+				{Email: &email.Email{MessageID: "<cover>", Subject: "[PATCH 0/1] Series"}},
+				{Email: &email.Email{MessageID: "<reply>", InReplyTo: "<cover>", Subject: "Re: [PATCH 1/1] Series"}},
+			},
+			corrupted: "the subject mentions 1 patches, 0 are found",
+		},
+		{
+			name: "zero-sized series",
+			emails: []*Email{
+				{Email: &email.Email{MessageID: "<cover>", Subject: "[PATCH 0/0] Series"}},
+			},
+			corrupted: "the subject mentions 0 patches, 0 are found",
+		},
+		{
+			name: "cover letter and one patch",
+			emails: []*Email{
+				{Email: &email.Email{MessageID: "<cover>", Subject: "[PATCH 0/1] Series"}},
+				{Email: &email.Email{MessageID: "<patch>", InReplyTo: "<cover>", Subject: "[PATCH 1/1] Series"},
+					HasPatch: true},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			series := PatchSeries(test.emails)
+			require.Len(t, series, 1)
+			assert.Equal(t, test.corrupted, series[0].Corrupted)
+			if test.corrupted != "" {
+				assert.Empty(t, series[0].Patches)
+			} else {
+				assert.NotEmpty(t, series[0].Patches)
+			}
 		})
 	}
 }

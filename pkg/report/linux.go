@@ -6,6 +6,7 @@ package report
 import (
 	"bytes"
 	"fmt"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -64,9 +65,7 @@ func ctorLinux(cfg *config) (reporterImpl, []string, error) {
 		vmlinux: vmlinux,
 		symbols: symbols,
 	}
-	ctx.consoleOutputRe = regexp.MustCompile(
-		`^(?:\*\* [0-9]+ printk messages dropped \*\* )?` +
-			`(?:.* login: )?(?:\<[0-9]+\>)?\[ *[0-9]+\.[0-9]+\](\[ *(?:C|T)[0-9]+\])? `)
+	ctx.consoleOutputRe = regexp.MustCompile(`(?:\<[0-9]+\>)?\[ *[0-9]+\.[0-9]+\](\[ *(?:C|T)[0-9]+\])? ?`)
 	ctx.taskContext = regexp.MustCompile(`\[ *T[0-9]+\]`)
 	ctx.cpuContext = regexp.MustCompile(`\[ *C[0-9]+\]`)
 	ctx.questionableFrame = regexp.MustCompile(`(\[\<[0-9a-f]+\>\])? \? `)
@@ -104,6 +103,8 @@ func ctorLinux(cfg *config) (reporterImpl, []string, error) {
 		regexp.MustCompile(`^kernel/kthread.c`),
 		regexp.MustCompile(`^kernel/sched/.*.c`),
 		regexp.MustCompile(`^kernel/stacktrace.c`),
+		regexp.MustCompile(`^kernel/task_work\.c`),
+		regexp.MustCompile(`^kernel/time/sleep_timeout\.c`),
 		regexp.MustCompile(`^kernel/time/timer.c`),
 		regexp.MustCompile(`^kernel/workqueue.c`),
 		regexp.MustCompile(`^net/core/dev.c`),
@@ -115,7 +116,12 @@ func ctorLinux(cfg *config) (reporterImpl, []string, error) {
 		// Crashes in these files are almost always caused by the calling code.
 		regexp.MustCompile(`^arch/.*/lib/crc.*`),
 	}
-	ctx.guiltyLineIgnore = regexp.MustCompile(`(hardirqs|softirqs)\s+last\s+(enabled|disabled)|^Register r\d+ information`)
+	ctx.guiltyLineIgnore = regexp.MustCompile(
+		`(hardirqs|softirqs)\s+last\s+(enabled|disabled)|` +
+			`,\s+at:\s+|` +
+			`^\s*#\d+:|` +
+			`^Register r\d+ information`,
+	)
 	// These pattern do _not_ start a new report, i.e. can be in a middle of another report.
 	ctx.reportStartIgnores = []*regexp.Regexp{
 		compile(`invalid opcode: 0000`),
@@ -992,12 +998,12 @@ func (ctx *linux) extractGuiltyFileImpl(report []byte) string {
 		if matchesAny(file, ctx.guiltyFileIgnores) || ctx.guiltyLineIgnore.Match(line) {
 			continue
 		}
-		guilty = filepath.Clean(string(file))
+		guilty = path.Clean(string(file))
 		break
 	}
 
 	// Search for deeper filepaths in the stack trace below the first possible guilty file.
-	deepestPath := filepath.Dir(guilty)
+	deepestPath := guiltyDir(guilty)
 	for len(lines) > 0 {
 		line, lines = lines[0], lines[1:]
 		match := filenameRe.FindSubmatch(line)
@@ -1008,18 +1014,29 @@ func (ctx *linux) extractGuiltyFileImpl(report []byte) string {
 		if matchesAny(file, ctx.guiltyFileIgnores) || ctx.guiltyLineIgnore.Match(line) {
 			continue
 		}
-		clean := filepath.Clean(string(file))
+		clean := path.Clean(string(file))
+		cleanDir := guiltyDir(clean)
 
-		// Check if the new path has *both* the same directory prefix *and* a deeper suffix.
-		if suffix, ok := strings.CutPrefix(clean, deepestPath); ok {
-			if deeperPathRe.Match([]byte(suffix)) {
-				guilty = clean
-				deepestPath = filepath.Dir(guilty)
-			}
+		// Check if the new path has *both* the same directory prefix *and* a deeper nesting.
+		if strings.HasPrefix(cleanDir, deepestPath+"/") {
+			guilty = clean
+			deepestPath = cleanDir
 		}
 	}
 
 	return guilty
+}
+
+func guiltyDir(file string) string {
+	dir := path.Clean(path.Dir(file))
+	switch dir {
+	// fs/iomap and fs/netfs are shared helper libraries for filesystems in fs/*,
+	// so treat their effective directory depth as "fs".
+	case "fs/iomap", "fs/netfs":
+		return "fs"
+	default:
+		return dir
+	}
 }
 
 func (ctx *linux) getMaintainers(file string) (vcs.Recipients, error) {
@@ -1345,6 +1362,7 @@ var linuxStackParams = &stackParams{
 		"fixup_bug",
 		"print_report",
 		"print_usage_bug",
+		"valid_state",
 		"do_error",
 		"invalid_op",
 		`_trap$|do_trap`,
@@ -1410,6 +1428,8 @@ var linuxStackParams = &stackParams{
 		"owner_on_cpu",
 		"osq_lock",
 		"osq_unlock",
+		"lock_sock",
+		"release_sock",
 		"atomic(64)?_(dec|inc|read|set|or|xor|and|add|sub|fetch|xchg|cmpxchg|try)",
 		"(set|clear|change|test)_bit",
 		"__wake_up",
@@ -1550,6 +1570,12 @@ var linuxStackParams = &stackParams{
 		"print_tainted",
 		"xas_(?:start|load|find)",
 		"find_lock_entries",
+		"ifs_free",
+		"iomap_invalidate_folio",
+		"folio_invalidate",
+		"truncate_cleanup_folio",
+		"truncate_inode_folio",
+		"truncate_inode_partial_folio",
 		"truncate_inode_pages_range",
 		"__phys_addr",
 		"__fortify_report",
@@ -1883,6 +1909,12 @@ var linuxOopses = append([]*oops{
 			{
 				title: compile("BUG: Bad page map"),
 				fmt:   "BUG: Bad page map",
+			},
+			{
+				title:        compile("BUG: workqueue lockup"),
+				report:       compile("BUG: workqueue lockup(?:.*\\n)+?.*Workqueue:\\s+\\S+\\s+([a-zA-Z0-9_]+)"),
+				fmt:          "BUG: workqueue lockup in %[1]v",
+				noStackTrace: true,
 			},
 			{
 				title:        compile("BUG: workqueue lockup"),

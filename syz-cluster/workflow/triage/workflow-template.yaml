@@ -15,6 +15,7 @@ spec:
       securityContext:
         runAsUser: 10000
         fsGroup: 10000
+        fsGroupChangePolicy: "OnRootMismatch"
       initContainers:
         - name: setup-repo
           image: ${IMAGE_PREFIX}triage-action:${IMAGE_TAG}
@@ -23,7 +24,7 @@ spec:
             - sh
             - -c
             - |
-              git clone --reference /kernel-repo -c remote.origin.fetch="+refs/heads/*:refs/heads/*" /kernel-repo /workdir
+              git clone --shared -c remote.origin.fetch="+refs/heads/*:refs/heads/*" /kernel-repo /workdir
               git -C /workdir commit-graph write --reachable
           env:
             - name: GIT_DISCOVERY_ACROSS_FILESYSTEM

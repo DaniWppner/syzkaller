@@ -7,7 +7,6 @@ import (
 	"math/rand"
 	"sort"
 
-	"github.com/google/syzkaller/pkg/signal"
 	"github.com/google/syzkaller/prog"
 )
 
@@ -21,19 +20,18 @@ func (pl *ProgramsList) chooseProgram(r *rand.Rand) *prog.Prog {
 	if len(pl.progs) == 0 {
 		return nil
 	}
-	randVal := r.Int63n(pl.sumPrios + 1)
+	randVal := r.Int63n(pl.sumPrios) + 1
 	idx := sort.Search(len(pl.accPrios), func(i int) bool {
 		return pl.accPrios[i] >= randVal
 	})
 	return pl.progs[idx]
 }
 
-func (pl *ProgramsList) saveProgram(p *prog.Prog, signal signal.Signal) {
-	prio := int64(len(signal))
+func (pl *ProgramsList) saveProgram(p *prog.Prog, prio int) {
 	if prio == 0 {
 		prio = 1
 	}
-	pl.sumPrios += prio
+	pl.sumPrios += int64(prio)
 	pl.accPrios = append(pl.accPrios, pl.sumPrios)
 	pl.progs = append(pl.progs, p)
 }
@@ -76,4 +74,10 @@ func (corpus *Corpus) Programs() []*prog.Prog {
 	corpus.mu.RLock()
 	defer corpus.mu.RUnlock()
 	return corpus.progs
+}
+
+func (pl *ProgramsList) clear() {
+	pl.progs = nil
+	pl.accPrios = nil
+	pl.sumPrios = 0
 }
