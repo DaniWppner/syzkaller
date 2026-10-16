@@ -363,7 +363,7 @@ func (job *triageJob) doHandleCall(p *prog.Prog, call int, info *triageCall, fPC
 	if len(newPCs) > 0 {
 		data, err := job.fuzzer.Cover.UpdateCoveredFunctions(newPCs)
 		if err == nil && len(data) > 0 {
-			job.info.Logf("new_covered_functions: %s", string(data))
+			job.info.Logf("new_covered_functions for call #%d [%s]: %s", call, callName, string(data))
 		}
 	}
 }
